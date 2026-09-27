@@ -48,16 +48,20 @@ outgoing:
   max_request_timeout: 8.0
 
 engines:
-  # Google et Bing sont « disabled: true » dans les réglages par défaut actuels de SearXNG : on les réactive.
+  # Mesuré le 28/09 depuis workspace4 : Google répond CAPTCHA dès la 1re ou 2e requête puis est suspendu ;
+  # DuckDuckGo idem ; Bing renvoie beaucoup de bruit (YouTube, Google Play, Gmail pour « version de PHP ») ;
+  # Brave donne les bons résultats (php.net, python.org, nextcloud.com, kitco). → Brave en premier, Google gardé
+  # (utile quand il n'est pas bloqué), Bing retiré.
+  - name: brave
+    disabled: false
+    weight: 2.0
   - name: google
     disabled: false
     weight: 1.5
-  - name: bing
-    disabled: false
   - name: duckduckgo
     disabled: false
-  - name: brave
-    disabled: false
+  - name: bing
+    disabled: true
   # Wikipédia en anglais (moteur par défaut, langue forcée) + une seconde instance en français.
   - name: wikipedia
     disabled: false
@@ -73,4 +77,4 @@ engines:
   - name: google news
     disabled: false
   - name: bing news
-    disabled: false
+    disabled: true
