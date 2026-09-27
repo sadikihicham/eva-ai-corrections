@@ -28,6 +28,7 @@ function extraire(string $src, string $methode): string {
     throw new RuntimeException("fin de méthode introuvable : $methode");
 }
 if (!preg_match('/private const CREATION_NUDGE = .*?;\n/s', $source, $nudge)) { fwrite(STDERR, "CREATION_NUDGE absente\n"); exit(2); }
+if (!preg_match('/private const WRITE_TOOLS = .*?;\n/s', $source, $ecriture)) { fwrite(STDERR, "WRITE_TOOLS absente\n"); exit(2); }
 
 // eval() ne charge que du code extrait de NOTRE fichier versionné src/RagService.php (voir test_liens_fichiers.php).
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
@@ -39,6 +40,8 @@ eval('class RagSousTest {
     public array $createdFiles = [];
     public bool $fileToolAttempted = false;
     public bool $removedFileLinks = false;
+    public bool $writeToolSucceeded = false;
+    ' . $ecriture[0] . '
     public array $toolSources = [];
     public string $langue = "fr";
     /** fichiers « existants » du faux utilisateur hicham : ids et chemins */
@@ -152,6 +155,11 @@ foreach ([
     "Quel est le cours de l'or pour le bijou de Fatima ?",
     "Le prix de vente de l'appartement de M. Haddad dépend du cours de l'or",
     "Le prix est bon, or Karim veut attendre",
+    // 3e revue : « explicite » à l'intérieur d'un texte de travail
+    "Rédige un mail à Paul lui demandant de vérifier sur le web les tarifs de notre fournisseur Dupont SA",
+    "Résume ce que j'ai trouvé sur internet à propos de la plainte de Mme Martin",
+    "Le patient a regardé sur internet ses symptômes, rédige une réponse",
+    "cherche sur internet le contrat de Mme Martin",
 ] as $q) {
     // Propriété v3 : soit rien ne part, soit une requête RECONSTRUITE sans aucun mot propre à l'utilisateur.
     $r = $t->web($q);
@@ -185,6 +193,8 @@ foreach ([
     "Fais-moi un tableau comparatif PHP 8.2 vs 8.3",
     "Prépare un tableau récapitulatif des rendez-vous",
     "Fais-moi une note de synthèse sur la réunion",
+    "Écris un paragraphe sur les fichiers PDF",
+    "Rédige un mail au client pour lui dire que sa facture PDF a été générée",
 ] as $q) {
     verifie('pas une création : ' . $q, !$t->fichier($q));
 }
@@ -202,12 +212,12 @@ verifie('relance : outil create_file absent (actions désactivées) → non', !$
 $t->collecter('create_file', ['ok' => false, 'error' => 'EVA cannot generate .pdf files']);
 verifie('relance : create_file déjà tenté (même en échec) → non', !$t->relance($q, "J'ai créé le fichier.", $outils));
 foreach (["I've created the Excel file.", "I have created the file X. Would you like anything else?", "J'ai créé le fichier X. Souhaitez-vous autre chose ?",
-          "The file has been successfully created.", "Le fichier X est créé.", "Fichier créé : X", "Here's your spreadsheet", "Votre fichier est prêt",
+          "The file has been successfully created.", "Le fichier X est créé.", "Votre fichier budget.xlsx a été créé.", "Fichier créé : X", "Here's your spreadsheet", "Votre fichier est prêt",
           "Je vous ai préparé le fichier", "تم انشاء الملف", "(file created: rapport.pdf)", "[EVA: file created in an earlier turn: x.pdf]",
           "Voir http://h/workspace/index.php/f/12"] as $a) {
     verifie('affirmation reconnue : ' . $a, $t->affirme($a));
 }
-foreach (["Voici le tableau comparatif :\n| a | b |", "Je vais créer le fichier. Quel nom voulez-vous ?", "Quel contenu voulez-vous mettre dans le fichier ?", "1. Accueil\n2. Café"] as $a) {
+foreach (["Bonjour M. Karim, votre facture PDF a été générée et le contrat a été enregistré le 3 mars.", "Le compte est créé automatiquement.", "La copie a été créée.",  "Je vais créer le fichier. Quel nom voulez-vous ?", "Quel contenu voulez-vous mettre dans le fichier ?", "1. Accueil\n2. Café"] as $a) {
     verifie('pas une affirmation : ' . str_replace("\n", ' ', $a), !$t->affirme($a));
 }
 verifie('le texte de relance exige de lire les données avant d\'écrire',
@@ -231,6 +241,15 @@ verifie('formulation non reconnue par une regex ? couverte quand même par la no
 $t = new RagSousTest();
 $r = $t->finir("Voici le tableau :\n| a | b |", [], "Fais-moi un tableau comparatif PHP 8.2 vs 8.3");
 verifie('tableau dans le chat (pas une demande de fichier) → intact, sans note', $r === "Voici le tableau :\n| a | b |", $r);
+$t = new RagSousTest();
+$t->collecter('copy_file', ['ok' => true, 'result' => 'Copied to Documents/budget-copie.xlsx']);
+$r = $t->finir("La copie est faite.", [], "Crée un fichier excel copie du budget");
+verifie('un autre outil d\'écriture a réussi (copy_file) → pas de note « aucun fichier »', !str_contains($r, 'ℹ️'), $r);
+verifie('copy_file compte comme tentative → pas de relance', !$t->relance("Crée un fichier excel copie du budget", "J'ai créé la copie.", $outils));
+foreach (["https://nextcloud.example.com/index.php/f/5", "https://votre-domaine.com/index.php/f/5"] as $u) {
+    $t = new RagSousTest();
+    verifie('hôte d\'exemple → traité comme inventé, faux lien retiré : ' . $u, str_contains($t->finir("Ici : $u"), '⚠️'));
+}
 foreach (["http://localhost/index.php/f/3660074", "https://your-nextcloud/index.php/f/5", "http://nextcloud.local/remote.php/dav/files/hicham/x.xlsx"] as $u) {
     $t = new RagSousTest();
     verifie('hôte inventé traité comme le nôtre → faux lien retiré : ' . $u, str_contains($t->finir("Ici : $u"), '⚠️'));
@@ -256,7 +275,7 @@ $r = $t->finir("Faux http://h/workspace/index.php/f/5 et vrai http://h/workspace
 verifie('retirer …/f/5 ne touche pas …/f/55 sur la même ligne', str_contains($r, 'http://h/workspace/index.php/f/55') && !preg_match('~/f/5(?!5)~', $r), $r);
 // autre site : jamais vérifié ni retiré (revue n°8)
 $t = new RagSousTest();
-$ext = "Doc : https://docs.example.org/index.php/f/5";
+$ext = "Doc : https://help.nextcloud.com/index.php/f/5";
 verifie('lien /f/ d\'un vrai site public → intact', $t->finir($ext) === $ext, $t->finir($ext));
 // ligne de tableau : seul le lien est barré (revue n°8)
 $t = new RagSousTest();

@@ -160,6 +160,16 @@ pour payer le fournisseur Al Futtaim… » partait encore), les affirmations ont
   signatures .doc/.xls/.ppt/.7z/.webp ; trace de recherche toujours fermée dans `ask()`.
 **Tests 133/133 ; contre-épreuve : la v2 en échoue 50, la v1 38 (sur 93).**
 
+**Contre-revue ciblée v3 (3e agent, 28/09 ~06:00)** : principe validé (requête reconstruite : « aucun chemin où les
+mots de l'utilisateur sortent » hors demande explicite). 1 bloquant : la « demande explicite » se déclenchait à
+l'intérieur d'un texte de travail (« rédige un mail… lui demandant de vérifier sur le web… »). **v3.1** : demande
+explicite = impératif EN TÊTE de message, et les mots de travail bloquent aussi ce chemin ; relance seulement sur
+une affirmation à la 1re personne / « votre fichier… » (plus de passif : « votre facture a été générée » dans un mail
+faisait écrire un fichier) ; tout outil d'écriture compte (copy/move/rename/restore/sticker) et annule la note ;
+objet de la demande introduit par « un/une/en/new… » ; hôtes d'exemple (example.com, votre-…) = inventés ;
+renameFile .md→.docx/.xlsx refusé. **Tests 146/146 ; contre-épreuve : la v3 échoue exactement aux 13 nouveaux cas.**
+Reste (non bloquant, tranche suivante) : note fausse si `fileLinks()` échoue ; move/copy vers .pdf.
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).

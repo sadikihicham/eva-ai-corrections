@@ -2110,7 +2110,7 @@ class ActionExecutor {
         $parent = $node->getParent();
         // Same rule as createFile: a text file renamed to .pdf/.xls/… is a corrupt file under a trusted name.
         $toExt = strtolower(pathinfo($newName, PATHINFO_EXTENSION));
-        if (in_array($toExt, ['pdf', 'doc', 'docm', 'xls', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'], true)
+        if (in_array($toExt, ['pdf', 'doc', 'docx', 'docm', 'xls', 'xlsx', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'], true)
             && strtolower(pathinfo($path, PATHINFO_EXTENSION)) !== $toExt) {
             return ['ok' => false, 'error' => 'Changing a file into .' . $toExt . ' by renaming is not allowed: the content would not be a real .' . $toExt . ' file. Nothing was renamed.'];
         }

@@ -31,10 +31,14 @@ function extraire(string $src, string $methode): string {
 
 // eval() ne charge ici que du code extrait de NOTRE fichier src/RagService.php (dépôt versionné), jamais de
 // données extérieures : c'est ce qui permet de tester le vrai code sans le recopier ni démarrer Nextcloud.
+// Constante WRITE_TOOLS reprise du vrai code (branche anti-invention).
+preg_match('/private const WRITE_TOOLS = .*?;\n/s', $source, $ecriture);
 $corps = extraire($source, 'collectToolSources') . "\n" . extraire($source, 'addCreatedFile') . "\n" . extraire($source, 'appendFileLinks');
 eval('class RagSousTest {
     public array $createdFiles = [];
     public bool $fileToolAttempted = false;   // ajoutée par la branche anti-invention
+    public bool $writeToolSucceeded = false;
+    ' . ($ecriture[0] ?? '') . '
     public array $toolSources = [];
     public array $toolImages = [];
     public string $langue = "fr";
