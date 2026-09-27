@@ -41,6 +41,35 @@ identifiable, mais un risque : sur vLLM, le modèle **invente** au lieu d'appele
 faisait pas de façon aussi visible avec Ollama dans nos tests. **Non corrigé, à surveiller** — hors
 scope d'une correction de code ponctuelle.
 
+## 4 bis. Q8 approfondi (28/09 01:15–01:40) — le modèle croit savoir, il ne cherche pas
+Mesures reproductibles (`tests/eval_recherche_web.py`, `tests/eval_latence_reflexion.py`) : vrai payload d'eva
+(prompt système + 78 outils, reconstitué en lecture seule), vrai vLLM, 15 questions dont 5 jamais vues pendant la
+mise au point et 5 témoins qui ne doivent PAS déclencher de recherche.
+- `web_search_enabled=1`, l'outil est bien proposé au modèle, et il fonctionne (appel direct : 5 résultats).
+- Le modèle cherche pour « le cours de l'or » ou « les actualités », **jamais** pour « la dernière version de X »
+  (Nextcloud, PHP, Python, Ubuntu, iPhone) : il répond avec assurance des versions périmées de ses données
+  d'entraînement. Témoins jamais vus : **1/5**.
+- Retouches du prompt : **inefficaces** (suppression de la consigne « questions factuelles sans outil », règle en fin
+  de prompt, règle dans la description de l'outil, instructions personnalisées : 0 à 2/5 ; certaines font même
+  inventer le cours de l'or). Moins d'outils (3 au lieu de 78) : pire.
+- **Réflexion activée : 5/5**, mais **répond en anglais** à des questions françaises et coûte +2,5 à +5 s par réponse.
+- Dès que la recherche est faite, la réponse est juste (« Nextcloud 35, 16/09/2026 ») : tout se joue dans la décision.
+- Correction de ma part : `qwen3-30b-agent` n'est pas parfaitement déterministe (écarts d'un passage à l'autre).
+**Pistes, par ordre recommandé** : (1) rejouer cette évaluation sur les candidats de P4 (Gemma 4, Qwen3.6), qui
+décideront peut-être mieux ; (2) sinon, un petit détecteur de questions « datées » dans eva qui impose `web_search`
+au premier tour (`tool_choice`), déterministe ; (3) écartées : réflexion (anglais + lenteur), retouches du prompt.
+
+## 5. Liens « Ouvrir / Télécharger » sous chaque fichier créé (branche `liens-fichiers-crees`)
+Demande de l'admin (28/09). `create_file`, `create_files` et `create_note` renvoient désormais `url` (ouvre le
+fichier dans Nextcloud, `/index.php/f/<id>`) et `download_url` (WebDAV, téléchargement direct) ; eva ajoute sous sa
+réponse une ligne par fichier « 📄 nom — [Ouvrir](…) · [Télécharger](…) », **par le code** (même mécanisme que les
+images, `appendImageMarkdown`), libellés FR/AR/DE/EN selon la langue de l'interface. Liens privés : connexion et
+droit d'accès requis, aucun partage public créé. Un échec de génération de lien ne fait jamais échouer l'écriture.
+**Tests** : `tests/test_liens_fichiers.php` 7/7 sur le vrai code (a trouvé un défaut : un lot `create_files` avec un
+échec ne montrait aucun lien — corrigé) ; génération réelle par Nextcloud sur un fichier existant (a trouvé un 2e
+défaut : `/workspace/workspace/` en ligne de commande — corrigé) ; les deux adresses répondent 401 sans connexion.
+**Reste** : le clic réel avec une session ouverte, après déploiement.
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).

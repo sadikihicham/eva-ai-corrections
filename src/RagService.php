@@ -38,6 +38,8 @@ class RagService {
     private array $toolSources = [];
     /** @var list<array{url:string,title:string}> */
     private array $toolImages = [];
+    /** @var array<int,array{name:string,url:string,download_url:string}> files written in this answer, by file id */
+    private array $createdFiles = [];
 
     public function __construct(
         private AppConfig $config,
@@ -91,6 +93,7 @@ class RagService {
 		$this->config->setUserId($userId);
         $this->toolSources = [];
         $this->toolImages = [];
+        $this->createdFiles = [];
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -122,7 +125,7 @@ class RagService {
 			$toolCalls = $chat['tool_calls'] ?? [];
 			if ($toolCalls === []) {
 				$answer = $chat['answer'] ?? '';
-				$answer = $this->appendImageMarkdown((string)$answer);
+				$answer = $this->appendFileLinks($this->appendImageMarkdown((string)$answer));
 				return [
 					'answer' => $answer,
 					'sources' => $this->answerSources($byDoc),
@@ -189,7 +192,7 @@ class RagService {
         // tool chain into an empty reply was the worst possible outcome.
         $final = $this->ollama->chat($messages, []);
         $answer = trim((string)($final['answer'] ?? ''));
-        $answer = $this->appendImageMarkdown($answer);
+        $answer = $this->appendFileLinks($this->appendImageMarkdown($answer));
         if ($answer !== '') {
             return [
                 'answer' => $answer,
@@ -218,6 +221,7 @@ class RagService {
         $this->config->setUserId($userId);
             $this->toolSources = [];
             $this->toolImages = [];
+            $this->createdFiles = [];
         try {
             if ($this->clientDisconnected()) {
                 return;
@@ -345,7 +349,7 @@ $this->executor->setUserId($userId);
                 yield json_encode(['type' => 'error', 'message' => 'No text response received from Ollama.']) . "\n";
                 return;
             }
-            $answer = $this->appendImageMarkdown($answer);
+            $answer = $this->appendFileLinks($this->appendImageMarkdown($answer));
             yield json_encode([
                 'type' => 'done',
                 'answer' => $answer,
@@ -374,10 +378,25 @@ $this->executor->setUserId($userId);
      * @param array<string,mixed> $res the tool result envelope
      */
     private function collectToolSources(string $toolName, array $res): void {
+        if ($toolName === 'create_files' && is_array($res['result']['files'] ?? null)) {
+            // A batch reports ok=false as soon as ONE file fails: the files
+            // that were written still get their links, checked one by one.
+            foreach ($res['result']['files'] as $entry) {
+                if (is_array($entry) && !empty($entry['ok']) && is_array($entry['result'] ?? null)) {
+                    $this->addCreatedFile($entry['result']);
+                }
+            }
+            return;
+        }
         if (empty($res['ok']) || !is_array($res['result'] ?? null)) {
             return;
         }
         $result = $res['result'];
+
+        if ($toolName === 'create_file' || $toolName === 'create_note') {
+            $this->addCreatedFile($result);
+            return;
+        }
 
         if ($toolName === 'web_search') {
             // `results` is the ranked, bounded list the model saw.
@@ -436,6 +455,54 @@ $this->executor->setUserId($userId);
             $seen[$image['url']] = true;
             $title = str_replace(['[', ']'], '', trim($image['title'])) ?: 'Web image';
             $lines[] = '![' . $title . '](' . $image['url'] . ')';
+        }
+        return $lines === [] ? $answer : rtrim($answer) . "\n\n" . implode("\n", $lines);
+    }
+
+    /**
+     * Remember a file this answer wrote, with its direct links (see
+     * ActionExecutor::fileResult). Only http(s) links are kept.
+     *
+     * @param array<string,mixed> $result
+     */
+    private function addCreatedFile(array $result): void {
+        $url = trim((string)($result['url'] ?? ''));
+        $download = trim((string)($result['download_url'] ?? ''));
+        $id = (int)($result['file_id'] ?? 0);
+        if ($id <= 0 || !preg_match('~^https?://~i', $url) || !preg_match('~^https?://~i', $download)) {
+            return;
+        }
+        $this->createdFiles[$id] = [
+            'name' => basename((string)($result['path'] ?? '')) ?: ('#' . $id),
+            'url' => $url,
+            'download_url' => $download,
+        ];
+    }
+
+    /**
+     * Append "open / download" links for every file written in this answer,
+     * like appendImageMarkdown(): added by code, so the user always gets them
+     * even when the model does not repeat the tool result. A file whose open
+     * link the model already wrote is not repeated.
+     */
+    private function appendFileLinks(string $answer): string {
+        if ($this->createdFiles === []) {
+            return $answer;
+        }
+        $labels = match (substr($this->uiLanguage(), 0, 2)) {
+            'fr' => ['Ouvrir', 'Télécharger'],
+            'ar' => ['فتح', 'تنزيل'],
+            'de' => ['Öffnen', 'Herunterladen'],
+            default => ['Open', 'Download'],
+        };
+        $lines = [];
+        foreach (array_slice($this->createdFiles, 0, 20, true) as $file) {
+            if (str_contains($answer, $file['url'])) {
+                continue;
+            }
+            // Markdown-escape the file name so it cannot break or inject into the line.
+            $name = str_replace(['\\', '`', '*', '_', '[', ']', '<', '>'], ['\\\\', '\`', '\*', '\_', '\[', '\]', '&lt;', '&gt;'], $file['name']);
+            $lines[] = '📄 **' . $name . '** — [' . $labels[0] . '](' . $file['url'] . ') · [' . $labels[1] . '](' . $file['download_url'] . ')';
         }
         return $lines === [] ? $answer : rtrim($answer) . "\n\n" . implode("\n", $lines);
     }
