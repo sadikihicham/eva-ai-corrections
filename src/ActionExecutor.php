@@ -1929,7 +1929,7 @@ class ActionExecutor {
             if ($existing instanceof File) {
                 $existing->putContent($content);
                 $this->bumpSearchRevision();
-                return ['ok' => true, 'result' => $this->fileResult('Updated ' . $path, $home, $existing)];
+                return ['ok' => true, 'result' => 'Updated ' . $path] + $this->fileLinks($home, $existing);
             }
             return ['ok' => false, 'error' => 'A folder with that name already exists at ' . $path];
         }
@@ -1946,31 +1946,32 @@ class ActionExecutor {
         } catch (\Throwable $e) {
             return ['ok' => true, 'result' => 'Created ' . $path];
         }
-        return ['ok' => true, 'result' => $this->fileResult('Created ' . $path, $home, $created)];
+        return ['ok' => true, 'result' => 'Created ' . $path] + $this->fileLinks($home, $created);
     }
 
     /**
-     * Result of a file write, with two direct links so the user reaches the
-     * file without browsing the Files app: `url` opens it in Nextcloud
-     * (/index.php/f/<id>) and `download_url` downloads it (WebDAV, served as an
-     * attachment). Both need a logged-in session with access to the file: no
-     * public share is created and no permission changes. Building the links
-     * must never make the write itself fail, so any error degrades to the
-     * previous plain message.
+     * Direct links to a written file, returned NEXT TO the unchanged `result`
+     * string (key `file`), so every existing consumer keeps receiving the same
+     * "Created <path>" text — in particular the confirmation dialog, which
+     * would otherwise label a `result.url` as "Share created". `url` opens the
+     * file in Nextcloud (/index.php/f/<id>), `download_url` downloads it
+     * (WebDAV, served as an attachment). Both need a logged-in session with
+     * access to the file: no public share is created, no permission changes.
+     * Building the links never makes the write fail: any error returns [].
      *
-     * @return array<string,mixed>|string
+     * @return array{file?: array{name:string,path:string,file_id:int,url:string,download_url:string}}
      */
-    private function fileResult(string $message, Folder $home, \OCP\Files\Node $node): array|string {
+    private function fileLinks(Folder $home, \OCP\Files\Node $node): array {
         try {
             $relative = ltrim((string)$home->getRelativePath($node->getPath()), '/');
             $owner = explode('/', trim($home->getPath(), '/'))[0] ?? '';
             if ($relative === '' || $owner === '') {
-                return $message;
+                return [];
             }
             $urls = Server::get(\OCP\IURLGenerator::class);
             $davPath = implode('/', array_map('rawurlencode', explode('/', $relative)));
-            return [
-                'message' => $message,
+            return ['file' => [
+                'name' => $node->getName(),
                 'path' => $relative,
                 'file_id' => $node->getId(),
                 // getAbsoluteURL() with a path WITHOUT the web root: correct both in a web
@@ -1978,9 +1979,9 @@ class ActionExecutor {
                 // as /workspace in CLI). /index.php/f/<id> works with or without pretty URLs.
                 'url' => $urls->getAbsoluteURL('/index.php/f/' . $node->getId()),
                 'download_url' => $urls->getAbsoluteURL('/remote.php/dav/files/' . rawurlencode($owner) . '/' . $davPath),
-            ];
+            ]];
         } catch (\Throwable $e) {
-            return $message;
+            return [];
         }
     }
 

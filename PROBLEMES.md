@@ -70,6 +70,22 @@ droit d'accès requis, aucun partage public créé. Un échec de génération de
 défaut : `/workspace/workspace/` en ligne de commande — corrigé) ; les deux adresses répondent 401 sans connexion.
 **Reste** : le clic réel avec une session ouverte, après déploiement.
 
+**Revue adverse (agent séparé, 28/09 ~02:10) : aucun bloquant, 3 points importants — tous traités.**
+- n°1 : après une confirmation, le navigateur aurait affiché « ✅ Share created: … » (il lit `result.url` comme un
+  partage). → **Conception changée** : `result` redevient la phrase d'origine (« Created … ») et les liens voyagent
+  dans une clé séparée `file` (`ActionExecutor::fileLinks()`). Aucun consommateur d'eva ne voit de changement de
+  format ; le bouton « Share created » ne peut plus apparaître (règle aussi n°4 et n°11).
+- n°2 : …/f/12345 pris pour « déjà cité » si la réponse contient …/f/123456 → comparaison avec limite de fin de lien.
+- n°3 : si le modèle recopiait le seul lien « Ouvrir », toute la ligne sautait (téléchargement perdu) → la ligne
+  n'est omise que si les DEUX liens sont déjà cités.
+- Mineurs corrigés : nom lu par `Node::getName()` (n°6) ; caractères invisibles (U+202E…) retirés et `|` échappé
+  (n°7) ; « … +N autres fichiers » au-delà de 20 (n°10).
+- Mineurs reportés (sans risque pour ce déploiement) : langue des liens en tâche de fond (n°5, les outils fichiers
+  sont refusés hors web de toute façon) ; lien périmé si le fichier est renommé/supprimé dans la même réponse (n°8) ;
+  pas de lien si la réponse finale est vide (n°9) ; fragile si la racine web était `/r` ou `/i` (ici `/workspace`).
+- Les tests ont trouvé un défaut dans la correction elle-même (délimiteur `~` dans la regex → regex invalide, un test
+  passait par accident) : corrigé ; toute alerte PHP compte désormais comme un échec. **10/10.**
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).

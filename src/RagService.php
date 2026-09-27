@@ -378,13 +378,21 @@ $this->executor->setUserId($userId);
      * @param array<string,mixed> $res the tool result envelope
      */
     private function collectToolSources(string $toolName, array $res): void {
+        // File writes carry their links in `file`, next to the unchanged
+        // `result` text (see ActionExecutor::fileLinks()).
         if ($toolName === 'create_files' && is_array($res['result']['files'] ?? null)) {
             // A batch reports ok=false as soon as ONE file fails: the files
             // that were written still get their links, checked one by one.
             foreach ($res['result']['files'] as $entry) {
-                if (is_array($entry) && !empty($entry['ok']) && is_array($entry['result'] ?? null)) {
-                    $this->addCreatedFile($entry['result']);
+                if (is_array($entry) && !empty($entry['ok']) && is_array($entry['file'] ?? null)) {
+                    $this->addCreatedFile($entry['file']);
                 }
+            }
+            return;
+        }
+        if ($toolName === 'create_file' || $toolName === 'create_note') {
+            if (!empty($res['ok']) && is_array($res['file'] ?? null)) {
+                $this->addCreatedFile($res['file']);
             }
             return;
         }
@@ -392,11 +400,6 @@ $this->executor->setUserId($userId);
             return;
         }
         $result = $res['result'];
-
-        if ($toolName === 'create_file' || $toolName === 'create_note') {
-            $this->addCreatedFile($result);
-            return;
-        }
 
         if ($toolName === 'web_search') {
             // `results` is the ranked, bounded list the model saw.
@@ -473,7 +476,9 @@ $this->executor->setUserId($userId);
             return;
         }
         $this->createdFiles[$id] = [
-            'name' => basename((string)($result['path'] ?? '')) ?: ('#' . $id),
+            // Node::getName() from ActionExecutor, not basename(): basename() is locale-dependent and can cut
+            // multibyte (e.g. Arabic) names under a non-UTF-8 locale.
+            'name' => trim((string)($result['name'] ?? '')) ?: ('#' . $id),
             'url' => $url,
             'download_url' => $download,
         ];
@@ -482,27 +487,38 @@ $this->executor->setUserId($userId);
     /**
      * Append "open / download" links for every file written in this answer,
      * like appendImageMarkdown(): added by code, so the user always gets them
-     * even when the model does not repeat the tool result. A file whose open
-     * link the model already wrote is not repeated.
+     * even when the model does not repeat the tool result. A file is skipped
+     * only when the model already wrote BOTH of its links (an answer that only
+     * cites the open link still gets the line, so the download link is never
+     * lost), and a link only counts when it is not the prefix of a longer one
+     * (…/f/12345 must not match …/f/123456).
      */
     private function appendFileLinks(string $answer): string {
         if ($this->createdFiles === []) {
             return $answer;
         }
         $labels = match (substr($this->uiLanguage(), 0, 2)) {
-            'fr' => ['Ouvrir', 'Télécharger'],
-            'ar' => ['فتح', 'تنزيل'],
-            'de' => ['Öffnen', 'Herunterladen'],
-            default => ['Open', 'Download'],
+            'fr' => ['Ouvrir', 'Télécharger', 'autres fichiers'],
+            'ar' => ['فتح', 'تنزيل', 'ملفات أخرى'],
+            'de' => ['Öffnen', 'Herunterladen', 'weitere Dateien'],
+            default => ['Open', 'Download', 'more files'],
         };
+        $cited = static fn(string $url): bool
+            => preg_match('~' . preg_quote($url, '~') . '(?![0-9A-Za-z%._\~/-])~u', $answer) === 1;   // « \~ » : ~ est aussi le délimiteur
+        $max = 20;
         $lines = [];
-        foreach (array_slice($this->createdFiles, 0, 20, true) as $file) {
-            if (str_contains($answer, $file['url'])) {
+        foreach (array_slice($this->createdFiles, 0, $max, true) as $file) {
+            if ($cited($file['url']) && $cited($file['download_url'])) {
                 continue;
             }
-            // Markdown-escape the file name so it cannot break or inject into the line.
-            $name = str_replace(['\\', '`', '*', '_', '[', ']', '<', '>'], ['\\\\', '\`', '\*', '\_', '\[', '\]', '&lt;', '&gt;'], $file['name']);
-            $lines[] = '📄 **' . $name . '** — [' . $labels[0] . '](' . $file['url'] . ') · [' . $labels[1] . '](' . $file['download_url'] . ')';
+            // Drop control and invisible format characters (e.g. U+202E, which could disguise
+            // "fdp.exe" as "exe.pdf"), then Markdown-escape the name so it cannot break the line.
+            $name = preg_replace('/[\p{Cc}\p{Cf}]/u', '', $file['name']) ?? '';
+            $name = str_replace(['\\', '`', '*', '_', '[', ']', '|', '<', '>'], ['\\\\', '\`', '\*', '\_', '\[', '\]', '\|', '&lt;', '&gt;'], $name);
+            $lines[] = '📄 **' . ($name !== '' ? $name : '…') . '** — [' . $labels[0] . '](' . $file['url'] . ') · [' . $labels[1] . '](' . $file['download_url'] . ')';
+        }
+        if (count($this->createdFiles) > $max) {
+            $lines[] = '… +' . (count($this->createdFiles) - $max) . ' ' . $labels[2];
         }
         return $lines === [] ? $answer : rtrim($answer) . "\n\n" . implode("\n", $lines);
     }
