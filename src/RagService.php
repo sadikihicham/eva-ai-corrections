@@ -42,6 +42,8 @@ class RagService {
     private array $createdFiles = [];
     /** True once the model called a file-writing tool in this answer, even if the write failed. */
     private bool $fileToolAttempted = false;
+    /** Set by removeUnbackedFileLinks() for the current answer. */
+    private bool $removedFileLinks = false;
 
     /**
      * Sent (at most twice) when the user asked for a file and the model answered without
@@ -147,14 +149,14 @@ class RagService {
 			}
 			$toolCalls = $chat['tool_calls'] ?? [];
 			if ($toolCalls === []) {
-				if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, $tools)) {
+				if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, (string)($chat['answer'] ?? ''), $tools)) {
 					$nudges++;
 					$messages[] = ['role' => 'assistant', 'content' => (string)($chat['answer'] ?? '')];
 					$messages[] = ['role' => 'user', 'content' => self::CREATION_NUDGE];
 					continue;
 				}
 				$answer = $chat['answer'] ?? '';
-				$answer = $this->finishAnswer($userId, (string)$answer, $messages);
+				$answer = $this->finishAnswer($userId, $message, (string)$answer, $messages);
 				return [
 					'answer' => $answer,
 					'sources' => $this->answerSources($byDoc),
@@ -221,7 +223,7 @@ class RagService {
         // tool chain into an empty reply was the worst possible outcome.
         $final = $this->ollama->chat($messages, []);
         $answer = trim((string)($final['answer'] ?? ''));
-        $answer = $this->finishAnswer($userId, $answer, $messages);
+        $answer = $this->finishAnswer($userId, $message, $answer, $messages);
         if ($answer !== '') {
             return [
                 'answer' => $answer,
@@ -276,18 +278,23 @@ $this->executor->setUserId($userId);
             $toolFailure = false;
             $seenToolCalls = [];
             $nudges = 0;
+            // When a file is requested, the model's text is not streamed live: if it only claims the file, the
+            // retry replaces it, and the browser never shows the invented text (it gets `done.answer`).
+            $holdText = $this->isFileCreationRequest($message);
+			$requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
             $forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
-            if ($forced !== null) {
+            if ($forced !== null && !$this->clientDisconnected()) {
                 yield json_encode(['type' => 'tool', 'name' => 'web_search', 'arguments' => $this->safeToolArguments($forced)], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
                 $startedAt = microtime(true);
                 $res = $this->runForcedWebSearch($userId, $forced, $messages);
-                if ($res !== null) {
-                    $toolActivity = true;
-                    yield json_encode(['type' => 'tool_result', 'name' => 'web_search', 'ok' => !empty($res['ok']), 'error' => $res['error'] ?? null, 'url' => null,
-                        'result' => $this->safeToolResult($res['result'] ?? null), 'elapsed_ms' => max(0, (int)round((microtime(true) - $startedAt) * 1000))], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+                $toolActivity = $res !== null;
+                // Always close the trace entry, even when nothing was injected, so it never stays "running".
+                yield json_encode(['type' => 'tool_result', 'name' => 'web_search', 'ok' => !empty($res['ok']), 'error' => $res === null ? 'skipped' : ($res['error'] ?? null), 'url' => null,
+                    'result' => $this->safeToolResult($res['result'] ?? null), 'elapsed_ms' => max(0, (int)round((microtime(true) - $startedAt) * 1000))], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+                if ($this->clientDisconnected()) {
+                    return;
                 }
             }
-			$requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 			$maxToolRounds = max((int)AppConfig::LIMITS['agent_max_tool_rounds'][0], min($this->config->getInt('agent_max_tool_rounds', self::MAX_TOOL_ROUNDS), (int)AppConfig::LIMITS['agent_max_tool_rounds'][1]));
 			for ($round = 0; $round < $maxToolRounds; $round++) {
 				if (microtime(true) >= $requestDeadline) {
@@ -304,7 +311,9 @@ $this->executor->setUserId($userId);
                     $evType = $ev['type'] ?? '';
                     if ($evType === 'content') {
                         $answer .= $ev['delta'] ?? '';
-                        yield json_encode(['type' => 'content', 'delta' => $ev['delta'] ?? '']) . "\n";
+                        if (!$holdText) {
+                            yield json_encode(['type' => 'content', 'delta' => $ev['delta'] ?? '']) . "\n";
+                        }
                     } elseif ($evType === 'thinking') {
                         yield json_encode(['type' => 'thinking', 'delta' => $ev['delta'] ?? '']) . "\n";
                     } elseif ($evType === 'tool_calls') {
@@ -319,8 +328,8 @@ $this->executor->setUserId($userId);
                     return;
                 }
                 if ($toolCalls === []) {
-                    if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, $tools)) {
-                        // The text already streamed is replaced by `done.answer` in the browser.
+                    if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, $answer, $tools)) {
+                        // Not streamed (see $holdText): the browser never shows the invented text.
                         $nudges++;
                         $messages[] = ['role' => 'assistant', 'content' => $answer];
                         $messages[] = ['role' => 'user', 'content' => self::CREATION_NUDGE];
@@ -399,7 +408,7 @@ $this->executor->setUserId($userId);
                 yield json_encode(['type' => 'error', 'message' => 'No text response received from Ollama.']) . "\n";
                 return;
             }
-            $answer = $this->finishAnswer($userId, $answer, $messages);
+            $answer = $this->finishAnswer($userId, $message, $answer, $messages);
             yield json_encode([
                 'type' => 'done',
                 'answer' => $answer,
@@ -582,11 +591,29 @@ $this->executor->setUserId($userId);
      * "I created the file" without create_file, with invented links. Prompt rules
      * did not fix it (eva-corrections/PROBLEMES.md §4 bis), so these checks are
      * done by code and do not depend on the model or on the provider.
+     * v2 after an adversarial review: the web detector is deliberately narrow
+     * (the question leaves the instance), and the file check reacts to an
+     * invented CLAIM, not to the request alone.
      */
 
-    /** Final touches shared by every answer path: drop invented file links, then attach images and real file links. */
-    private function finishAnswer(string $userId, string $answer, array $messages): string {
-        return $this->appendFileLinks($this->appendImageMarkdown($this->removeUnbackedFileLinks($userId, $answer, $messages)));
+    /**
+     * Final touches shared by every answer path: invented file links are struck
+     * out, a creation claim with no file behind it gets a warning, then images
+     * and the real file links are attached.
+     */
+    private function finishAnswer(string $userId, string $message, string $answer, array $messages): string {
+        $this->removedFileLinks = false;
+        $answer = $this->removeUnbackedFileLinks($userId, $answer, $messages);
+        $falseClaim = $this->createdFiles === [] && $this->isFileCreationRequest($message) && $this->claimsCreation($answer);
+        if ($this->removedFileLinks || $falseClaim) {
+            $answer = trim(trim($answer) . "\n\n" . match (substr($this->uiLanguage(), 0, 2)) {
+                'fr' => '⚠️ Attention : aucun fichier correspondant n\'a été créé ni trouvé — l\'annonce ou le lien ci-dessus n\'est pas fiable. Redemandez si besoin.',
+                'ar' => '⚠️ تنبيه: لم يتم إنشاء أو العثور على أي ملف مطابق — الإعلان أو الرابط أعلاه غير موثوق. أعد الطلب إذا لزم الأمر.',
+                'de' => '⚠️ Achtung: Es wurde keine passende Datei erstellt oder gefunden – die Angabe oder der Link oben ist nicht zuverlässig. Bitte erneut anfragen.',
+                default => '⚠️ Warning: no matching file was created or found — the statement or link above is not reliable. Please ask again if needed.',
+            });
+        }
+        return $this->appendFileLinks($this->appendImageMarkdown($answer));
     }
 
     /** @param list<array<string,mixed>> $tools */
@@ -600,63 +627,61 @@ $this->executor->setUserId($userId);
     }
 
     /**
-     * Web search to run BEFORE the model answers, or null. Only two cases, kept
-     * narrow on purpose: an explicit request to search the web, or a question
-     * whose answer changes over time (latest version, news, price or rate now,
-     * weather). Questions about the user's own data ("my server", "my files")
-     * are left to the model. Long messages (pasted text) are never matched.
+     * Web search to run BEFORE the model answers, or null. The question leaves
+     * the instance as it is, so the detector is narrow on purpose:
+     *  - an explicit request to search the web;
+     *  - otherwise only public topics that change over time: the latest version
+     *    or release of a NAMED product, a market price (gold, bitcoin, currency),
+     *    news, the current holder of a public office.
+     * Anything that looks like the user's own work (my/our, mail, contract,
+     * client, file, server…) is never sent. Weather is left to the weather tool.
+     * Always mode "web": "all"/"news" also query the Bing/Google News feeds
+     * whatever provider the admin chose.
      *
      * @return array{query:string,mode:string}|null
      */
     private function forcedWebSearch(string $message): ?array {
         $text = trim((string)preg_replace('/\s+/u', ' ', $message));
-        if ($text === '' || mb_strlen($text) > 300) {
+        if ($text === '' || mb_strlen($text) > 200) {
             return null;
         }
         $m = mb_strtolower($text);
-        $query = ['query' => mb_substr($text, 0, 200), 'mode' => 'all'];
+        $query = ['query' => $text, 'mode' => 'web'];
         $explicit = [
-            '~(cherch|recherch|regard|trouv|v[ée]rifi)\p{L}*[^.?!\n]{0,40}(sur|dans|via)\s+(le\s+|l[\'’]\s*)?(net|web|internet|google)(?!\p{L})~u',
-            '~(recherche|search)\s+(web|internet|en\s+ligne|online)(?!\p{L})~u',
-            '~(search|look\s*up|google|check)[^.?!\n]{0,40}(on|in)\s+(the\s+)?(web|internet|net)(?!\p{L})~u',
-            '~(such|recherchier)\p{L}*[^.?!\n]{0,40}(im\s+(web|internet|netz)|online)~u',
-            '~(ابحث|بحث|ابحثي)[^.?!\n]{0,40}(الإنترنت|الانترنت|الويب|النت|جوجل)~u',
+            '~(cherch|recherch|regard|trouv|v[ée]rifi)\p{L}*[^.?!\n]{0,40}(?<!\p{L})(sur|via)\s+(le\s+|l[\'’]\s*)?(net|web|internet|google)(?!\p{L})~u',
+            '~(?<!\p{L})(recherche|search)\s+(web|internet|en\s+ligne|online)(?!\p{L})~u',
+            '~(?<!\p{L})(search|look\s*up|google)(?!\p{L})[^.?!\n]{0,40}(?<!\p{L})(on|in)\s+(the\s+)?(web|internet)(?!\p{L})(?!\s+(folder|directory|drive|share))~u',
+            '~(?<!\p{L})(such|recherchier)\p{L}*[^.?!\n]{0,40}im\s+(web|internet|netz)(?!\p{L})~u',
+            '~(ابحث|ابحثي)[^.?!\n]{0,40}(الإنترنت|الانترنت|الويب|النت|جوجل)~u',
         ];
         foreach ($explicit as $re) {
             if (preg_match($re, $m) === 1) {
                 return $query;
             }
         }
-        $personal = '~(?<!\p{L})(mes|mon|ma|my|mein\p{L}*|notre|nos|our)\s+(fichier|document|dossier|rendez|rdv|agenda|calendrier|r[ée]union|mail|e-?mail|courriel|t[aâ]che|note|contact|file|folder|calendar|appointment|meeting|task|app|application|serveur|server|nextcloud|instance|compte|account|installation|poste|pc|ordinateur|computer|t[ée]l[ée]phone|phone)~u';
-        if (preg_match($personal, $m) === 1) {
+        $work = '~(?<!\p{L})(mes|mon|ma|my|mein\p{L}*|notre|nos|our|unser\p{L}*|r[ée]dig\p{L}*|[ée]cri[srt]\p{L}*|write|draft|mail|e-?mail|courriel|devis|contrat|contract|client\p{L}*|customer|ticket|dossier|soci[ée]t[ée]|entreprise|company|filiale|subsidiary|conseil|board|association|club|[ée]quipe|team|projet|project|facture|invoice|patient|salari[ée]|employ[ée]|fichier|file|document|serveur|server|instance|interne|internal|chez\s+nous)(?!\p{L})~u';
+        if (preg_match($work, $m) === 1) {
             return null;
         }
-        $news = [
-            '~(?<!\p{L})(actualit[ée]s?|news|nachrichten|infos?\s+du\s+jour|أخبار|اخبار)(?!\p{L})~u',
-            '~(?<!\p{L})(cours|prix|price|taux\s+de\s+change|exchange\s+rate|bourse|stock|bitcoin|btc|crypto\p{L}*|سعر|أسعار)(?!\p{L})[^.?!\n]{0,40}(aujourd|actuel|maintenant|now|today|current|du\s+jour|en\s+ce\s+moment|live|اليوم|الآن|الحالي)~u',
-            '~(?<!\p{L})(score|r[ée]sultats?|match|[ée]lections?)(?!\p{L})[^.?!\n]{0,30}(aujourd|hier|today|yesterday|ce\s+soir|tonight)~u',
-        ];
-        foreach ($news as $i => $re) {
-            if (preg_match($re, $m) === 1) {
-                // Only real news goes to the news feeds: measured 28/09, "news" mode failed ("feeds could not be
-                // read") or returned stale articles for rates and prices, which "all" handles better.
-                return ['query' => $query['query'], 'mode' => $i === 0 ? 'news' : 'all'];
-            }
+        $product = '(nextcloud|php|python|node(?:\.?js)?|java|ubuntu|debian|fedora|red\s*hat|rhel|linux|kernel|windows|macos|ios|ipados|android|iphone|ipad|pixel|galaxy|chrome|firefox|safari|docker|kubernetes|postgres(?:ql)?|mysql|mariadb|nginx|apache|wordpress|laravel|symfony|django|react|angular|typescript|rust|golang|dotnet|vmware|esxi|proxmox|truenas|synology|qnap|pfsense|openssl|libreoffice|onlyoffice|collabora|teams|zoom|whatsapp|telegram|qwen|llama|gemma|mistral|chatgpt|gpt|claude|gemini|vllm|ollama)';
+        $latest = '(derni[eè]re?s?|latest|newest|most\s+recent|plus\s+r[ée]cente?s?|r[ée]cente?s?|actuelle?s?|current|stable|neueste\p{L}*|aktuelle\p{L}*|أحدث|آخر)';
+        $release = '(version|release|mise\s+[àa]\s+jour|update|sortie|mod[eè]le|model|إصدار|اصدار|الإصدار|نسخة|تحديث)';
+        if (preg_match('~(?<![\p{L}.])' . $product . '(?!\p{L})~u', $m) === 1 && (
+            preg_match('~(?<!\p{L})' . $latest . '(?!\p{L})[^.?!\n]{0,30}' . $release . '|' . $release . '[^.?!\n]{0,30}(?<!\p{L})' . $latest . '(?!\p{L})~u', $m) === 1
+            || preg_match('~(?<!\p{L})(sorti\p{L}*|sort|sortira|released?|release\s+date|date\s+de\s+sortie)(?!\p{L})~u', $m) === 1)) {
+            return $query;
         }
-        $changing = [
-            '~(?<!\p{L})(derni[eè]re?s?|latest|newest|most\s+recent|plus\s+r[ée]cente?s?|r[ée]cente?s?|actuelle?s?|current|neueste\p{L}*|aktuelle\p{L}*)\s+(version|release|mise\s+[àa]\s+jour|update|sortie)~u',
-            '~(?<!\p{L})(version|release)\s+(la\s+plus\s+r[ée]cente|actuelle|stable|courante|current|latest)~u',
-            '~(?<!\p{L})(quelle|what|which|welche)(?!\p{L})[^.?!\n]{0,25}(?<!\p{L})version(?!\p{L})~u',
-            '~(?<!\p{L})(latest|newest|derni[eè]re?|plus\s+r[ée]cente?|neueste\p{L}*)\s+(?:\p{L}+\s+){0,2}(mod[eè]le|model|modell)(?!\p{L})~u',
-            '~(?<!\p{L})(actuel\p{L}*|current|present|aktuelle\p{L}*)\s+(pr[ée]sident\p{L}*|premi[eè]re?\s+ministre|prime\s+minister|chancel\p{L}*|ceo|pdg|maire|mayor|roi|king|pape|pope)(?!\p{L})~u',
-            '~(?<!\p{L})(qui\s+est|who\s+is|wer\s+ist)\s+(le\s+|la\s+|the\s+|der\s+|die\s+)?(pr[ée]sident\p{L}*|premi[eè]re?\s+ministre|prime\s+minister|chancel\p{L}*|ceo|pdg|pape|pope)(?!\p{L})~u',
-            '~(أحدث|آخر)\s+(إصدار|اصدار|نسخة|تحديث)~u',
-            '~(?<!\p{L})(m[ée]t[ée]o|weather|wetter|الطقس)(?!\p{L})~u',
-        ];
-        foreach ($changing as $re) {
-            if (preg_match($re, $m) === 1) {
-                return $query;
-            }
+        $market = '(or|gold|argent|silver|p[ée]trole|oil|brent|bitcoin|btc|ethereum|crypto\p{L}*|dollar|euros?|dirhams?|aed|usd|eur|gbp|livre\s+sterling|yen|yuan|roupie|rupee|riyal|devises?|currency|cac\s*40|nasdaq|dow\s+jones|s&p\s*500|الذهب|بيتكوين|الدولار|اليورو|الدرهم)';
+        $price = '(prix|price|cours|valeur|value|taux(?:\s+de\s+change)?|exchange\s+rate|rate|combien\s+vaut|how\s+much\s+is|سعر)';
+        if (preg_match('~(?<!\p{L})' . $price . '(?!\p{L})[^.?!\n]{0,30}(?<!\p{L})' . $market . '(?!\p{L})~u', $m) === 1
+            || preg_match('~(?<!\p{L})' . $market . '(?!\p{L})[^.?!\n]{0,15}(?<!\p{L})' . $price . '(?!\p{L})~u', $m) === 1) {
+            return $query;
+        }
+        if (preg_match('~(?<!\p{L})(actualit[ée]s?|actus?|news|nachrichten|(?:ال)?أخبار|(?:ال)?اخبار)(?!\p{L})~u', $m) === 1) {
+            return $query;
+        }
+        if (preg_match('~(?<!\p{L})(actuel\p{L}*|current|present|aktuelle\p{L}*|qui\s+est|who\s+is|wer\s+ist)\s+(le\s+|la\s+|l[\'’]|the\s+|der\s+|die\s+)?(actuel\p{L}*\s+)?(pr[ée]sident\p{L}*|premi[eè]re?\s+ministre|prime\s+minister|chancel\p{L}*|pape|pope|roi|king|secr[ée]taire\s+g[ée]n[ée]ral)(?!\p{L})~u', $m) === 1) {
+            return $query;
         }
         return null;
     }
@@ -665,25 +690,27 @@ $this->executor->setUserId($userId);
      * Run the forced web search and add it to the conversation exactly like a
      * tool call the model would have made, so the model answers from the
      * results. A failed search is passed on too: the model then says the
-     * search failed instead of answering from memory.
+     * search failed instead of answering from memory. Never throws: any error
+     * leaves the conversation unchanged (the model decides as before).
      *
      * @param array{query:string,mode:string} $args
-     * @return array<string,mixed>|null the tool result, or null when the call needs a confirmation (not injected)
+     * @return array<string,mixed>|null the tool result, or null when nothing was injected
      */
     private function runForcedWebSearch(string $userId, array $args, array &$messages): ?array {
-        $res = $this->executor->run($userId, 'web_search', $args);
-        if (empty($res['ok']) && empty($res['confirmation_required']) && $args['mode'] !== 'web') {
-            $args['mode'] = 'web';
+        try {
             $res = $this->executor->run($userId, 'web_search', $args);
-        }
-        if (!empty($res['confirmation_required'])) {
+            if (!empty($res['confirmation_required'])) {
+                return null;
+            }
+            $this->collectToolSources('web_search', $res);
+            $call = ['id' => 'call_eva_' . bin2hex(random_bytes(4)), 'type' => 'function', 'function' => ['name' => 'web_search', 'arguments' => $args]];
+            $messages[] = ['role' => 'assistant', 'content' => '', 'tool_calls' => $this->canonicalToolCalls([$call])];
+            $messages[] = ['role' => 'tool', 'content' => json_encode($res, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)];
+            return $res;
+        } catch (\Throwable $e) {
+            $this->logger->warning('EVA forced web search failed: ' . $e->getMessage());
             return null;
         }
-        $this->collectToolSources('web_search', $res);
-        $call = ['id' => 'call_eva_' . bin2hex(random_bytes(4)), 'type' => 'function', 'function' => ['name' => 'web_search', 'arguments' => $args]];
-        $messages[] = ['role' => 'assistant', 'content' => '', 'tool_calls' => $this->canonicalToolCalls([$call])];
-        $messages[] = ['role' => 'tool', 'content' => json_encode($res, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)];
-        return $res;
     }
 
     /** True when the user asks EVA to produce a file (not how to make one). */
@@ -696,30 +723,76 @@ $this->executor->setUserId($userId);
         if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
             return false;
         }
-        $verb = '(cr[eé]+[rsz]?|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|create|generate|make|export|save|write|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب)';
-        $object = '(fichier|document|doc|docx|excel|xlsx|xls|tableur|classeur|pdf|csv|txt|markdown|md|note|file|spreadsheet|workbook|datei|ملف|مستند)';
+        $verb = '(cr[eé]+[rsz]?|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
+        $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|tableau|pdf|csv|txt|markdown|md|note|file|spreadsheet|workbook|powerpoint|pptx|datei|ملف|مستند|جدول|اكسل)';
         // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
-        // not a file to create: those requests must not trigger the creation check.
+        // not a file to create.
         $existing = '(?<!ce )(?<!cet )(?<!cette )(?<!ces )(?<!le )(?<!la )(?<!les )(?<!mon )(?<!ma )(?<!mes )(?<!ton )(?<!ta )(?<!tes )(?<!son )(?<!sa )(?<!ses )(?<!this )(?<!that )(?<!these )(?<!those )(?<!the )(?<!my )(?<!your )(?<!du )(?<!dans )';
         return preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})[^.?!\n]{0,60}(?<!\p{L})' . $existing . $object . '(?!\p{L})~u', $m) === 1;
     }
 
-    /** Ask the model once more when a file was requested and no file tool was even tried. */
-    private function needsCreationNudge(string $message, array $tools): bool {
-        return $this->createdFiles === [] && !$this->fileToolAttempted
-            && $this->hasTool($tools, 'create_file') && $this->isFileCreationRequest($message);
+    /**
+     * Does the answer claim (or announce) a file it did not create? A past-tense
+     * claim ("I have created…", "J'ai créé…"), an announced action ("je vais
+     * créer…") or a link to a Nextcloud file. A reply that ends with a question
+     * (asking what to put in the file) is a legitimate clarification, not a claim.
+     */
+    private function claimsCreation(string $answer): bool {
+        $a = mb_strtolower(trim($answer));
+        if ($a === '' || preg_match('~[?؟]\s*$~u', $a) === 1) {
+            return false;
+        }
+        if (preg_match('~/(?:index\.php/)?f/\d+|/remote\.php/(?:dav/files|webdav)/~', $a) === 1) {
+            return true;
+        }
+        return preg_match('~(j[\'’]ai\s+(bien\s+)?(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée]|pr[ée]par[ée]|export[ée]|sauvegard[ée]|r[ée]dig[ée])'
+            . '|a\s+(bien\s+)?[ée]t[ée]\s+(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée])'
+            . '|(je\s+vais|i\s+will|i[\'’]ll|let\s+me)\s+(cr[ée]er|g[ée]n[ée]rer|pr[ée]parer|create|generate|prepare|make)'
+            . '|i\s+(have\s+|[\'’]ve\s+)?(created|generated|saved|exported|prepared)|has\s+been\s+(created|generated|saved)'
+            . '|here\s+is\s+(your|the)\s+(file|document|spreadsheet)|voici\s+(votre|ton|le)\s+(fichier|document|tableau)'
+            . '|أنشأت|تم\s+إنشاء|habe\s+(\p{L}+\s+)?erstellt|wurde\s+erstellt)~u', $a) === 1;
     }
 
     /**
-     * Remove links to Nextcloud files that do not exist. A link is kept when it
-     * points to a file written in this answer, when it came from a tool result,
-     * the user or the file context (never from an earlier assistant answer,
-     * which may itself be invented), or when the file really exists in the
-     * user's home. Each line holding an invalid link is removed — it is the
-     * sentence claiming the file — and one warning replaces them.
+     * Ask the model again (at most twice) when a file was requested, no file
+     * tool was even tried, and the answer claims or announces the file anyway.
+     * Reacting to the claim, not to the request, keeps a plain text answer
+     * ("here are 10 ideas, no file needed") or a clarification untouched: on the
+     * web surface create_file runs without a confirmation dialog.
+     */
+    private function needsCreationNudge(string $message, string $answer, array $tools): bool {
+        return $this->createdFiles === [] && !$this->fileToolAttempted
+            && $this->hasTool($tools, 'create_file') && $this->isFileCreationRequest($message)
+            && $this->claimsCreation($answer);
+    }
+
+    /** Links to this Nextcloud only: a /f/123 link on another site is none of our business. Errors: treat as ours. */
+    private function isOwnNextcloudUrl(string $url): bool {
+        try {
+            $own = strtolower((string)parse_url($this->urlGenerator->getAbsoluteURL('/'), PHP_URL_HOST));
+            $host = strtolower((string)parse_url($url, PHP_URL_HOST));
+            return $own === '' || $host === $own || filter_var($host, FILTER_VALIDATE_IP) !== false;
+        } catch (\Throwable $e) {
+            return true;
+        }
+    }
+
+    /** $url cited in $text as a whole link (…/f/5 is not cited by …/f/55). */
+    private static function citesUrl(string $text, string $url): bool {
+        return preg_match('~' . preg_quote($url, '~') . '(?![0-9A-Za-z%._\~/-])~u', $text) === 1;
+    }
+
+    /**
+     * Strike out links to files of this Nextcloud that do not exist. A link is
+     * kept when it points to a file written in this answer, when it came from a
+     * tool result, the user or the file context (never from an earlier assistant
+     * answer, which may itself be invented), or when the file really exists in
+     * the user's home. Only the link is replaced (its label struck out), so a
+     * table row or a one-line answer keeps its content; a copied "📄" line is
+     * dropped whole. Sets $removedFileLinks so finishAnswer() adds one warning.
      */
     private function removeUnbackedFileLinks(string $userId, string $answer, array $messages): string {
-        if (preg_match_all('~https?://[^\s<>"\'()\[\]]+~u', $answer, $found) < 1) {
+        if (preg_match_all('~https?://[^\s<>"\'()\[\]«»“”]+~u', $answer, $found) < 1) {
             return $answer;
         }
         $trusted = [];
@@ -729,14 +802,15 @@ $this->executor->setUserId($userId);
         }
         $bad = [];
         foreach (array_unique($found[0]) as $url) {
-            $url = rtrim($url, '.,;:!?*_');
+            // Punctuation glued to the link, including French and Arabic marks.
+            $url = (string)preg_replace('~[.,;:!?*_»”’“«،؟。]+$~u', '', $url);
             $path = (string)parse_url($url, PHP_URL_PATH);
-            if (!preg_match('~/(?:index\.php/)?f/\d+/?$|/remote\.php/(?:dav/files|webdav)/~', $path) || isset($trusted[$url])) {
+            if (!preg_match('~/(?:index\.php/)?f/\d+/?$|/remote\.php/(?:dav/files|webdav)/~', $path) || isset($trusted[$url]) || !$this->isOwnNextcloudUrl($url)) {
                 continue;
             }
             $quoted = false;
             foreach ($messages as $msg) {
-                if (($msg['role'] ?? '') !== 'assistant' && is_string($msg['content'] ?? null) && str_contains($msg['content'], $url)) {
+                if (($msg['role'] ?? '') !== 'assistant' && is_string($msg['content'] ?? null) && self::citesUrl($msg['content'], $url)) {
                     $quoted = true;
                     break;
                 }
@@ -748,21 +822,24 @@ $this->executor->setUserId($userId);
         if ($bad === []) {
             return $answer;
         }
-        $kept = array_filter(preg_split('/\R/u', $answer) ?: [], static function (string $line) use ($bad): bool {
+        $this->removedFileLinks = true;
+        $lines = [];
+        foreach (preg_split('/\R/u', $answer) ?: [] as $line) {
+            $hit = false;
             foreach ($bad as $url) {
-                if (str_contains($line, $url)) {
-                    return false;
+                if (self::citesUrl($line, $url)) {
+                    $hit = true;
+                    $q = preg_quote($url, '~');
+                    $line = (string)preg_replace('~\[([^\]]*)\]\(' . $q . '\)~u', '~~$1~~', $line);
+                    $line = (string)preg_replace('~' . $q . '(?![0-9A-Za-z%._\~/-])~u', '', $line);
                 }
             }
-            return true;
-        });
-        $warning = match (substr($this->uiLanguage(), 0, 2)) {
-            'fr' => '⚠️ Lien retiré : il ne menait à aucun fichier existant. Aucun fichier n\'a été créé ni trouvé pour cette partie de la réponse — redemandez si besoin.',
-            'ar' => '⚠️ تمت إزالة رابط لا يؤدي إلى أي ملف موجود. لم يتم إنشاء أو العثور على أي ملف لهذا الجزء من الإجابة — أعد الطلب إذا لزم الأمر.',
-            'de' => '⚠️ Link entfernt: Er führte zu keiner vorhandenen Datei. Für diesen Teil der Antwort wurde keine Datei erstellt oder gefunden – bitte erneut anfragen.',
-            default => '⚠️ Link removed: it did not lead to any existing file. No file was created or found for that part of the answer — please ask again if needed.',
-        };
-        return trim(trim(implode("\n", $kept)) . "\n\n" . $warning);
+            if ($hit && str_starts_with(ltrim($line), '📄')) {
+                continue;   // imitation of the line appendFileLinks() adds: nothing left worth keeping
+            }
+            $lines[] = rtrim($line);
+        }
+        return trim(implode("\n", $lines));
     }
 
     /** Does a Nextcloud file link (/f/<id>, WebDAV path) point to a file of this user? Errors keep the link. */
@@ -788,10 +865,13 @@ $this->executor->setUserId($userId);
     /**
      * The "📄 name — [Open](…) · [Download](…)" lines appended by appendFileLinks()
      * are for the user only: sent back in the history, the model copied their
-     * format with invented file ids (28/09). Strip them from earlier answers.
+     * format with invented file ids (28/09). In earlier answers they become a
+     * plain "(file created: name)", so a follow-up ("add a line to that file")
+     * still knows which file it was.
      */
     private function stripFileLinkLines(string $content): string {
-        $out = preg_replace('~^📄 \*\*.+\*\* — \[[^\]]+\]\(https?://[^)\s]+\) · \[[^\]]+\]\(https?://[^)\s]+\)[ \t]*$\R?~mu', '', $content);
+        $out = preg_replace_callback('~^📄 \*\*(.+)\*\* — \[[^\]]+\]\(https?://[^)\s]+\) · \[[^\]]+\]\(https?://[^)\s]+\)[ \t]*$~mu',
+            static fn(array $m): string => '(file created: ' . preg_replace('~\\\\(.)~u', '$1', $m[1]) . ')', $content);
         return is_string($out) ? rtrim($out) : $content;
     }
 

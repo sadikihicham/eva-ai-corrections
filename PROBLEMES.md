@@ -123,6 +123,26 @@ les gardes neutralisés, 20 échecs (le test détecte bien le défaut) ; `test_l
 **Limites connues** : le texte déjà affiché en direct est remplacé par la réponse finale à la fin (comme avant) ;
 la question part telle quelle vers le moteur externe (déjà le cas quand le modèle cherche) ; pas de générateur PDF.
 
+**Revue adverse (agent séparé, 28/09 ~04:00) : 🔴 non déployable — 1 bloquant, 7 importants, 6 mineurs. v2 corrige :**
+- n°1 BLOQUANT (fuite) : des phrases de travail partaient telles quelles vers un moteur externe (« Quelle version du
+  contrat de Mme Martin… », « Qui est le CEO de notre filiale ? »). v2 : « dernière version » seulement avec un
+  logiciel/produit NOMMÉ ; prix seulement pour un marché (or, bitcoin, devises) ; liste de mots de travail qui bloque
+  (mon/notre, mail, devis, contrat, client, ticket, dossier, société, serveur, patient…) ; ≤ 200 caractères ; mode
+  `web` toujours (`all`/`news` interrogeaient Bing/Google News quel que soit le fournisseur) ; plus de 2e envoi ;
+  météo laissée à l'outil météo.
+- n°2/3 : la relance réagit à l'AFFIRMATION inventée (« j'ai créé… », « je vais créer… », lien de fichier) et plus à
+  la seule demande (une note ou un fichier non voulu était écrit sans confirmation) ; question de clarification
+  respectée ; si l'affirmation persiste sans fichier → avertissement.
+- n°4 : le message d'erreur ne suggère plus `content_base64` ; le binaire est vérifié par signature (`%PDF-`, `PK`…) ;
+  liste étendue (docm, xlsm, pptm, zip, images).
+- n°5/6/8 : ponctuation « » ، ؟ ” collée retirée ; comparaison du lien ENTIER (…/f/5 ≠ …/f/55) ; seul le lien est
+  barré (la ligne, un tableau restent) ; liens d'un autre site jamais touchés.
+- n°9/10/12 : recherche imposée après le délai, annulation respectée, `tool_result` toujours émis, `try/catch` ;
+  texte non diffusé en direct quand un fichier est demandé (le faux texte n'apparaît plus).
+- n°13 : dans l'historique, la ligne 📄 devient « (file created: nom) ».
+- n°14 : tests 93/93 dont toutes les phrases-pièges ; **contre-épreuve : les mêmes tests sur la v1 → 38 échecs**.
+  Non couverts (limite assumée) : boucles `ask()`/`askStream()` de bout en bout, liens de partage `/s/`.
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).

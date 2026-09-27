@@ -1918,11 +1918,23 @@ class ActionExecutor {
         }
         // Binary formats EVA has no generator for: plain text saved under such a
         // name is a corrupt file that no viewer opens (seen 28/09 with ".pdf").
-        // Refuse clearly so the model can offer a format it can really produce.
-        $noTextBuilder = ['pdf', 'doc', 'xls', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'epub'];
-        if (!$binary && in_array(strtolower(pathinfo($name, PATHINFO_EXTENSION)), $noTextBuilder, true)) {
-            return ['ok' => false, 'error' => 'EVA cannot generate .' . strtolower(pathinfo($name, PATHINFO_EXTENSION))
-                . ' files from text: nothing was created. Offer the user a .docx, .xlsx, .md or .txt file instead (these are generated correctly), or pass real file bytes in content_base64.'];
+        // Refuse clearly so the model offers a format it can really produce.
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        $noTextBuilder = ['pdf', 'doc', 'docm', 'xls', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'];
+        if (!$binary && in_array($ext, $noTextBuilder, true)) {
+            return ['ok' => false, 'error' => 'EVA cannot generate .' . $ext . ' files: nothing was created. '
+                . 'Tell the user, and offer a .docx, .xlsx, .md or .txt file instead (EVA generates these correctly).'];
+        }
+        // Bytes passed in content_base64 must really be of the announced type: a model
+        // asked for a PDF can otherwise base64-encode plain text and write a corrupt file.
+        $signatures = ['pdf' => ['%PDF-'], 'png' => ["\x89PNG"], 'jpg' => ["\xFF\xD8\xFF"], 'jpeg' => ["\xFF\xD8\xFF"], 'gif' => ['GIF8'],
+            'zip' => ["PK\x03\x04"], 'docx' => ["PK\x03\x04"], 'xlsx' => ["PK\x03\x04"], 'pptx' => ["PK\x03\x04"], 'docm' => ["PK\x03\x04"],
+            'xlsm' => ["PK\x03\x04"], 'pptm' => ["PK\x03\x04"], 'odt' => ["PK\x03\x04"], 'ods' => ["PK\x03\x04"], 'odp' => ["PK\x03\x04"], 'epub' => ["PK\x03\x04"]];
+        if ($binary && isset($signatures[$ext])) {
+            $matches = array_filter($signatures[$ext], static fn(string $sig): bool => str_starts_with($content, $sig));
+            if ($matches === []) {
+                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; offer a .docx, .xlsx, .md or .txt file instead.'];
+            }
         }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'docx') {
             try { $content = $this->buildDocx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'DOCX generation is unavailable on this server: ' . $e->getMessage()]; }
