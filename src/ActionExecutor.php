@@ -1929,7 +1929,8 @@ class ActionExecutor {
         // asked for a PDF can otherwise base64-encode plain text and write a corrupt file.
         $signatures = ['pdf' => ['%PDF-'], 'png' => ["\x89PNG"], 'jpg' => ["\xFF\xD8\xFF"], 'jpeg' => ["\xFF\xD8\xFF"], 'gif' => ['GIF8'],
             'zip' => ["PK\x03\x04"], 'docx' => ["PK\x03\x04"], 'xlsx' => ["PK\x03\x04"], 'pptx' => ["PK\x03\x04"], 'docm' => ["PK\x03\x04"],
-            'xlsm' => ["PK\x03\x04"], 'pptm' => ["PK\x03\x04"], 'odt' => ["PK\x03\x04"], 'ods' => ["PK\x03\x04"], 'odp' => ["PK\x03\x04"], 'epub' => ["PK\x03\x04"]];
+            'xlsm' => ["PK\x03\x04"], 'pptm' => ["PK\x03\x04"], 'odt' => ["PK\x03\x04"], 'ods' => ["PK\x03\x04"], 'odp' => ["PK\x03\x04"], 'epub' => ["PK\x03\x04"],
+            'doc' => ["\xD0\xCF\x11\xE0"], 'xls' => ["\xD0\xCF\x11\xE0"], 'ppt' => ["\xD0\xCF\x11\xE0"], '7z' => ["7z\xBC\xAF"], 'webp' => ['RIFF']];
         if ($binary && isset($signatures[$ext])) {
             $matches = array_filter($signatures[$ext], static fn(string $sig): bool => str_starts_with($content, $sig));
             if ($matches === []) {
@@ -2107,6 +2108,12 @@ class ActionExecutor {
         }
         $node = $this->resolve($home, $path);
         $parent = $node->getParent();
+        // Same rule as createFile: a text file renamed to .pdf/.xls/… is a corrupt file under a trusted name.
+        $toExt = strtolower(pathinfo($newName, PATHINFO_EXTENSION));
+        if (in_array($toExt, ['pdf', 'doc', 'docm', 'xls', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'], true)
+            && strtolower(pathinfo($path, PATHINFO_EXTENSION)) !== $toExt) {
+            return ['ok' => false, 'error' => 'Changing a file into .' . $toExt . ' by renaming is not allowed: the content would not be a real .' . $toExt . ' file. Nothing was renamed.'];
+        }
         if ($parent->nodeExists($newName)) {
             return ['ok' => false, 'error' => 'Target name already exists'];
         }

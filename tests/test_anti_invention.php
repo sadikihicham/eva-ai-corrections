@@ -1,6 +1,6 @@
 <?php
 /**
- * Tests des garde-fous « anti-invention » v2 (branche anti-invention, 28/09/2026, après revue adverse).
+ * Tests des garde-fous « anti-invention » v3 (branche anti-invention, 28/09/2026, après 2 revues adverses).
  *
  * Même principe que test_liens_fichiers.php : les VRAIES méthodes sont extraites de src/RagService.php et
  * chargées dans une classe de test minimale. Simulés : l'accès aux fichiers (linkedFileExists), l'hôte de
@@ -31,7 +31,8 @@ if (!preg_match('/private const CREATION_NUDGE = .*?;\n/s', $source, $nudge)) { 
 
 // eval() ne charge que du code extrait de NOTRE fichier versionné src/RagService.php (voir test_liens_fichiers.php).
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
-    'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks'];
+    'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
+    'isPrivateOrInventedHost'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -45,7 +46,8 @@ eval('class RagSousTest {
     private function uiLanguage(): string { return $this->langue; }
     private function appendImageMarkdown(string $a): string { return $a; }
     private function addToolSource(string $url, array $item): void { $this->toolSources[] = $url; }
-    private function isOwnNextcloudUrl(string $url): bool { return in_array(parse_url($url, PHP_URL_HOST), ["h", "192.168.1.99"], true); }
+    /** simulation de la partie « trusted_domains » ; la partie hôte inventé/privé est le VRAI code extrait */
+    private function isOwnNextcloudUrl(string $url): bool { $h = strtolower((string)parse_url($url, PHP_URL_HOST)); return self::isPrivateOrInventedHost($h) || $h === "cloud.exemple.ae"; }
     private function linkedFileExists(string $userId, string $url): bool {
         $p = rawurldecode((string)parse_url($url, PHP_URL_PATH));
         if (preg_match("~/f/(\\d+)/?$~", $p, $m)) return in_array((int)$m[1], $this->existants["ids"], true);
@@ -53,6 +55,7 @@ eval('class RagSousTest {
         return true;
     }
     public function web(string $q): ?array { return $this->forcedWebSearch($q); }
+    public function affirme(string $a): bool { return $this->claimsCreation($a); }
     public function fichier(string $q): bool { return $this->isFileCreationRequest($q); }
     public function relance(string $q, string $reponse, array $outils): bool { return $this->needsCreationNudge($q, $reponse, $outils); }
     public function collecter(string $outil, array $res): void { $this->collectToolSources($outil, $res); }
@@ -74,10 +77,8 @@ foreach ([
     "Quelle est la dernière version majeure de Nextcloud publiée, et quand ? Donne la source.",
     "Quelle est la dernière version stable de PHP ?",
     "Quel est le cours actuel de l'once d'or en dollars ?",
-    "Quelles sont les principales actualités sur l'intelligence artificielle cette semaine ?",
     "What is the latest released version of Python?",
     "Quelle est la dernière version LTS d'Ubuntu ?",
-    "Qui est l'actuel président de la République française ?",
     "C'est quoi la dernière version de Nextcloud ?",
     "What is the newest iPhone model?",
     "Quel est le taux de change actuel du dirham en euros ?",
@@ -90,15 +91,29 @@ foreach ([
     "Bitcoin price?",
     "Quand sort Nextcloud 35 ?",
     "Est-ce que PHP 8.5 est sorti ?",
-    "Quelles sont les dernières actus ?",
-    "ما هي آخر الأخبار",
 ] as $q) {
     verifie('web imposé : ' . $q, $t->web($q) !== null);
 }
-$r = $t->web("Quelles sont les actualités du jour ?");
+// v3 : actualités et fonctions publiques ne sont plus imposées (la requête ne pourrait pas être reconstruite sans
+// recopier les mots de l'utilisateur) : le modèle garde la décision, comme avant.
+foreach (["Quelles sont les principales actualités sur l'intelligence artificielle cette semaine ?", "Qui est l'actuel président de la République française ?",
+          "Quelles sont les dernières actus ?", "ما هي آخر الأخبار"] as $q) {
+    verifie('laissé au modèle : ' . $q, $t->web($q) === null);
+}
+foreach ([
+    ["Quelle est la dernière version stable de PHP ?", "php latest version"],
+    ["What is the newest iPhone model?", "iphone latest version"],
+    ["Quel est le cours actuel de l'once d'or en dollars ?", "gold USD price today"],
+    ["Quel est le taux de change actuel du dirham en euros ?", "EUR AED exchange rate today"],
+    ["Bitcoin price?", "bitcoin price today"],
+] as [$q, $attendu]) {
+    $r = $t->web($q);
+    verifie("requête RECONSTRUITE : « $attendu »", ($r['query'] ?? '') === $attendu, json_encode($r, JSON_UNESCAPED_UNICODE));
+}
+$r = $t->web("cherche sur internet les horaires de la bibliothèque de Dubaï");
+verifie('demande explicite : la phrase part telle quelle (consentement)', ($r['query'] ?? '') === "cherche sur internet les horaires de la bibliothèque de Dubaï", json_encode($r, JSON_UNESCAPED_UNICODE));
+$r = $t->web("Quel est le cours du bitcoin ?");
 verifie('toujours le mode « web » (all/news interrogent Bing/Google News quel que soit le fournisseur)', ($r['mode'] ?? '') === 'web', json_encode($r));
-$r = $t->web("Quelle est la dernière version de PHP ?");
-verifie('la requête envoyée = la question, intacte', ($r['query'] ?? '') === "Quelle est la dernière version de PHP ?", json_encode($r, JSON_UNESCAPED_UNICODE));
 
 // ── 2. Ne doit JAMAIS partir vers un moteur externe : questions de travail (phrases-pièges de la revue adverse)
 foreach ([
@@ -127,8 +142,22 @@ foreach ([
     "Check in the internet folder of the shared drive",
     "Quelle est la météo à Dubaï demain ?",
     str_repeat("Voici un long texte collé avec le mot actualités et dernière version de PHP. ", 4),
+    // 2e revue adverse
+    "Quel est le taux du dollar pour payer le fournisseur Al Futtaim 45 000 AED ?",
+    "La dernière version du rapport RH de Leila sur Teams est-elle prête ?",
+    "Donne-moi la dernière version du budget Zoom de Leila",
+    "Qui est le président de la résidence Al Noor ?",
+    "Les news du rendez-vous avec Dr Salem ?",
+    "Quelles sont les actus concernant la plainte de Mme Dupont ?",
+    "Quel est le cours de l'or pour le bijou de Fatima ?",
+    "Le prix de vente de l'appartement de M. Haddad dépend du cours de l'or",
+    "Le prix est bon, or Karim veut attendre",
 ] as $q) {
-    verifie('pas de web : ' . mb_substr($q, 0, 80), $t->web($q) === null);
+    // Propriété v3 : soit rien ne part, soit une requête RECONSTRUITE sans aucun mot propre à l'utilisateur.
+    $r = $t->web($q);
+    $fuite = $r !== null && (!preg_match('~^[a-z0-9 .&]+ (latest version|price today|exchange rate today)$~i', $r['query'])
+        || preg_match('~martin|sarah|paul|omega|haddad|karim|benali|leila|salem|dupont|fatima|futtaim|noor|durand|devis|contrat|ticket~i', $r['query']));
+    verifie('aucune fuite : ' . mb_substr($q, 0, 80) . ($r !== null ? ' → « ' . $r['query'] . ' »' : ''), !$fuite, json_encode($r, JSON_UNESCAPED_UNICODE));
 }
 
 // ── 3. Demande de création de fichier
@@ -153,6 +182,9 @@ foreach ([
     "Quelle est la dernière version stable de PHP ?",
     "Explique-moi comment exporter en PDF",
     "Écris un mail à Paul pour annuler la réunion",
+    "Fais-moi un tableau comparatif PHP 8.2 vs 8.3",
+    "Prépare un tableau récapitulatif des rendez-vous",
+    "Fais-moi une note de synthèse sur la réunion",
 ] as $q) {
     verifie('pas une création : ' . $q, !$t->fichier($q));
 }
@@ -169,6 +201,15 @@ verifie('relance : réponse en texte sans affirmation (« pas besoin de fichier 
 verifie('relance : outil create_file absent (actions désactivées) → non', !$t->relance($q, "J'ai créé le fichier.", []));
 $t->collecter('create_file', ['ok' => false, 'error' => 'EVA cannot generate .pdf files']);
 verifie('relance : create_file déjà tenté (même en échec) → non', !$t->relance($q, "J'ai créé le fichier.", $outils));
+foreach (["I've created the Excel file.", "I have created the file X. Would you like anything else?", "J'ai créé le fichier X. Souhaitez-vous autre chose ?",
+          "The file has been successfully created.", "Le fichier X est créé.", "Fichier créé : X", "Here's your spreadsheet", "Votre fichier est prêt",
+          "Je vous ai préparé le fichier", "تم انشاء الملف", "(file created: rapport.pdf)", "[EVA: file created in an earlier turn: x.pdf]",
+          "Voir http://h/workspace/index.php/f/12"] as $a) {
+    verifie('affirmation reconnue : ' . $a, $t->affirme($a));
+}
+foreach (["Voici le tableau comparatif :\n| a | b |", "Je vais créer le fichier. Quel nom voulez-vous ?", "Quel contenu voulez-vous mettre dans le fichier ?", "1. Accueil\n2. Café"] as $a) {
+    verifie('pas une affirmation : ' . str_replace("\n", ' ', $a), !$t->affirme($a));
+}
 verifie('le texte de relance exige de lire les données avant d\'écrire',
     str_contains(RagSousTest::CREATION_NUDGE, 'FIRST call the tool that reads') && str_contains(RagSousTest::CREATION_NUDGE, 'never write'));
 
@@ -183,7 +224,17 @@ verifie('cas réel Excel : libellé barré, avertissement, reste du texte gardé
 // fausse affirmation SANS lien, relances épuisées (revue n°3)
 $t = new RagSousTest();
 $r = $t->finir("J'ai créé Rendezvous.xlsx dans Documents.", [], $q);
-verifie('affirmation sans lien ni fichier → avertissement', str_contains($r, '⚠️ Attention'), $r);
+verifie('affirmation sans lien ni fichier → note « aucun fichier créé »', str_contains($r, 'ℹ️ Aucun fichier'), $r);
+$t = new RagSousTest();
+$r = $t->finir("I've created the Excel file for you. Anything else?", [], $q);
+verifie('formulation non reconnue par une regex ? couverte quand même par la note factuelle', str_contains($r, 'ℹ️ Aucun fichier'), $r);
+$t = new RagSousTest();
+$r = $t->finir("Voici le tableau :\n| a | b |", [], "Fais-moi un tableau comparatif PHP 8.2 vs 8.3");
+verifie('tableau dans le chat (pas une demande de fichier) → intact, sans note', $r === "Voici le tableau :\n| a | b |", $r);
+foreach (["http://localhost/index.php/f/3660074", "https://your-nextcloud/index.php/f/5", "http://nextcloud.local/remote.php/dav/files/hicham/x.xlsx"] as $u) {
+    $t = new RagSousTest();
+    verifie('hôte inventé traité comme le nôtre → faux lien retiré : ' . $u, str_contains($t->finir("Ici : $u"), '⚠️'));
+}
 $t = new RagSousTest();
 verifie('réponse normale sans demande de fichier → intacte', $t->finir("Nextcloud est une plateforme de partage.") === "Nextcloud est une plateforme de partage.");
 
@@ -206,7 +257,7 @@ verifie('retirer …/f/5 ne touche pas …/f/55 sur la même ligne', str_contain
 // autre site : jamais vérifié ni retiré (revue n°8)
 $t = new RagSousTest();
 $ext = "Doc : https://docs.example.org/index.php/f/5";
-verifie('lien /f/ d\'un autre site → intact', $t->finir($ext) === $ext, $t->finir($ext));
+verifie('lien /f/ d\'un vrai site public → intact', $t->finir($ext) === $ext, $t->finir($ext));
 // ligne de tableau : seul le lien est barré (revue n°8)
 $t = new RagSousTest();
 $r = $t->finir("| Janvier | [rapport](http://h/workspace/index.php/f/9) | 12 |");
@@ -237,7 +288,9 @@ verifie('avertissement en arabe', str_contains($t->finir("http://h/workspace/ind
 // ── 6. Historique : la ligne 📄 devient « (file created: nom) » (revue n°13)
 $t = new RagSousTest();
 $h = "J'ai créé le fichier.\n\n📄 **Rendezvous\\_summary.docx** — [Open](http://192.168.1.99/workspace/index.php/f/3660073) · [Download](http://192.168.1.99/workspace/remote.php/dav/files/hicham/Rendezvous_summary.docx)";
-verifie('historique : ligne 📄 → « (file created: nom) », sans lien ni échappement', $t->historique($h) === "J'ai créé le fichier.\n\n(file created: Rendezvous_summary.docx)", $t->historique($h));
+verifie('historique : ligne 📄 → marqueur EVA, sans lien ni échappement', $t->historique($h) === "J'ai créé le fichier.\n\n[EVA: file created in an earlier turn: Rendezvous_summary.docx]", $t->historique($h));
+$h2 = "📄 **a&lt;b.md** — [Open](http://h/workspace/index.php/f/1) · [Download](http://h/workspace/remote.php/dav/files/hicham/a%3Cb.md)";
+verifie('historique : entités &lt; décodées dans le nom', $t->historique($h2) === "[EVA: file created in an earlier turn: a<b.md]", $t->historique($h2));
 verifie('historique : texte sans ligne 📄 inchangé', $t->historique("Bonjour 📄 **x**") === "Bonjour 📄 **x**");
 
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";

@@ -143,6 +143,23 @@ la question part telle quelle vers le moteur externe (déjà le cas quand le mod
 - n°14 : tests 93/93 dont toutes les phrases-pièges ; **contre-épreuve : les mêmes tests sur la v1 → 38 échecs**.
   Non couverts (limite assumée) : boucles `ask()`/`askStream()` de bout en bout, liens de partage `/s/`.
 
+**Revue de vérification (2e agent, 28/09 ~05:00) : 🔴 encore** — les listes de mots se contournent (« le taux du dollar
+pour payer le fournisseur Al Futtaim… » partait encore), les affirmations ont trop de formulations (« I've created… »,
+« …créé. Souhaitez-vous… ? »), et la v2 créait une RÉGRESSION (« fais un tableau comparatif » → relance → fichier
+écrit sans le vouloir). **Conclusion : on change de principe, v3 sûre par construction :**
+- Recherche imposée : la requête est **reconstruite** à partir des seuls mots reconnus (« php latest version »,
+  « gold USD price today ») → les mots de l'utilisateur ne sortent jamais, même si le détecteur se trompe. Seule une
+  demande explicite (« cherche sur internet… ») envoie la phrase (consentement). Actualités et fonctions publiques :
+  laissées au modèle. « or » seulement sous la forme l'or / d'or.
+- Au lieu de deviner toutes les façons d'affirmer un fichier : quand un fichier est demandé et qu'aucun n'a été
+  écrit, eva ajoute TOUJOURS « ℹ️ Aucun fichier n'a été créé pour cette demande » (vrai dans 100 % des cas). La
+  relance (qui peut écrire) ne part que sur une affirmation forte ; « tableau / note / markdown » seuls ne sont plus
+  des demandes de fichier.
+- Hôtes inventés (localhost, sans point, *.local, IP) traités comme le nôtre ; `trusted_domains` lu ; historique
+  « [EVA: file created in an earlier turn: X] » (repéré si le modèle l'imite) ; `renameFile` refuse txt→pdf ;
+  signatures .doc/.xls/.ppt/.7z/.webp ; trace de recherche toujours fermée dans `ask()`.
+**Tests 133/133 ; contre-épreuve : la v2 en échoue 50, la v1 38 (sur 93).**
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).
