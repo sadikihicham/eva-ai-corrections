@@ -29,11 +29,16 @@ function extraire(string $src, string $methode): string {
 }
 if (!preg_match('/private const CREATION_NUDGE = .*?;\n/s', $source, $nudge)) { fwrite(STDERR, "CREATION_NUDGE absente\n"); exit(2); }
 if (!preg_match('/private const WRITE_TOOLS = .*?;\n/s', $source, $ecriture)) { fwrite(STDERR, "WRITE_TOOLS absente\n"); exit(2); }
+$autres = '';
+foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE'] as $c) {
+    if (!preg_match('/private const ' . $c . ' = .*?;\n/s', $source, $x)) { fwrite(STDERR, "$c absente\n"); exit(2); }
+    $autres .= str_replace('private const', 'public const', $x[0]);
+}
 
 // eval() ne charge que du code extrait de NOTRE fichier versionné src/RagService.php (voir test_liens_fichiers.php).
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
     'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
-    'isPrivateOrInventedHost'];
+    'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -41,7 +46,8 @@ eval('class RagSousTest {
     public bool $fileToolAttempted = false;
     public bool $removedFileLinks = false;
     public bool $writeToolSucceeded = false;
-    ' . $ecriture[0] . '
+    public array $calledTools = [];
+    ' . $ecriture[0] . $autres . '
     public array $toolSources = [];
     public string $langue = "fr";
     /** fichiers « existants » du faux utilisateur hicham : ids et chemins */
@@ -59,6 +65,8 @@ eval('class RagSousTest {
     }
     public function web(string $q): ?array { return $this->forcedWebSearch($q); }
     public function affirme(string $a): bool { return $this->claimsCreation($a); }
+    public function relanceGenerale(string $q, string $a, array $outils): ?string { return $this->nudgeFor($q, $a, $outils); }
+    public function meteo(string $q): bool { return $this->isWeatherQuestion($q); }
     public function fichier(string $q): bool { return $this->isFileCreationRequest($q); }
     public function relance(string $q, string $reponse, array $outils): bool { return $this->needsCreationNudge($q, $reponse, $outils); }
     public function collecter(string $outil, array $res): void { $this->collectToolSources($outil, $res); }
@@ -222,6 +230,35 @@ foreach (["Bonjour M. Karim, votre facture PDF a été générée et le contrat 
 }
 verifie('le texte de relance exige de lire les données avant d\'écrire',
     str_contains(RagSousTest::CREATION_NUDGE, 'FIRST call the tool that reads') && str_contains(RagSousTest::CREATION_NUDGE, 'never write'));
+
+// ── 4 bis. Recherche proposée au lieu d'être faite ; météo inventée (réponses réelles d'eva du 28/09)
+$tous = [['type' => 'function', 'function' => ['name' => 'web_search']], ['type' => 'function', 'function' => ['name' => 'weather']], ['type' => 'function', 'function' => ['name' => 'create_file']]];
+foreach ([
+    "Je ne suis pas en mesure de consulter les actualités en temps réel. Cependant, je peux vous aider à effectuer une recherche sur le web pour trouver les dernières nouvelles. Voulez-vous que je fasse cela pour vous ?",
+    "Je ne peux pas accéder aux actualités en temps réel ou aux sources externes. Cependant, vous pouvez utiliser le moteur de recherche web pour obtenir les dernières nouvelles. Voulez-vous que je cherche les dernières nouvelles pour vous ?",
+    "I can't browse the internet in real time. Would you like me to search the web for it?",
+] as $a) {
+    $t = new RagSousTest();
+    verifie('recherche proposée au lieu d\'être faite → relance recherche : ' . mb_substr($a, 0, 60), $t->relanceGenerale("appel news ?", $a, $tous) === RagSousTest::SEARCH_NUDGE);
+}
+$t = new RagSousTest(); $t->collecter('web_search', ['ok' => true, 'result' => ['results' => []]]);
+verifie('recherche déjà faite dans ce tour → pas de relance recherche', $t->relanceGenerale("appel news ?", "Voulez-vous que je cherche encore ?", $tous) === null);
+$t = new RagSousTest();
+verifie('recherche désactivée (outil absent) → pas de relance', $t->relanceGenerale("appel news ?", "Voulez-vous que je fasse une recherche ?", []) === null);
+$t = new RagSousTest();
+verifie('réponse normale → aucune relance', $t->relanceGenerale("Explique Nextcloud", "Nextcloud est une plateforme de partage de fichiers.", $tous) === null);
+$t = new RagSousTest();
+verifie('météo inventée (« 38 °C » sans outil) → relance météo', $t->relanceGenerale("donne moi la temperature de demin a dubai", "La température prévue pour demain à Dubaï est de 38 °C.", $tous) === RagSousTest::WEATHER_NUDGE);
+$t = new RagSousTest(); $t->collecter('weather', ['ok' => true, 'result' => ['location' => 'Dubai']]);
+verifie('outil météo appelé → pas de relance', $t->relanceGenerale("météo à Dubaï demain", "Demain à Dubaï : 38 °C.", $tous) === null);
+$t = new RagSousTest();
+verifie('météo : eva demande la ville → pas de relance', $t->relanceGenerale("Quel temps fera-t-il demain ?", "Pour quelle ville ?", $tous) === null);
+foreach (["donne moi la temperature de demin a dubai", "Quelle est la météo à Dubaï ?", "Il va pleuvoir demain ?", "weather in Paris tomorrow", "Quel temps fait-il à Rabat ?", "كيف الطقس في دبي"] as $qm) {
+    verifie('question météo : ' . $qm, $t->meteo($qm));
+}
+foreach (["Quelle température pour cuire un poulet ?", "La température du serveur est élevée", "Explique le climat de Dubaï en été", "La température du four à 180 degrés"] as $qm) {
+    verifie('pas une question météo : ' . $qm, !$t->meteo($qm));
+}
 
 // ── 5. Faux liens : le cas réel du 28/09 (Excel), recopié tel quel
 $t = new RagSousTest();

@@ -46,6 +46,14 @@ class RagService {
     private bool $removedFileLinks = false;
     /** A tool that writes to the user's files succeeded in this answer. */
     private bool $writeToolSucceeded = false;
+    /** @var array<string,true> tools called (or forced) in this answer, by name */
+    private array $calledTools = [];
+    private const SEARCH_NUDGE = '[Automatic check by EVA, not written by the user] You DO have the web_search tool and it works: never say you cannot '
+        . 'access the web or real-time news, and do not offer to search. Call web_search now with a short query for the user\'s request, then '
+        . 'answer from the results in the language of the user\'s request.';
+    private const WEATHER_NUDGE = '[Automatic check by EVA, not written by the user] You answered a weather question without calling the `weather` '
+        . 'tool, so any figure you gave is invented. Call `weather` now with the place from the request (ask the user only if no place is given), '
+        . 'then answer from its result in the language of the user\'s request.';
     private const WRITE_TOOLS = ['create_file', 'create_files', 'create_note', 'copy_file', 'move_file', 'rename_file', 'restore_file_version', 'create_sticker'];
 
     /**
@@ -115,6 +123,7 @@ class RagService {
         $this->createdFiles = [];
         $this->fileToolAttempted = false;
         $this->writeToolSucceeded = false;
+        $this->calledTools = [];
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -154,10 +163,11 @@ class RagService {
 			}
 			$toolCalls = $chat['tool_calls'] ?? [];
 			if ($toolCalls === []) {
-				if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, (string)($chat['answer'] ?? ''), $tools)) {
+				$nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($message, (string)($chat['answer'] ?? ''), $tools) : null;
+				if ($nudge !== null) {
 					$nudges++;
 					$messages[] = ['role' => 'assistant', 'content' => (string)($chat['answer'] ?? '')];
-					$messages[] = ['role' => 'user', 'content' => self::CREATION_NUDGE];
+					$messages[] = ['role' => 'user', 'content' => $nudge];
 					continue;
 				}
 				$answer = $chat['answer'] ?? '';
@@ -260,6 +270,7 @@ class RagService {
             $this->createdFiles = [];
             $this->fileToolAttempted = false;
             $this->writeToolSucceeded = false;
+            $this->calledTools = [];
         try {
             if ($this->clientDisconnected()) {
                 return;
@@ -286,7 +297,7 @@ $this->executor->setUserId($userId);
             $nudges = 0;
             // When a file is requested, the model's text is not streamed live: if it only claims the file, the
             // retry replaces it, and the browser never shows the invented text (it gets `done.answer`).
-            $holdText = $this->isFileCreationRequest($message);
+            $holdText = $this->isFileCreationRequest($message) || $this->isWeatherQuestion($message);
 			$requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
             $forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
             if ($forced !== null && !$this->clientDisconnected()) {
@@ -334,11 +345,12 @@ $this->executor->setUserId($userId);
                     return;
                 }
                 if ($toolCalls === []) {
-                    if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, $answer, $tools)) {
+                    $nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($message, $answer, $tools) : null;
+                    if ($nudge !== null) {
                         // Not streamed (see $holdText): the browser never shows the invented text.
                         $nudges++;
                         $messages[] = ['role' => 'assistant', 'content' => $answer];
-                        $messages[] = ['role' => 'user', 'content' => self::CREATION_NUDGE];
+                        $messages[] = ['role' => 'user', 'content' => $nudge];
                         $answer = '';
                         continue;
                     }
@@ -443,6 +455,7 @@ $this->executor->setUserId($userId);
      * @param array<string,mixed> $res the tool result envelope
      */
     private function collectToolSources(string $toolName, array $res): void {
+        $this->calledTools[$toolName] = true;
         // Any tool that writes to the user's files counts as an attempt; a successful one also cancels the
         // "no file was created" notice (copy, move, restore… do not fill $createdFiles).
         if (in_array($toolName, self::WRITE_TOOLS, true)) {
@@ -800,6 +813,50 @@ $this->executor->setUserId($userId);
         }
         $future = '~(je\s+vais|i\s+will|i[\'’]ll|let\s+me)\s+(cr[ée]er|g[ée]n[ée]rer|pr[ée]parer|create|generate|prepare|make)~u';
         return preg_match($future, $a) === 1 && preg_match('~[?؟]\s*$~u', $a) !== 1;
+    }
+
+    /**
+     * Which retry, if any, this answer needs (null = none). Shared budget of two
+     * retries per answer. Each case reacts to a tool the model SHOULD have
+     * called and did not:
+     *  - a file claimed or announced without any write (CREATION_NUDGE);
+     *  - a web search offered ("voulez-vous que je cherche ?") or declared
+     *    impossible instead of being done (seen 28/09: "appel news ?"). The
+     *    model then writes its own query, as when it searches by itself;
+     *  - a weather question answered without the weather tool (seen 28/09:
+     *    "38 °C demain à Dubaï" invented).
+     */
+    private function nudgeFor(string $message, string $answer, array $tools): ?string {
+        if ($this->needsCreationNudge($message, $answer, $tools)) {
+            return self::CREATION_NUDGE;
+        }
+        if (!isset($this->calledTools['web_search']) && $this->hasTool($tools, 'web_search') && $this->offersSearchInstead($answer)) {
+            return self::SEARCH_NUDGE;
+        }
+        if (!isset($this->calledTools['weather']) && $this->hasTool($tools, 'weather') && $this->isWeatherQuestion($message)
+            && preg_match('~[?؟]\s*$~u', trim($answer)) !== 1) {
+            return self::WEATHER_NUDGE;
+        }
+        return null;
+    }
+
+    /** The answer offers a web search, or claims it cannot reach the web / real-time news, instead of searching. */
+    private function offersSearchInstead(string $answer): bool {
+        $a = mb_strtolower(trim($answer));
+        return $a !== '' && preg_match('~(voulez-vous|souhaitez-vous|veux-tu|voulez\s+vous|would\s+you\s+like|do\s+you\s+want|shall\s+i|should\s+i)[^?؟]{0,80}(recherch|cherch|search|look\s+up|actualit|news)'
+            . '|je\s+(peux|pourrais)\s+(vous\s+|t[\'’])?(aider\s+[àa]\s+)?(effectuer|faire|lancer|mener)\s+une\s+recherche'
+            . '|(je\s+ne\s+(peux|suis)\s+pas\s+(en\s+mesure\s+de\s+)?(acc[ée]der|consulter|naviguer|chercher))[^.]{0,60}(temps\s+r[ée]el|actualit|internet|web|en\s+ligne|sources?\s+externes?)'
+            . '|i\s+(can(no|[\'’])t|am\s+(not\s+able|unable)\s+to|do\s+not\s+have\s+access\s+to)\s+(access|browse|check|search|real[- ]time)[^.]{0,40}(real[- ]time|internet|web|news|online)?'
+            . '|لا\s+(يمكنني|أستطيع)\s+(الوصول|تصفح)~u', $a) === 1;
+    }
+
+    /** A question about the weather (forecast, rain, outside temperature), not "the oven temperature". */
+    private function isWeatherQuestion(string $message): bool {
+        $m = mb_strtolower(trim($message));
+        return $m !== '' && mb_strlen($m) <= 300 && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|wetter|pr[ée]visions?\s+m[ée]t[ée]o|pleuvoir|pleut|pluie|neige|rain|snow|الطقس)(?!\p{L})'
+            . '|temps\s+(qu[\'’]il\s+)?(fait|fera)|temp[ée]rature[^.?!\n]{0,30}(demain|demin|aujourd|ce\s+soir|cette\s+semaine|week-?end|dehors|ext[ée]rieur|tomorrow|today|tonight|outside)'
+            . '|temp[ée]rature[^.?!\n]{0,40}(?<!\p{L})(à|a|au|en|in|at)\s+\p{L}{3,}'
+            . '|درجة\s+الحرارة~u', $m) === 1;
     }
 
     /**
