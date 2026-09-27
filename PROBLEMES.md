@@ -86,6 +86,43 @@ défaut : `/workspace/workspace/` en ligne de commande — corrigé) ; les deux 
 - Les tests ont trouvé un défaut dans la correction elle-même (délimiteur `~` dans la regex → regex invalide, un test
   passait par accident) : corrigé ; toute alerte PHP compte désormais comme un échec. **10/10.**
 
+**Déployé le 28/09 01:56** (f236b1a). Test réel de l'admin : docx ✅ ouvrir + télécharger. Excel et PDF ❌ — voir §6 :
+ce n'était pas le code des liens, **aucun fichier n'avait été créé**.
+
+## 6. eva invente au lieu d'agir (branche `anti-invention`, 28/09)
+**Constat (conversation `87004a68` + index des fichiers, lecture seule)** : pour « crée un fichier excel / pdf », le
+modèle n'a appelé AUCUN outil ; il a répondu « I have created… » et a recopié la ligne 📄 de la réponse précédente
+(vue dans l'historique) avec des identifiants inventés (3660074/75 = dossiers internes de Collabora). Même le docx
+contenait des rendez-vous inventés (agenda jamais lu). Et eva ne sait pas générer de PDF : du texte aurait été
+écrit dans un `.pdf` illisible.
+
+**Q8 : la vraie cause est le moteur de recherche.** Recherche imposée + vrais résultats + vrai vLLM : 4/10 réponses
+toujours fausses. Les résultats du moteur configuré (`bing`) sont hors sujet (« dernière version de Nextcloud » →
+hôtels ; « version de PHP » → Gmail ; « Python » → WhatsApp) : le modèle les écarte, à raison, et répond de
+mémoire. DuckDuckGo : excellent à la 1re requête, vide dès la 2e (blocage anti-robot). → **Décision d'infrastructure**
+(SearXNG auto-hébergé, qui peut interroger Google, ou fournisseur à clé) : aucun code ne compense un moteur qui
+renvoie Gmail pour « PHP ».
+
+**Corrections (par le code, indépendantes du modèle et du fournisseur)** :
+- `forcedWebSearch()` : demande explicite de recherche web, ou question qui change avec le temps (dernière
+  version, actualités, cours/taux « actuel », météo, titulaire d'une fonction) → `web_search` exécuté AVANT le
+  modèle et injecté comme un appel d'outil. Exclus : questions sur les données de l'utilisateur (« mon serveur »),
+  messages > 300 caractères. Mode `news` seulement pour l'actualité ; repli sur `web` si la recherche échoue.
+  `tool_choice` testé aussi (fonctionne sur vLLM, ~1 s) mais les requêtes du modèle ≈ la question : pas de gain,
+  et il ne marche pas avec Ollama.
+- Relance (au plus 2) si un fichier est demandé et qu'aucun outil fichier n'a été tenté : **mesurée sur le vrai
+  vLLM** — version courte : 6/6 `create_file` mais contenu INVENTÉ ; version retenue (« lis d'abord les données ») :
+  8/9 corrects (lit l'agenda puis écrit).
+- `removeUnbackedFileLinks()` : un lien de fichier Nextcloud qui ne mène à aucun fichier de l'utilisateur (et ne
+  vient ni d'un outil de ce tour, ni de l'utilisateur) est retiré avec sa phrase, remplacé par un avertissement.
+- Lignes 📄 retirées de l'historique envoyé au modèle (il ne peut plus les imiter).
+- `createFile` refuse d'écrire du texte dans `.pdf/.doc/.xls/.ppt/.pptx/.odt/.ods/.odp/.epub` (fichier corrompu)
+  et propose .docx/.xlsx/.md.
+**Tests** : `tests/test_anti_invention.php` 58/58 (dont le cas réel Excel recopié tel quel) ; contre-épreuve : avec
+les gardes neutralisés, 20 échecs (le test détecte bien le défaut) ; `test_liens_fichiers.php` 10/10.
+**Limites connues** : le texte déjà affiché en direct est remplacé par la réponse finale à la fin (comme avant) ;
+la question part telle quelle vers le moteur externe (déjà le cas quand le modèle cherche) ; pas de générateur PDF.
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).

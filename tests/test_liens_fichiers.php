@@ -34,6 +34,7 @@ function extraire(string $src, string $methode): string {
 $corps = extraire($source, 'collectToolSources') . "\n" . extraire($source, 'addCreatedFile') . "\n" . extraire($source, 'appendFileLinks');
 eval('class RagSousTest {
     public array $createdFiles = [];
+    public bool $fileToolAttempted = false;   // ajoutée par la branche anti-invention
     public array $toolSources = [];
     public array $toolImages = [];
     public string $langue = "fr";

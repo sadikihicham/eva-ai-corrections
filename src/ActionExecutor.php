@@ -1916,6 +1916,14 @@ class ActionExecutor {
         if ($typeError !== null) {
             return ['ok' => false, 'error' => $typeError];
         }
+        // Binary formats EVA has no generator for: plain text saved under such a
+        // name is a corrupt file that no viewer opens (seen 28/09 with ".pdf").
+        // Refuse clearly so the model can offer a format it can really produce.
+        $noTextBuilder = ['pdf', 'doc', 'xls', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'epub'];
+        if (!$binary && in_array(strtolower(pathinfo($name, PATHINFO_EXTENSION)), $noTextBuilder, true)) {
+            return ['ok' => false, 'error' => 'EVA cannot generate .' . strtolower(pathinfo($name, PATHINFO_EXTENSION))
+                . ' files from text: nothing was created. Offer the user a .docx, .xlsx, .md or .txt file instead (these are generated correctly), or pass real file bytes in content_base64.'];
+        }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'docx') {
             try { $content = $this->buildDocx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'DOCX generation is unavailable on this server: ' . $e->getMessage()]; }
         }

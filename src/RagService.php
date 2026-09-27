@@ -40,6 +40,20 @@ class RagService {
     private array $toolImages = [];
     /** @var array<int,array{name:string,url:string,download_url:string}> files written in this answer, by file id */
     private array $createdFiles = [];
+    /** True once the model called a file-writing tool in this answer, even if the write failed. */
+    private bool $fileToolAttempted = false;
+
+    /**
+     * Sent (at most twice) when the user asked for a file and the model answered without
+     * calling any tool: on 28/09 it replied "I have created Rendezvous_list.xlsx"
+     * with invented links while nothing had been written. Measured on the real
+     * vLLM (28/09): 8/9 correct (reads the calendar first, then writes); a
+     * shorter version made it write invented appointments.
+     */
+    private const CREATION_NUDGE = '[Automatic check by EVA, not written by the user] Nothing was done: you answered without calling any tool, so no file exists '
+        . 'and any link you wrote is invalid. Do it now, in this order: (1) if the file must contain the user\'s own data (calendar events, '
+        . 'mails, tasks, contacts, files), FIRST call the tool that reads that data (e.g. list_calendar_events for appointments) - never write '
+        . 'data you have not read with a tool; (2) then call create_file with that real content. Answer in the language of the user\'s request.';
 
     public function __construct(
         private AppConfig $config,
@@ -94,6 +108,7 @@ class RagService {
         $this->toolSources = [];
         $this->toolImages = [];
         $this->createdFiles = [];
+        $this->fileToolAttempted = false;
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -112,6 +127,14 @@ class RagService {
 		$tools = $allowActions && $this->actionsEnabled() ? $this->executor->tools() : [];
 		$messages = $this->buildMessages($userId, $message, $history, $context, count($results), $tools !== [], $instructions, $persona, $this->dateContext($userId), $extraContext);
 		$seenToolCalls = [];
+		$nudges = 0;
+		$forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
+		if ($forced !== null) {
+			if ($onProgress !== null) $onProgress('tool', 'web_search', $forced);
+			$startedAt = microtime(true);
+			$res = $this->runForcedWebSearch($userId, $forced, $messages);
+			if ($res !== null && $onProgress !== null) $onProgress('tool_result', 'web_search', ['ok' => !empty($res['ok']), 'error' => mb_substr((string)($res['error'] ?? ''), 0, 300), 'result' => $this->safeToolResult($res['result'] ?? null), 'elapsed_ms' => max(0, (int)round((microtime(true) - $startedAt) * 1000))]);
+		}
 
         for ($round = 0; $round < $maxToolRounds; $round++) {
             if ($shouldStop !== null && $shouldStop()) return ['answer' => '', 'sources' => $this->answerSources($byDoc), 'model' => $this->config->get('chat_model'), 'error' => 'cancelled', 'followups' => []];
@@ -124,8 +147,14 @@ class RagService {
 			}
 			$toolCalls = $chat['tool_calls'] ?? [];
 			if ($toolCalls === []) {
+				if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, $tools)) {
+					$nudges++;
+					$messages[] = ['role' => 'assistant', 'content' => (string)($chat['answer'] ?? '')];
+					$messages[] = ['role' => 'user', 'content' => self::CREATION_NUDGE];
+					continue;
+				}
 				$answer = $chat['answer'] ?? '';
-				$answer = $this->appendFileLinks($this->appendImageMarkdown((string)$answer));
+				$answer = $this->finishAnswer($userId, (string)$answer, $messages);
 				return [
 					'answer' => $answer,
 					'sources' => $this->answerSources($byDoc),
@@ -192,7 +221,7 @@ class RagService {
         // tool chain into an empty reply was the worst possible outcome.
         $final = $this->ollama->chat($messages, []);
         $answer = trim((string)($final['answer'] ?? ''));
-        $answer = $this->appendFileLinks($this->appendImageMarkdown($answer));
+        $answer = $this->finishAnswer($userId, $answer, $messages);
         if ($answer !== '') {
             return [
                 'answer' => $answer,
@@ -222,6 +251,7 @@ class RagService {
             $this->toolSources = [];
             $this->toolImages = [];
             $this->createdFiles = [];
+            $this->fileToolAttempted = false;
         try {
             if ($this->clientDisconnected()) {
                 return;
@@ -245,6 +275,18 @@ $this->executor->setUserId($userId);
             $toolActivity = false;
             $toolFailure = false;
             $seenToolCalls = [];
+            $nudges = 0;
+            $forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
+            if ($forced !== null) {
+                yield json_encode(['type' => 'tool', 'name' => 'web_search', 'arguments' => $this->safeToolArguments($forced)], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+                $startedAt = microtime(true);
+                $res = $this->runForcedWebSearch($userId, $forced, $messages);
+                if ($res !== null) {
+                    $toolActivity = true;
+                    yield json_encode(['type' => 'tool_result', 'name' => 'web_search', 'ok' => !empty($res['ok']), 'error' => $res['error'] ?? null, 'url' => null,
+                        'result' => $this->safeToolResult($res['result'] ?? null), 'elapsed_ms' => max(0, (int)round((microtime(true) - $startedAt) * 1000))], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+                }
+            }
 			$requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 			$maxToolRounds = max((int)AppConfig::LIMITS['agent_max_tool_rounds'][0], min($this->config->getInt('agent_max_tool_rounds', self::MAX_TOOL_ROUNDS), (int)AppConfig::LIMITS['agent_max_tool_rounds'][1]));
 			for ($round = 0; $round < $maxToolRounds; $round++) {
@@ -277,6 +319,14 @@ $this->executor->setUserId($userId);
                     return;
                 }
                 if ($toolCalls === []) {
+                    if ($nudges < 2 && $round + 1 < $maxToolRounds && $this->needsCreationNudge($message, $tools)) {
+                        // The text already streamed is replaced by `done.answer` in the browser.
+                        $nudges++;
+                        $messages[] = ['role' => 'assistant', 'content' => $answer];
+                        $messages[] = ['role' => 'user', 'content' => self::CREATION_NUDGE];
+                        $answer = '';
+                        continue;
+                    }
                     break;
                 }
                 $messages[] = ['role' => 'assistant', 'content' => $answer, 'tool_calls' => $this->canonicalToolCalls($rawToolCalls)];
@@ -349,7 +399,7 @@ $this->executor->setUserId($userId);
                 yield json_encode(['type' => 'error', 'message' => 'No text response received from Ollama.']) . "\n";
                 return;
             }
-            $answer = $this->appendFileLinks($this->appendImageMarkdown($answer));
+            $answer = $this->finishAnswer($userId, $answer, $messages);
             yield json_encode([
                 'type' => 'done',
                 'answer' => $answer,
@@ -378,6 +428,9 @@ $this->executor->setUserId($userId);
      * @param array<string,mixed> $res the tool result envelope
      */
     private function collectToolSources(string $toolName, array $res): void {
+        if (in_array($toolName, ['create_file', 'create_files', 'create_note'], true)) {
+            $this->fileToolAttempted = true;
+        }
         // File writes carry their links in `file`, next to the unchanged
         // `result` text (see ActionExecutor::fileLinks()).
         if ($toolName === 'create_files' && is_array($res['result']['files'] ?? null)) {
@@ -521,6 +574,225 @@ $this->executor->setUserId($userId);
             $lines[] = '… +' . (count($this->createdFiles) - $max) . ' ' . $labels[2];
         }
         return $lines === [] ? $answer : rtrim($answer) . "\n\n" . implode("\n", $lines);
+    }
+
+    /*
+     * Anti-invention guards (28/09). With vLLM, the model regularly answers from
+     * memory instead of calling a tool: "latest version of X" without web_search,
+     * "I created the file" without create_file, with invented links. Prompt rules
+     * did not fix it (eva-corrections/PROBLEMES.md §4 bis), so these checks are
+     * done by code and do not depend on the model or on the provider.
+     */
+
+    /** Final touches shared by every answer path: drop invented file links, then attach images and real file links. */
+    private function finishAnswer(string $userId, string $answer, array $messages): string {
+        return $this->appendFileLinks($this->appendImageMarkdown($this->removeUnbackedFileLinks($userId, $answer, $messages)));
+    }
+
+    /** @param list<array<string,mixed>> $tools */
+    private function hasTool(array $tools, string $name): bool {
+        foreach ($tools as $tool) {
+            if (is_array($tool) && (($tool['function']['name'] ?? $tool['name'] ?? '') === $name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Web search to run BEFORE the model answers, or null. Only two cases, kept
+     * narrow on purpose: an explicit request to search the web, or a question
+     * whose answer changes over time (latest version, news, price or rate now,
+     * weather). Questions about the user's own data ("my server", "my files")
+     * are left to the model. Long messages (pasted text) are never matched.
+     *
+     * @return array{query:string,mode:string}|null
+     */
+    private function forcedWebSearch(string $message): ?array {
+        $text = trim((string)preg_replace('/\s+/u', ' ', $message));
+        if ($text === '' || mb_strlen($text) > 300) {
+            return null;
+        }
+        $m = mb_strtolower($text);
+        $query = ['query' => mb_substr($text, 0, 200), 'mode' => 'all'];
+        $explicit = [
+            '~(cherch|recherch|regard|trouv|v[ée]rifi)\p{L}*[^.?!\n]{0,40}(sur|dans|via)\s+(le\s+|l[\'’]\s*)?(net|web|internet|google)(?!\p{L})~u',
+            '~(recherche|search)\s+(web|internet|en\s+ligne|online)(?!\p{L})~u',
+            '~(search|look\s*up|google|check)[^.?!\n]{0,40}(on|in)\s+(the\s+)?(web|internet|net)(?!\p{L})~u',
+            '~(such|recherchier)\p{L}*[^.?!\n]{0,40}(im\s+(web|internet|netz)|online)~u',
+            '~(ابحث|بحث|ابحثي)[^.?!\n]{0,40}(الإنترنت|الانترنت|الويب|النت|جوجل)~u',
+        ];
+        foreach ($explicit as $re) {
+            if (preg_match($re, $m) === 1) {
+                return $query;
+            }
+        }
+        $personal = '~(?<!\p{L})(mes|mon|ma|my|mein\p{L}*|notre|nos|our)\s+(fichier|document|dossier|rendez|rdv|agenda|calendrier|r[ée]union|mail|e-?mail|courriel|t[aâ]che|note|contact|file|folder|calendar|appointment|meeting|task|app|application|serveur|server|nextcloud|instance|compte|account|installation|poste|pc|ordinateur|computer|t[ée]l[ée]phone|phone)~u';
+        if (preg_match($personal, $m) === 1) {
+            return null;
+        }
+        $news = [
+            '~(?<!\p{L})(actualit[ée]s?|news|nachrichten|infos?\s+du\s+jour|أخبار|اخبار)(?!\p{L})~u',
+            '~(?<!\p{L})(cours|prix|price|taux\s+de\s+change|exchange\s+rate|bourse|stock|bitcoin|btc|crypto\p{L}*|سعر|أسعار)(?!\p{L})[^.?!\n]{0,40}(aujourd|actuel|maintenant|now|today|current|du\s+jour|en\s+ce\s+moment|live|اليوم|الآن|الحالي)~u',
+            '~(?<!\p{L})(score|r[ée]sultats?|match|[ée]lections?)(?!\p{L})[^.?!\n]{0,30}(aujourd|hier|today|yesterday|ce\s+soir|tonight)~u',
+        ];
+        foreach ($news as $i => $re) {
+            if (preg_match($re, $m) === 1) {
+                // Only real news goes to the news feeds: measured 28/09, "news" mode failed ("feeds could not be
+                // read") or returned stale articles for rates and prices, which "all" handles better.
+                return ['query' => $query['query'], 'mode' => $i === 0 ? 'news' : 'all'];
+            }
+        }
+        $changing = [
+            '~(?<!\p{L})(derni[eè]re?s?|latest|newest|most\s+recent|plus\s+r[ée]cente?s?|r[ée]cente?s?|actuelle?s?|current|neueste\p{L}*|aktuelle\p{L}*)\s+(version|release|mise\s+[àa]\s+jour|update|sortie)~u',
+            '~(?<!\p{L})(version|release)\s+(la\s+plus\s+r[ée]cente|actuelle|stable|courante|current|latest)~u',
+            '~(?<!\p{L})(quelle|what|which|welche)(?!\p{L})[^.?!\n]{0,25}(?<!\p{L})version(?!\p{L})~u',
+            '~(?<!\p{L})(latest|newest|derni[eè]re?|plus\s+r[ée]cente?|neueste\p{L}*)\s+(?:\p{L}+\s+){0,2}(mod[eè]le|model|modell)(?!\p{L})~u',
+            '~(?<!\p{L})(actuel\p{L}*|current|present|aktuelle\p{L}*)\s+(pr[ée]sident\p{L}*|premi[eè]re?\s+ministre|prime\s+minister|chancel\p{L}*|ceo|pdg|maire|mayor|roi|king|pape|pope)(?!\p{L})~u',
+            '~(?<!\p{L})(qui\s+est|who\s+is|wer\s+ist)\s+(le\s+|la\s+|the\s+|der\s+|die\s+)?(pr[ée]sident\p{L}*|premi[eè]re?\s+ministre|prime\s+minister|chancel\p{L}*|ceo|pdg|pape|pope)(?!\p{L})~u',
+            '~(أحدث|آخر)\s+(إصدار|اصدار|نسخة|تحديث)~u',
+            '~(?<!\p{L})(m[ée]t[ée]o|weather|wetter|الطقس)(?!\p{L})~u',
+        ];
+        foreach ($changing as $re) {
+            if (preg_match($re, $m) === 1) {
+                return $query;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Run the forced web search and add it to the conversation exactly like a
+     * tool call the model would have made, so the model answers from the
+     * results. A failed search is passed on too: the model then says the
+     * search failed instead of answering from memory.
+     *
+     * @param array{query:string,mode:string} $args
+     * @return array<string,mixed>|null the tool result, or null when the call needs a confirmation (not injected)
+     */
+    private function runForcedWebSearch(string $userId, array $args, array &$messages): ?array {
+        $res = $this->executor->run($userId, 'web_search', $args);
+        if (empty($res['ok']) && empty($res['confirmation_required']) && $args['mode'] !== 'web') {
+            $args['mode'] = 'web';
+            $res = $this->executor->run($userId, 'web_search', $args);
+        }
+        if (!empty($res['confirmation_required'])) {
+            return null;
+        }
+        $this->collectToolSources('web_search', $res);
+        $call = ['id' => 'call_eva_' . bin2hex(random_bytes(4)), 'type' => 'function', 'function' => ['name' => 'web_search', 'arguments' => $args]];
+        $messages[] = ['role' => 'assistant', 'content' => '', 'tool_calls' => $this->canonicalToolCalls([$call])];
+        $messages[] = ['role' => 'tool', 'content' => json_encode($res, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)];
+        return $res;
+    }
+
+    /** True when the user asks EVA to produce a file (not how to make one). */
+    private function isFileCreationRequest(string $message): bool {
+        $m = mb_strtolower(trim($message));
+        if ($m === '' || mb_strlen($m) > 2000) {
+            return false;
+        }
+        // "how do I create an Excel file?" asks for an explanation, not a file.
+        if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
+            return false;
+        }
+        $verb = '(cr[eé]+[rsz]?|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|create|generate|make|export|save|write|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب)';
+        $object = '(fichier|document|doc|docx|excel|xlsx|xls|tableur|classeur|pdf|csv|txt|markdown|md|note|file|spreadsheet|workbook|datei|ملف|مستند)';
+        // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
+        // not a file to create: those requests must not trigger the creation check.
+        $existing = '(?<!ce )(?<!cet )(?<!cette )(?<!ces )(?<!le )(?<!la )(?<!les )(?<!mon )(?<!ma )(?<!mes )(?<!ton )(?<!ta )(?<!tes )(?<!son )(?<!sa )(?<!ses )(?<!this )(?<!that )(?<!these )(?<!those )(?<!the )(?<!my )(?<!your )(?<!du )(?<!dans )';
+        return preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})[^.?!\n]{0,60}(?<!\p{L})' . $existing . $object . '(?!\p{L})~u', $m) === 1;
+    }
+
+    /** Ask the model once more when a file was requested and no file tool was even tried. */
+    private function needsCreationNudge(string $message, array $tools): bool {
+        return $this->createdFiles === [] && !$this->fileToolAttempted
+            && $this->hasTool($tools, 'create_file') && $this->isFileCreationRequest($message);
+    }
+
+    /**
+     * Remove links to Nextcloud files that do not exist. A link is kept when it
+     * points to a file written in this answer, when it came from a tool result,
+     * the user or the file context (never from an earlier assistant answer,
+     * which may itself be invented), or when the file really exists in the
+     * user's home. Each line holding an invalid link is removed — it is the
+     * sentence claiming the file — and one warning replaces them.
+     */
+    private function removeUnbackedFileLinks(string $userId, string $answer, array $messages): string {
+        if (preg_match_all('~https?://[^\s<>"\'()\[\]]+~u', $answer, $found) < 1) {
+            return $answer;
+        }
+        $trusted = [];
+        foreach ($this->createdFiles as $file) {
+            $trusted[$file['url']] = true;
+            $trusted[$file['download_url']] = true;
+        }
+        $bad = [];
+        foreach (array_unique($found[0]) as $url) {
+            $url = rtrim($url, '.,;:!?*_');
+            $path = (string)parse_url($url, PHP_URL_PATH);
+            if (!preg_match('~/(?:index\.php/)?f/\d+/?$|/remote\.php/(?:dav/files|webdav)/~', $path) || isset($trusted[$url])) {
+                continue;
+            }
+            $quoted = false;
+            foreach ($messages as $msg) {
+                if (($msg['role'] ?? '') !== 'assistant' && is_string($msg['content'] ?? null) && str_contains($msg['content'], $url)) {
+                    $quoted = true;
+                    break;
+                }
+            }
+            if (!$quoted && !$this->linkedFileExists($userId, $url)) {
+                $bad[] = $url;
+            }
+        }
+        if ($bad === []) {
+            return $answer;
+        }
+        $kept = array_filter(preg_split('/\R/u', $answer) ?: [], static function (string $line) use ($bad): bool {
+            foreach ($bad as $url) {
+                if (str_contains($line, $url)) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        $warning = match (substr($this->uiLanguage(), 0, 2)) {
+            'fr' => '⚠️ Lien retiré : il ne menait à aucun fichier existant. Aucun fichier n\'a été créé ni trouvé pour cette partie de la réponse — redemandez si besoin.',
+            'ar' => '⚠️ تمت إزالة رابط لا يؤدي إلى أي ملف موجود. لم يتم إنشاء أو العثور على أي ملف لهذا الجزء من الإجابة — أعد الطلب إذا لزم الأمر.',
+            'de' => '⚠️ Link entfernt: Er führte zu keiner vorhandenen Datei. Für diesen Teil der Antwort wurde keine Datei erstellt oder gefunden – bitte erneut anfragen.',
+            default => '⚠️ Link removed: it did not lead to any existing file. No file was created or found for that part of the answer — please ask again if needed.',
+        };
+        return trim(trim(implode("\n", $kept)) . "\n\n" . $warning);
+    }
+
+    /** Does a Nextcloud file link (/f/<id>, WebDAV path) point to a file of this user? Errors keep the link. */
+    private function linkedFileExists(string $userId, string $url): bool {
+        try {
+            $path = rawurldecode((string)parse_url($url, PHP_URL_PATH));
+            $home = $this->rootFolder->getUserFolder($userId);
+            if (preg_match('~/f/(\d+)/?$~', $path, $m)) {
+                return $home->getById((int)$m[1]) !== [];
+            }
+            if (preg_match('~/remote\.php/dav/files/([^/]+)/(.+)$~', $path, $m)) {
+                return $m[1] === $userId && $home->nodeExists(rtrim($m[2], '/'));
+            }
+            if (preg_match('~/remote\.php/webdav/(.+)$~', $path, $m)) {
+                return $home->nodeExists(rtrim($m[1], '/'));
+            }
+            return true;
+        } catch (\Throwable $e) {
+            return true;
+        }
+    }
+
+    /**
+     * The "📄 name — [Open](…) · [Download](…)" lines appended by appendFileLinks()
+     * are for the user only: sent back in the history, the model copied their
+     * format with invented file ids (28/09). Strip them from earlier answers.
+     */
+    private function stripFileLinkLines(string $content): string {
+        $out = preg_replace('~^📄 \*\*.+\*\* — \[[^\]]+\]\(https?://[^)\s]+\) · \[[^\]]+\]\(https?://[^)\s]+\)[ \t]*$\R?~mu', '', $content);
+        return is_string($out) ? rtrim($out) : $content;
     }
 
     /** @param array<string,mixed> $item */
@@ -1113,7 +1385,8 @@ $this->executor->setUserId($userId);
         $messages = [['role' => 'system', 'content' => $system]];
         foreach (array_slice($history, -12) as $h) {
             if (isset($h['role'], $h['content'])) {
-                $messages[] = ['role' => $h['role'] === 'user' ? 'user' : 'assistant', 'content' => (string)$h['content']];
+                $role = $h['role'] === 'user' ? 'user' : 'assistant';
+                $messages[] = ['role' => $role, 'content' => $role === 'assistant' ? $this->stripFileLinkLines((string)$h['content']) : (string)$h['content']];
             }
         }
         $messages[] = ['role' => 'user', 'content' => $userPrompt];
