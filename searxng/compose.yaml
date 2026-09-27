@@ -1,0 +1,60 @@
+# SearXNG interne pour l'assistant eva_ai de Nextcloud (workspace4).
+# Projet Compose SÉPARÉ de la stack Nextcloud (/home/ubuntu/docker, projet « nextcloud ») :
+#   cd /srv/searxng && sudo docker compose -p searxng up -d
+#
+# Réseau : AUCUN port publié sur l'hôte (les ports publiés par Docker contournent ufw).
+# SearXNG est rattaché au réseau « nextcloud_frontend » (réseau « frontend » du projet « nextcloud »),
+# où se trouve déjà le conteneur app : eva l'appelle sur http://searxng:8080.
+# « nextcloud_backend » ne convient pas : il est « internal: true », donc sans accès Internet,
+# et SearXNG doit interroger Google, Bing, etc.
+#
+# Image épinglée : searxng/searxng:2026.9.25-12f8b6515 (publiée sur Docker Hub le 25/09/2026 16:57 UTC,
+# tag le plus récent au 28/09/2026). Mise à jour = changer ce tag, puis `up -d`.
+# Secret : SEARXNG_SECRET lu depuis /srv/searxng/secret.env (généré SUR LE SERVEUR par installer.sh,
+# root:root 600, jamais dans le dépôt).
+
+name: searxng
+
+services:
+  searxng:
+    image: searxng/searxng:2026.9.25-12f8b6515
+    restart: unless-stopped
+    # UID:GID de l'utilisateur « searxng » de l'image (977, vérifié par installer.sh avant le démarrage).
+    # En non-root, l'entrypoint ne fait ni chown ni update-ca-certificates, d'où cap_drop ALL.
+    user: "977:977"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ./secret.env
+    environment:
+      SEARXNG_BASE_URL: "http://searxng:8080/"
+      # L'image écoute sur « :: » par défaut. Si IPv6 est désactivé dans le conteneur
+      # (réseau Docker sans IPv6), écouter en IPv4 évite un échec au démarrage.
+      GRANIAN_HOST: "0.0.0.0"
+      GRANIAN_PORT: "8080"
+    volumes:
+      # Répertoire de config en LECTURE SEULE : settings.yml existe déjà, l'entrypoint ne doit rien y écrire.
+      - ./config:/etc/searxng:ro
+      - ./cache:/var/cache/searxng
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    healthcheck:
+      # /healthz est la route de santé de SearXNG. Le chemin du python de l'image se déduit de son entrypoint.
+      test: ["CMD", "/usr/local/searxng/.venv/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks:
+      nextcloud_frontend:
+        aliases: [searxng]
+
+networks:
+  nextcloud_frontend:
+    external: true
+    name: nextcloud_frontend

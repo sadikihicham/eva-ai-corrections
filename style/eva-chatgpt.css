@@ -1,0 +1,642 @@
+/* =============================================================================
+   eva-chatgpt.css — mise en page « colonne de conversation » pour eva_ai
+   (app Nextcloud 34), à charger via l'app officielle « Custom CSS »
+   (theming_customcss).
+
+   Principe : reprendre seulement la MISE EN PAGE (colonne centrée, bulles
+   utilisateur, réponses sans bulle, zone de saisie flottante). Aucun logo,
+   nom, police ni élément de marque tiers.
+
+   Portée : CHAQUE règle commence par `#content-vue.eva-ai-app`.
+     - `#content-vue`  = racine rendue par NcContent (bibliothèque @nextcloud/vue),
+     - `.eva-ai-app`   = classe posée par App.vue d'eva sur ce NcContent
+                         (mode utilisateur ; le mode admin porte `.eva-ai-admin`
+                         et n'est volontairement PAS stylé).
+   Hors de l'app eva, aucune règle ne s'applique : le reste de Nextcloud est
+   intact. L'id donne en plus une spécificité (1,x,x) qui l'emporte sur les
+   feuilles internes d'eva (au plus 0,4,1) quel que soit l'ordre de chargement.
+
+   Couleurs : uniquement des variables de thème Nextcloud (clair ET sombre),
+   avec une valeur de repli neutre.
+
+   `!important` : utilisé SEULEMENT sur le fond/la couleur de `.rb` (bulle de
+   message). Raison : le JS d'eva écrit un style en ligne sur chaque `.rb`
+   (s.style.background = …) et sa propre feuille les force déjà avec
+   `!important` ; sans `!important` aucune feuille externe ne peut gagner.
+
+   Sélecteurs : tous relevés dans le bundle compilé (voir SELECTEURS.md).
+   Si une mise à jour d'eva renomme une classe, la règle concernée cesse
+   simplement de s'appliquer : l'élément reprend son aspect d'origine.
+   ============================================================================= */
+
+
+/* -----------------------------------------------------------------------------
+   0. Jetons locaux (dérivés des variables Nextcloud)
+   ----------------------------------------------------------------------------- */
+#content-vue.eva-ai-app .chatview-root {
+	--evx-col: 48rem;                                   /* largeur de la colonne */
+	--evx-gutter: 1rem;                                 /* marge latérale mini   */
+	--evx-radius: var(--border-radius-large, 12px);
+	--evx-radius-pill: 1.5rem;
+	--evx-bubble-bg: var(--color-background-dark, #ededed);   /* bulle utilisateur */
+	--evx-code-bg: var(--color-background-dark, #f0f0f0);     /* blocs de code     */
+	--evx-muted: var(--color-text-maxcontrast, #6b6b6b);
+	--evx-border: var(--color-border, #dcdcdc);
+	--evx-shadow: 0 2px 6px rgba(0, 0, 0, .06), 0 8px 24px rgba(0, 0, 0, .08);
+	/* La colonne interne d'eva lit --eva-content-width : on la ramène à 48rem. */
+	--eva-content-width: var(--evx-col);
+}
+
+
+/* -----------------------------------------------------------------------------
+   1. Conteneur de la vue de chat
+   ----------------------------------------------------------------------------- */
+/* La racine ne garde plus de marge latérale : c'est la liste des messages qui
+   centre la colonne, pour que la barre de défilement reste au bord de la vue. */
+#content-vue.eva-ai-app .chatview-root {
+	padding-inline: 0;
+	background: var(--color-main-background, #fff);
+	color: var(--color-main-text, #222);
+}
+
+/* En-tête (titre + pastilles + export/personnaliser) : sobre, sans filet. */
+#content-vue.eva-ai-app .chatview-root .head {
+	width: 100%;
+	min-height: 3rem;
+	padding: .5rem var(--evx-gutter);
+	border-bottom: 0;
+}
+#content-vue.eva-ai-app .chatview-root .head h1 {
+	font-size: 1rem;
+	font-weight: 600;
+}
+#content-vue.eva-ai-app .chatview-root .head .export {
+	border-color: transparent;
+	background: transparent;
+	border-radius: var(--evx-radius);
+}
+#content-vue.eva-ai-app .chatview-root .head .export:hover:not(:disabled) {
+	background: var(--color-background-hover, #f1f1f1);
+	border-color: transparent;
+}
+
+
+/* -----------------------------------------------------------------------------
+   2. Liste des messages : colonne centrée (~48rem)
+   ----------------------------------------------------------------------------- */
+#content-vue.eva-ai-app .chatview-root .chat-log {
+	width: 100%;
+	/* Colonne centrée : le rembourrage absorbe l'espace au-delà de 48rem. */
+	padding-block: 1.5rem 2rem;
+	padding-inline: max(var(--evx-gutter), calc((100% - var(--evx-col)) / 2));
+	gap: 1.75rem;
+}
+
+/* État vide (aucun message) */
+#content-vue.eva-ai-app .chatview-root .empty {
+	gap: .5rem;
+}
+#content-vue.eva-ai-app .chatview-root .empty .ico {
+	font-size: 2.5rem;
+	opacity: .6;
+}
+#content-vue.eva-ai-app .chatview-root .empty .t {
+	font-size: 1.5rem;
+	font-weight: 600;
+}
+#content-vue.eva-ai-app .chatview-root .empty .d {
+	font-size: .9375rem;
+	color: var(--evx-muted);
+}
+
+
+/* -----------------------------------------------------------------------------
+   3. Messages : utilisateur en bulle à droite, assistant sans bulle
+   ----------------------------------------------------------------------------- */
+/* .rm = une ligne de message ; .rm.user / .rm.assistant = rôle.
+   align-items: flex-end suit le sens d'écriture (à gauche en RTL). */
+#content-vue.eva-ai-app .chatview-root .rm.user {
+	align-items: flex-end;
+}
+
+/* Bulle utilisateur : fond gris doux, coins arrondis uniformes (aucun coin
+   « physique » pour rester correct en RTL). */
+#content-vue.eva-ai-app .chatview-root .rm.user .rb {
+	max-width: min(75%, 36rem);
+	padding: .625rem 1.125rem;
+	border-radius: var(--evx-radius-pill);
+	/* !important : bat le style en ligne posé par le JS d'eva (voir en-tête). */
+	background: var(--evx-bubble-bg) !important;
+	color: var(--color-main-text, #222) !important;
+}
+
+/* Réponse assistant : pas de bulle, pleine largeur de la colonne. */
+#content-vue.eva-ai-app .chatview-root .rm.assistant .rb {
+	max-width: 100%;
+	width: 100%;
+	padding: 0;                       /* plus besoin de réserver la place du bouton copier */
+	border-radius: 0;
+	/* !important : même raison (style en ligne var(--color-background-hover)). */
+	background: transparent !important;
+	color: var(--color-main-text, #222) !important;
+}
+
+
+/* -----------------------------------------------------------------------------
+   4. Typographie du contenu (.rt = rendu Markdown)
+   ----------------------------------------------------------------------------- */
+#content-vue.eva-ai-app .chatview-root .rt {
+	font-size: 1rem;                  /* 16px */
+	line-height: 1.6;
+	text-align: start;                /* au lieu de left : correct en RTL */
+}
+#content-vue.eva-ai-app .chatview-root .rt p {
+	margin: 0 0 1em;
+}
+#content-vue.eva-ai-app .chatview-root .rt p:last-child {
+	margin-bottom: 0;
+}
+
+/* Titres */
+#content-vue.eva-ai-app .chatview-root .rt h1,
+#content-vue.eva-ai-app .chatview-root .rt h2,
+#content-vue.eva-ai-app .chatview-root .rt h3,
+#content-vue.eva-ai-app .chatview-root .rt h4,
+#content-vue.eva-ai-app .chatview-root .rt h5,
+#content-vue.eva-ai-app .chatview-root .rt h6 {
+	margin: 1.5em 0 .5em;
+	font-weight: 600;
+	line-height: 1.3;
+}
+#content-vue.eva-ai-app .chatview-root .rt > :first-child {
+	margin-top: 0;
+}
+#content-vue.eva-ai-app .chatview-root .rt h1 { font-size: 1.5rem; }
+#content-vue.eva-ai-app .chatview-root .rt h2 { font-size: 1.25rem; }
+#content-vue.eva-ai-app .chatview-root .rt h3 { font-size: 1.125rem; }
+#content-vue.eva-ai-app .chatview-root .rt h4,
+#content-vue.eva-ai-app .chatview-root .rt h5,
+#content-vue.eva-ai-app .chatview-root .rt h6 { font-size: 1rem; }
+
+/* Listes : retrait logique (margin-inline-start) au lieu de margin-left. */
+#content-vue.eva-ai-app .chatview-root .rt ul,
+#content-vue.eva-ai-app .chatview-root .rt ol {
+	margin: 0 0 1em;
+	margin-inline-start: 1.5rem;
+	padding: 0;
+}
+#content-vue.eva-ai-app .chatview-root .rt li {
+	margin: .25em 0;
+	padding-inline-start: .25rem;
+}
+
+/* Citations : filet côté début de ligne (gauche en LTR, droite en RTL). */
+#content-vue.eva-ai-app .chatview-root .rt blockquote {
+	margin: 1em 0;
+	padding: .25rem 1rem;
+	border: 0;
+	border-inline-start: 3px solid var(--evx-border);
+	color: var(--evx-muted);
+}
+
+#content-vue.eva-ai-app .chatview-root .rt hr {
+	margin: 1.5em 0;
+}
+
+#content-vue.eva-ai-app .chatview-root .rt a {
+	text-underline-offset: .15em;
+}
+
+/* Images issues du Markdown */
+#content-vue.eva-ai-app .chatview-root .rt img.md-image {
+	border-radius: var(--evx-radius);
+}
+
+
+/* -----------------------------------------------------------------------------
+   5. Code : en ligne et blocs
+   ----------------------------------------------------------------------------- */
+/* Code en ligne (tout <code> qui n'est pas dans un bloc <pre>). */
+#content-vue.eva-ai-app .chatview-root .rt :not(pre) > code {
+	padding: .125rem .375rem;
+	border-radius: .375rem;
+	background: var(--evx-code-bg);
+	font-size: .875em;
+}
+
+/* Blocs de code : fond contrasté, coins arrondis, défilement horizontal.
+   Le code reste en LTR même dans une interface arabe. */
+#content-vue.eva-ai-app .chatview-root .rt pre,
+#content-vue.eva-ai-app .chatview-root .rt pre.md-pre {
+	margin: 0 0 1em;
+	padding: 1rem 1.125rem;
+	max-width: 100%;
+	overflow-x: auto;
+	border: 1px solid var(--evx-border);
+	border-radius: var(--evx-radius);
+	background: var(--evx-code-bg);
+	direction: ltr;
+	text-align: left;
+	unicode-bidi: isolate;
+}
+#content-vue.eva-ai-app .chatview-root .rt pre code {
+	display: block;
+	font-size: .875rem;
+	line-height: 1.55;
+	white-space: pre;                 /* pas de retour à la ligne : on défile */
+	overflow-wrap: normal;
+	word-break: normal;
+	background: transparent;
+	padding: 0;
+}
+
+
+/* -----------------------------------------------------------------------------
+   6. Tableaux (enveloppe .md-table-scroll = défilement horizontal)
+   ----------------------------------------------------------------------------- */
+#content-vue.eva-ai-app .chatview-root .rt .md-table-scroll {
+	margin: 1em 0;
+	border: 1px solid var(--evx-border);
+	border-radius: var(--evx-radius);
+	overflow-x: auto;
+}
+#content-vue.eva-ai-app .chatview-root .rt table {
+	border-collapse: collapse;
+	font-size: .9375rem;
+}
+#content-vue.eva-ai-app .chatview-root .rt th,
+#content-vue.eva-ai-app .chatview-root .rt td {
+	padding: .5rem .875rem;
+	border: 0;
+	border-bottom: 1px solid var(--evx-border);
+	text-align: start;
+	vertical-align: top;
+}
+#content-vue.eva-ai-app .chatview-root .rt th {
+	background: var(--color-background-hover, #f5f5f5);
+	font-weight: 600;
+}
+#content-vue.eva-ai-app .chatview-root .rt tr:last-child td {
+	border-bottom: 0;
+}
+
+
+/* -----------------------------------------------------------------------------
+   7. Actions de message (copier / régénérer / modifier) : discrètes
+   ----------------------------------------------------------------------------- */
+/* Assistant : rangée d'icônes SOUS la réponse (et non plus en surimpression). */
+#content-vue.eva-ai-app .chatview-root .rm.assistant .racts {
+	position: static;
+	margin-top: .375rem;
+	gap: .125rem;
+}
+/* Utilisateur : sous la bulle, alignées sur son bord de fin. */
+#content-vue.eva-ai-app .chatview-root .rm.user .racts {
+	top: calc(100% + .125rem);
+	right: auto;
+	inset-inline-end: 0;
+}
+#content-vue.eva-ai-app .chatview-root .racts .rcopy,
+#content-vue.eva-ai-app .chatview-root .racts .ract {
+	width: 2rem;
+	height: 2rem;
+	border-radius: .5rem;
+	font-size: .9375rem;
+	opacity: 1;                       /* la visibilité est gérée par .racts */
+}
+/* Écrans tactiles : pas de survol → actions toujours visibles. */
+@media (hover: none) {
+	#content-vue.eva-ai-app .chatview-root .racts {
+		opacity: 1;
+	}
+}
+
+
+/* -----------------------------------------------------------------------------
+   8. Éléments secondaires : réflexion, outils, sources, suggestions
+   ----------------------------------------------------------------------------- */
+/* Bloc « Réflexion » (.rth = <details>) : une puce repliée, discrète. */
+#content-vue.eva-ai-app .chatview-root .rth {
+	margin: 0 0 .75rem;
+	font-size: .8125rem;
+}
+#content-vue.eva-ai-app .chatview-root .rth summary {
+	display: inline-block;
+	padding: .125rem .625rem;
+	border-radius: 999px;
+	color: var(--evx-muted);
+	font-weight: 500;
+}
+#content-vue.eva-ai-app .chatview-root .rth summary:hover {
+	background: var(--color-background-hover, #f1f1f1);
+}
+#content-vue.eva-ai-app .chatview-root .rth-c {
+	margin-top: .375rem;
+	padding: .5rem .875rem;
+	border: 0;
+	border-inline-start: 2px solid var(--evx-border);
+	font-size: .8125rem;
+}
+
+/* Traces d'outils (.rtools > .tool) : petites lignes grises. */
+#content-vue.eva-ai-app .chatview-root .rtools {
+	max-width: 100%;
+	margin-top: .5rem;
+	gap: .125rem;
+}
+#content-vue.eva-ai-app .chatview-root .rtools .tool {
+	font-size: .75rem;
+	color: var(--evx-muted);
+	opacity: .85;
+}
+#content-vue.eva-ai-app .chatview-root .rtools .tool.running {
+	color: var(--color-warning-text, #8a6d1a);
+}
+#content-vue.eva-ai-app .chatview-root .rtools .tool.ok {
+	color: var(--evx-muted);          /* succès = état normal, pas besoin de vert */
+}
+#content-vue.eva-ai-app .chatview-root .rtools details {
+	margin-left: 0;
+	margin-inline-start: .375rem;
+}
+#content-vue.eva-ai-app .chatview-root .rtools summary {
+	color: var(--evx-muted);
+	text-decoration: underline dotted;
+}
+#content-vue.eva-ai-app .chatview-root .rtools pre {
+	border-radius: .5rem;
+	background: var(--evx-code-bg);
+	direction: ltr;
+	text-align: left;
+}
+#content-vue.eva-ai-app .chatview-root .rtools .tool-error {
+	margin: .125rem 0 0;
+	margin-inline-start: 1.125rem;
+}
+
+/* Sources (.rs = <details>) : une puce « Sources (n) » repliée. */
+#content-vue.eva-ai-app .chatview-root .rs {
+	margin-top: .75rem;
+	font-size: .8125rem;
+}
+#content-vue.eva-ai-app .chatview-root .rs-sum {
+	display: inline-block;
+	padding: .25rem .75rem;
+	border: 1px solid var(--evx-border);
+	border-radius: 999px;
+	font-weight: 500;
+}
+#content-vue.eva-ai-app .chatview-root .rs-sum:hover {
+	background: var(--color-background-hover, #f1f1f1);
+}
+#content-vue.eva-ai-app .chatview-root .rs-list {
+	margin-top: .5rem;
+	padding: .25rem 0 0;
+	padding-inline-start: .75rem;
+	border: 0;
+	border-inline-start: 2px solid var(--evx-border);
+}
+#content-vue.eva-ai-app .chatview-root .rs-excerpt {
+	border-radius: .5rem;
+}
+#content-vue.eva-ai-app .chatview-root .rs-badge {
+	margin-right: 0;
+	margin-inline-end: .375rem;
+}
+
+/* Suggestions de relance (.rfu > .rfu-btn) : puces à contour, survol doux. */
+#content-vue.eva-ai-app .chatview-root .rfu {
+	gap: .5rem;
+	margin-top: .75rem;
+}
+#content-vue.eva-ai-app .chatview-root .rfu-btn {
+	padding: .375rem .875rem;
+	border: 1px solid var(--evx-border);
+	border-radius: 999px;
+	background: transparent;
+	color: var(--color-main-text, #222);
+	font-size: .8125rem;
+	text-align: start;
+}
+#content-vue.eva-ai-app .chatview-root .rfu-btn:hover {
+	background: var(--color-background-hover, #f1f1f1);
+	border-color: var(--color-border-dark, #bbb);
+	color: var(--color-main-text, #222);
+}
+
+/* Demande de confirmation d'action (.rconfirm) : coins arrondis, filet logique.
+   `border` réinitialise le filet gauche d'origine, puis on le remet côté début. */
+#content-vue.eva-ai-app .chatview-root .rconfirm {
+	border: 1px solid var(--evx-border);
+	border-inline-start: 3px solid var(--color-warning, #eab308);
+	border-radius: var(--evx-radius);
+}
+#content-vue.eva-ai-app .chatview-root .rconfirm.rconfirm--danger {
+	border-inline-start-color: var(--color-error, #e9322d);
+}
+#content-vue.eva-ai-app .chatview-root .rtrimmed {
+	border-radius: var(--evx-radius);
+}
+
+
+/* -----------------------------------------------------------------------------
+   9. Zone de saisie flottante (.chatform) + bouton d'envoi rond
+   ----------------------------------------------------------------------------- */
+/* Structure (bundle) : <form.chatform> [📎 .cbtn-files] [input#chatinput]
+   [.cbtn = Envoyer / Stop] [.cbtn.cbtn-ghost = « En arrière-plan »] */
+#content-vue.eva-ai-app .chatview-root .chatform {
+	width: min(100% - 2 * var(--evx-gutter), var(--evx-col));
+	margin: 0 auto 1rem;
+	padding: .375rem;
+	padding-inline-start: .5rem;
+	gap: .375rem;
+	border: 1px solid var(--evx-border);
+	border-radius: 1.75rem;
+	background: var(--color-main-background, #fff);
+	box-shadow: var(--evx-shadow);
+	transition: border-color .15s ease, box-shadow .15s ease;
+}
+/* L'anneau de focus passe du champ au cadre entier (focus toujours visible). */
+#content-vue.eva-ai-app .chatview-root .chatform:focus-within {
+	border-color: var(--color-border-dark, #999);
+	box-shadow: var(--evx-shadow), 0 0 0 2px var(--color-primary-element-light, rgba(0, 103, 156, .15));
+}
+
+/* Champ de saisie : sans bordure, fond transparent, 16px (évite le zoom iOS). */
+#content-vue.eva-ai-app .chatview-root .chatform input,
+#content-vue.eva-ai-app .chatview-root #chatinput {
+	order: 1;
+	min-height: 2.5rem;
+	padding: .5rem .5rem;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	font-size: 1rem;
+	color: var(--color-main-text, #222);
+	box-shadow: none;
+}
+#content-vue.eva-ai-app .chatview-root .chatform input:focus,
+#content-vue.eva-ai-app .chatview-root #chatinput:focus {
+	outline: none;                    /* compensé par .chatform:focus-within */
+	border: 0;
+	box-shadow: none;
+}
+
+/* Bouton pièces jointes (📎) : rond, discret, en début de ligne. */
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn-files {
+	order: 0;
+	flex: 0 0 auto;
+	width: 2.5rem;
+	height: 2.5rem;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	font-size: 1.125rem;
+	line-height: 1;
+}
+
+/* Bouton « En arrière-plan » : petit texte discret, avant le bouton d'envoi. */
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn-ghost:not(.cbtn-files) {
+	order: 2;
+	flex: 0 0 auto;
+	padding: .375rem .75rem;
+	border: 0;
+	border-radius: 999px;
+	font-size: .8125rem;
+	font-weight: 500;
+	color: var(--evx-muted);
+}
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn-ghost:hover:not(:disabled) {
+	background: var(--color-background-hover, #f1f1f1);
+	filter: none;
+}
+
+/* Bouton d'envoi (et d'arrêt pendant la génération) : rond, en fin de ligne.
+   Son libellé texte (« Send message » / « Stop », traduit) reste dans le DOM
+   pour les lecteurs d'écran ; on le masque visuellement (font-size: 0) et on
+   affiche une flèche / un carré via ::before. */
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn:not(.cbtn-ghost) {
+	order: 3;
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 2.5rem;
+	height: 2.5rem;
+	padding: 0;
+	border-radius: 50%;
+	font-size: 0;
+	line-height: 1;
+	background: var(--color-main-text, #222);
+	color: var(--color-main-background, #fff);
+}
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn:not(.cbtn-ghost)::before {
+	content: "\2191";                 /* ↑ */
+	font-size: 1.25rem;
+	font-weight: 700;
+}
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn.cbtn-stop::before {
+	content: "\25A0";                 /* ■ */
+	font-size: .875rem;
+}
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn:not(.cbtn-ghost):hover:not(:disabled) {
+	filter: none;
+	opacity: .85;
+}
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn:not(.cbtn-ghost):disabled {
+	opacity: .35;
+}
+#content-vue.eva-ai-app .chatview-root .chatform .cbtn:focus-visible {
+	outline: 2px solid var(--color-primary-element, #00679c);
+	outline-offset: 2px;
+}
+
+/* Message d'erreur sous la zone de saisie : aligné sur la colonne. */
+#content-vue.eva-ai-app .chatview-root .err {
+	width: min(100% - 2 * var(--evx-gutter), var(--evx-col));
+	margin: -.5rem auto .75rem;
+	font-size: .8125rem;
+}
+
+
+/* -----------------------------------------------------------------------------
+   10. Barre latérale des conversations (NcAppNavigation) : sobre
+   ----------------------------------------------------------------------------- */
+#content-vue.eva-ai-app .new-chat-container {
+	padding-block: .25rem .5rem;
+}
+#content-vue.eva-ai-app .new-chat-button {
+	border-radius: var(--evx-radius, 12px);
+}
+/* Intitulés de groupe (« Chats », dossiers, archives) : petits, sans capitales. */
+#content-vue.eva-ai-app .chat-list-heading {
+	padding-top: .75rem;
+	font-size: .75rem;
+	font-weight: 600;
+	text-transform: none;
+	letter-spacing: .01em;
+}
+/* Conversations imbriquées dans un dossier : retrait logique (RTL). */
+#content-vue.eva-ai-app .chat-item--nested {
+	padding-left: 0;
+	padding-inline-start: .875rem;
+}
+#content-vue.eva-ai-app .app-navigation .app-navigation-entry {
+	border-radius: .625rem;
+}
+
+
+/* -----------------------------------------------------------------------------
+   11. Mobile (< 600px)
+   ----------------------------------------------------------------------------- */
+@media (max-width: 600px) {
+	#content-vue.eva-ai-app .chatview-root {
+		--evx-gutter: .75rem;
+	}
+	#content-vue.eva-ai-app .chatview-root .chat-log {
+		padding-block: 1rem 1.25rem;
+		gap: 1.25rem;
+	}
+	#content-vue.eva-ai-app .chatview-root .rm.user .rb {
+		max-width: 85%;
+	}
+	#content-vue.eva-ai-app .chatview-root .rm.assistant .rb {
+		padding: 0;
+	}
+	/* Zone de saisie sur deux lignes : le champ occupe toute la première,
+	   les boutons passent dessous, le bouton d'envoi reste à la fin. */
+	#content-vue.eva-ai-app .chatview-root .chatform {
+		flex-wrap: wrap;
+		margin-bottom: .5rem;
+		border-radius: 1.25rem;
+	}
+	#content-vue.eva-ai-app .chatview-root .chatform input,
+	#content-vue.eva-ai-app .chatview-root #chatinput {
+		order: 0;
+		flex: 1 1 100%;
+	}
+	#content-vue.eva-ai-app .chatview-root .chatform .cbtn-files {
+		order: 1;
+	}
+	#content-vue.eva-ai-app .chatview-root .chatform .cbtn:not(.cbtn-ghost) {
+		margin-inline-start: auto;
+	}
+	#content-vue.eva-ai-app .chatview-root .rt pre,
+	#content-vue.eva-ai-app .chatview-root .rt pre.md-pre {
+		padding: .75rem .875rem;
+	}
+}
+
+
+/* -----------------------------------------------------------------------------
+   12. Mouvement réduit : aucune transition
+   ----------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+	#content-vue.eva-ai-app .chatview-root *,
+	#content-vue.eva-ai-app .chatview-root *::before,
+	#content-vue.eva-ai-app .chatview-root *::after {
+		transition: none;
+		animation: none;
+		scroll-behavior: auto;
+	}
+}
