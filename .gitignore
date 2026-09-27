@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# payloads reconstitués (données d'un compte Nextcloud) : jamais dans le dépôt
+payload-*.json
