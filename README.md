@@ -11,7 +11,7 @@
   avec confirmation explicite et sauvegarde des fichiers d'origine (voir « Déploiement » plus bas).
 
 ## Historique
-- `main` : les fichiers tels que lus sur le serveur (« avant »).
+- `master` : les fichiers tels que lus sur le serveur (« avant »).
 - `corrige-outils-vllm` : les deux corrections, avec tests.
 
 Voir `PROBLEMES.md` pour le diagnostic complet et `signalement-eva-editeur.md` (dans le dossier parent)

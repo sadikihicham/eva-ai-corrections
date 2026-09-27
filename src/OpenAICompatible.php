@@ -160,23 +160,58 @@ class OpenAICompatible {
         catch (\Throwable $e) { throw new ProviderException('Speech provider connection or response failed. Check endpoint, key and model.'); }
     }
 
-    /** Convert EVA's provider-neutral image message to OpenAI vision syntax. */
+    /**
+     * Convert EVA's provider-neutral messages to the strict OpenAI chat-completions
+     * contract: inline images (vision) AND, since 28/09/2026, a valid tool-call
+     * round trip.
+     *
+     * EVA keeps `tool_calls[].function.arguments` decoded (array/stdClass) and
+     * never sets `tool_call_id` on the following `role:"tool"` message
+     * (RagService::canonicalToolCalls, AgentInteractionProvider) — Ollama
+     * tolerates that shape, but a strict OpenAI-compatible server (vLLM,
+     * OpenAI itself) rejects it with HTTP 400:
+     *   "arguments" : Input should be a valid string
+     *   ChatCompletionMessageCustomToolCallParam.custom : Field required
+     * Fixed here, only for this provider, so EVA's internal (Ollama) format
+     * is untouched. See eva-corrections/PROBLEMES.md for the full diagnosis.
+     */
     private function normalizeMessages(array $messages): array {
-        return array_map(static function (array $message): array {
+        $out = [];
+        $pendingToolCallId = null;
+        foreach ($messages as $message) {
             $images = is_array($message['images'] ?? null) ? $message['images'] : [];
             $mimes = is_array($message['image_mimes'] ?? null) ? $message['image_mimes'] : [];
             unset($message['images'], $message['image_mimes']);
-            if ($images === []) {
-                return $message;
+            if ($images !== []) {
+                $parts = [['type' => 'text', 'text' => (string)($message['content'] ?? '')]];
+                foreach ($images as $index => $base64) {
+                    if (!is_string($base64) || $base64 === '') continue;
+                    $mime = is_string($mimes[$index] ?? null) ? $mimes[$index] : 'image/jpeg';
+                    $parts[] = ['type' => 'image_url', 'image_url' => ['url' => 'data:' . $mime . ';base64,' . $base64]];
+                }
+                $message['content'] = $parts;
             }
-            $parts = [['type' => 'text', 'text' => (string)($message['content'] ?? '')]];
-            foreach ($images as $index => $base64) {
-                if (!is_string($base64) || $base64 === '') continue;
-                $mime = is_string($mimes[$index] ?? null) ? $mimes[$index] : 'image/jpeg';
-                $parts[] = ['type' => 'image_url', 'image_url' => ['url' => 'data:' . $mime . ';base64,' . $base64]];
+
+            if (($message['role'] ?? '') === 'assistant' && !empty($message['tool_calls']) && is_array($message['tool_calls'])) {
+                foreach ($message['tool_calls'] as &$call) {
+                    if (!is_array($call)) continue;
+                    $call['id'] = (string)($call['id'] ?? ('call_' . bin2hex(random_bytes(4))));
+                    $call['type'] = 'function';
+                    $args = $call['function']['arguments'] ?? [];
+                    $call['function']['arguments'] = is_string($args)
+                        ? $args
+                        : (json_encode($args, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}');
+                    $pendingToolCallId = $call['id'];
+                }
+                unset($call);
+            } elseif (($message['role'] ?? '') === 'tool') {
+                if ($pendingToolCallId !== null && empty($message['tool_call_id'])) {
+                    $message['tool_call_id'] = $pendingToolCallId;
+                }
+                $pendingToolCallId = null;
             }
-            $message['content'] = $parts;
-            return $message;
-        }, $messages);
+            $out[] = $message;
+        }
+        return $out;
     }
 }
