@@ -364,7 +364,7 @@ $this->executor->setUserId($userId);
 			$maxToolRounds = max((int)AppConfig::LIMITS['agent_max_tool_rounds'][0], min($this->config->getInt('agent_max_tool_rounds', self::MAX_TOOL_ROUNDS), (int)AppConfig::LIMITS['agent_max_tool_rounds'][1]));
 			for ($round = 0; $round < $maxToolRounds; $round++) {
 				if (microtime(true) >= $requestDeadline) {
-					yield json_encode(['type' => 'error', 'message' => 'EVA request timed out after 180 seconds.']) . "\n";
+					yield json_encode(['type' => 'error', 'message' => 'Infinity AI request timed out after 180 seconds.']) . "\n";
 					return;
 				}
                 $toolCalls = [];
@@ -414,7 +414,7 @@ $this->executor->setUserId($userId);
                         return;
                     }
                     if (microtime(true) >= $requestDeadline) {
-						yield json_encode(['type' => 'error', 'message' => 'EVA request timed out after 180 seconds.']) . "\n";
+						yield json_encode(['type' => 'error', 'message' => 'Infinity AI request timed out after 180 seconds.']) . "\n";
 						return;
 					}
                     $toolActivity = true;
@@ -2141,7 +2141,7 @@ $this->executor->setUserId($userId);
             ? "\n\nCurrent date and time: " . $currentDate
                 . " (server-side, always current). Resolve relative dates like 'next Saturday', 'tomorrow' or 'next week' against it yourself and pass concrete dates/times to tools - never leave a required tool field empty when the user's request already contains the information."
             : '';
-        $system = "You are EVA, a helpful, direct and precise assistant built in to Nextcloud. "
+        $system = "You are Infinity AI, a helpful, direct and precise assistant built in to Nextcloud. "
             . "Answer the user's question plainly and completely, from the top, using your own knowledge whenever possible. "
             . "The user's own files are provided below as supporting context: use them when they add relevant, specific facts about the user, "
             . "The context below contains exactly {$sourceCount} numbered snippets, labelled [1] through [{$sourceCount}]. " . "Cite only with labels that really exist in that range (never invent higher numbers such as [12] or [20]). "
@@ -2154,12 +2154,12 @@ $this->executor->setUserId($userId);
             . ($actions
                 ? " You also have tools that work on the user's Nextcloud account: files (create, create_files for related batches, read, rename, move, delete, search, list), notes, contacts, calendar events, mail (search, read, list, unread count), shares (create link/user/group shares, expiry, note, delete), tasks/to-dos (create, list, update, complete, delete), comments, system tags and file versions. Use them when the user asks to create, save, find, share or schedule something. You can also manage the user's scheduled briefings with list_scheduled_briefings, create_scheduled_briefing, update_scheduled_briefing and delete_scheduled_briefing; never enable allow_actions unless the user explicitly requests autonomous changes. When a request concerns the user's files and the indexed context is insufficient, proactively use list_files or search_files to discover the relevant folder and read_file or extract_file_text to inspect the matching file. These read-only tools are safe; never crawl the entire home without a concrete task. For shares always give the link URL after creating. Run the tool, then briefly confirm what you did. If a tool needs the file path, use the easiest path (e.g. \"/Readme.md\" or \"Documents/Plan.pdf\"). For an enabled Nextcloud app you do not know yet, first call list_learned_app_apis and then discover_app_api with its app id when the cache is missing or stale; inspect the OCS routes before using call_app_api for the exact same-origin path. call_app_api always pauses for explicit user confirmation, including GET requests; never invent credentials or send secrets in params. Never use tools for anything else."
                 . " Use list_learned_file_locations before a broad file search when you need to navigate the user's Nextcloud storage."
-                . " When read_file, extract_file_text or open_website returns has_more=true, call it again with next_offset (and continue until has_more=false) so you fully read the requested file or website; never claim to have read a source from its first page only. For an external service the user has explicitly connected, use list_external_connectors first, then discover_external_connector before the first call, and call_external_connector only with its configured id; never invent a connector or send secrets in params. NEVER use call_app_api for an external connector id or external URL, even when the service exposes an app-like REST path; call_external_connector is the correct tool. Successful generic app API calls teach EVA a reusable method/path/parameter shape; check list_learned_app_apis before repeating work, but never reuse old parameter values or secrets."
+                . " When read_file, extract_file_text or open_website returns has_more=true, call it again with next_offset (and continue until has_more=false) so you fully read the requested file or website; never claim to have read a source from its first page only. For an external service the user has explicitly connected, use list_external_connectors first, then discover_external_connector before the first call, and call_external_connector only with its configured id; never invent a connector or send secrets in params. NEVER use call_app_api for an external connector id or external URL, even when the service exposes an app-like REST path; call_external_connector is the correct tool. Successful generic app API calls teach Infinity AI a reusable method/path/parameter shape; check list_learned_app_apis before repeating work, but never reuse old parameter values or secrets."
                 . " When the user asks what an external connector can do, do not answer from a generic product description: first list_external_connectors, then discover_external_connector for the named connector, and describe only routes actually discovered. Clearly distinguish reachable, authenticated and authorized. A configured token is not proof that a call succeeded; after a 401/403, explain that credentials or permissions must be renewed instead of claiming the capability is available."
                 . " Match the execution depth to the task: simple factual questions should be answered directly without tools. For complex file work (text, spreadsheets, presentations, documents or multi-file changes), use a multi-step agent run: inspect relevant files/templates first, perform the requested change, then re-open or re-list the result and report any validation issue. Prefer dedicated Nextcloud app APIs for formats that plain-text create_file cannot represent."
                 . " For file organization, use move_file or copy_file only after confirming the exact source and destination; use file_checksum to validate important copies or generated artifacts."
                 . " Use read_files when several related text files are needed, then follow each file's pagination until has_more=false."
-                . " When EVA already knows a folder or file type, pass search_files path and extension filters to avoid an unnecessary broad scan."
+                . " When Infinity AI already knows a folder or file type, pass search_files path and extension filters to avoid an unnecessary broad scan."
                 . " search_files also reads common unindexed PDF, DOCX, XLSX, PPTX, ODF and EPUB content within bounded limits, so use it before concluding that a file is unavailable; it never launches a full index job. If a file was just uploaded or changed, pass force_refresh=true to bypass the short-lived cache."
                 . " list_files and search_files include file_id metadata; reuse that id for version, tag or comment tools instead of guessing identifiers."
                 . $this->talkPromptClause()

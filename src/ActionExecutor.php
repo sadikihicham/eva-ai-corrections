@@ -314,7 +314,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'delete_file',
-                'description' => 'Delete a file or an empty folder in the user\'s home. Use only when the user explicitly asks to delete something. Depending on the app settings you may only delete files EVA created itself.',
+                'description' => 'Delete a file or an empty folder in the user\'s home. Use only when the user explicitly asks to delete something. Depending on the app settings you may only delete files Infinity AI created itself.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'path' => ['type' => 'string', 'description' => 'Relative path of the file or folder to delete.'],
                 ], 'required' => ['path']],
@@ -724,7 +724,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'list_nextcloud_capabilities',
-                'description' => 'Discover which Nextcloud apps are enabled and which EVA integrations are available before planning a task. This is read-only and never exposes secrets. Use it when the user asks EVA to work with a Nextcloud feature you have not used before.',
+                'description' => 'Discover which Nextcloud apps are enabled and which Infinity AI integrations are available before planning a task. This is read-only and never exposes secrets. Use it when the user asks Infinity AI to work with a Nextcloud feature you have not used before.',
                 'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
             ]],
             ['type' => 'function', 'function' => [
@@ -737,12 +737,12 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'list_learned_app_apis',
-                'description' => 'List sanitized Nextcloud app API routes EVA learned earlier for this user. Read-only; use discover_app_api to refresh an app.',
+                'description' => 'List sanitized Nextcloud app API routes Infinity AI learned earlier for this user. Read-only; use discover_app_api to refresh an app.',
                 'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'list_learned_file_locations',
-                'description' => 'List bounded file and folder paths EVA learned from earlier Nextcloud searches and listings. Use this to navigate directly before doing another broad search.',
+                'description' => 'List bounded file and folder paths Infinity AI learned from earlier Nextcloud searches and listings. Use this to navigate directly before doing another broad search.',
                 'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
             ]],
             ['type' => 'function', 'function' => [
@@ -766,14 +766,14 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'list_scheduled_briefings',
-                'description' => 'List the current user\'s EVA scheduled briefings and their action permissions.',
+                'description' => 'List the current user\'s Infinity AI scheduled briefings and their action permissions.',
                 'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_scheduled_briefing',
-                'description' => 'Create a recurring EVA briefing. Use days 1-7 for Monday-Sunday. Read-only is the default; allow_actions must be explicitly true to permit autonomous changes.',
+                'description' => 'Create a recurring Infinity AI briefing. Use days 1-7 for Monday-Sunday. Read-only is the default; allow_actions must be explicitly true to permit autonomous changes.',
                 'parameters' => ['type' => 'object', 'properties' => [
-                    'prompt' => ['type' => 'string', 'description' => 'What EVA should do at the scheduled time.'],
+                    'prompt' => ['type' => 'string', 'description' => 'What Infinity AI should do at the scheduled time.'],
                     'time' => ['type' => 'string', 'description' => 'Local time in HH:MM format.'],
                     'days' => ['type' => 'array', 'items' => ['type' => 'integer'], 'description' => 'Weekdays 1 (Monday) through 7 (Sunday).'],
                     'allow_actions' => ['type' => 'boolean', 'description' => 'Optional explicit opt-in for autonomous tool actions. Defaults to false.'],
@@ -781,7 +781,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'update_scheduled_briefing',
-                'description' => 'Update an existing EVA briefing by id. Only supplied fields change.',
+                'description' => 'Update an existing Infinity AI briefing by id. Only supplied fields change.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'briefing_id' => ['type' => 'string', 'description' => 'Id returned by list_scheduled_briefings.'],
                     'prompt' => ['type' => 'string'], 'time' => ['type' => 'string'],
@@ -791,7 +791,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'delete_scheduled_briefing',
-                'description' => 'Delete an EVA scheduled briefing by id.',
+                'description' => 'Delete an Infinity AI scheduled briefing by id.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'briefing_id' => ['type' => 'string', 'description' => 'Id returned by list_scheduled_briefings.'],
                 ], 'required' => ['briefing_id']],
@@ -859,7 +859,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'send_talk_message',
-                'description' => 'Post a message into a Nextcloud Talk conversation as the user who is asking. It appears under their name, exactly as if they had typed it - there is no bot label, so only do this when the user explicitly asks you to write, send, answer, announce or forward something in a chat ("schreib in den Projekt-Chat, dass ...", "tell the team in X that ...", "antworten im Chat Y: ..."). `room` takes the name, token or id from `list_talk_rooms`. Use the user\'s own wording for the message and do not add anything to it; afterwards state which room you posted in. Posting is only possible when the user has enabled it in the EVA AI settings.',
+                'description' => 'Post a message into a Nextcloud Talk conversation as the user who is asking. It appears under their name, exactly as if they had typed it - there is no bot label, so only do this when the user explicitly asks you to write, send, answer, announce or forward something in a chat ("schreib in den Projekt-Chat, dass ...", "tell the team in X that ...", "antworten im Chat Y: ..."). `room` takes the name, token or id from `list_talk_rooms`. Use the user\'s own wording for the message and do not add anything to it; afterwards state which room you posted in. Posting is only possible when the user has enabled it in the Infinity AI settings.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'room' => ['type' => 'string', 'description' => 'The room to post into: its name, token or numeric id (see list_talk_rooms).'],
                     'message' => ['type' => 'string', 'description' => 'The exact message to post.'],
@@ -896,7 +896,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'configure_external_connector',
-                'description' => 'Create or update a named external connector. Public HTTPS and explicitly local HTTP(S) services are supported. Choose no auth, bearer token, basic username/password or API key; all secrets are encrypted and never shown to EVA.',
+                'description' => 'Create or update a named external connector. Public HTTPS and explicitly local HTTP(S) services are supported. Choose no auth, bearer token, basic username/password or API key; all secrets are encrypted and never shown to Infinity AI.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'id' => ['type' => 'string', 'description' => 'Stable connector id, lowercase letters, numbers, underscore or hyphen (max 40).'],
                     'name' => ['type' => 'string', 'description' => 'Human-readable connector name.'],
@@ -1478,9 +1478,9 @@ class ActionExecutor {
                 'notes' => ['protocols' => ['Nextcloud Notes service/WebDAV'], 'eva_tools' => ['create_note', 'read_file', 'search_files']],
                 'activity' => ['protocols' => ['OCS Activity API'], 'eva_tools' => ['recent_activity']],
                 'files_sharing' => ['protocols' => ['OCS Sharing API'], 'eva_tools' => ['list_shares', 'create_share', 'update_share', 'delete_share']],
-                'deck' => ['protocols' => ['Deck OCS API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated EVA adapter installed'],
-                'bookmarks' => ['protocols' => ['Bookmarks REST API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated EVA adapter installed'],
-                'forms' => ['protocols' => ['Forms OCS API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated EVA adapter installed'],
+                'deck' => ['protocols' => ['Deck OCS API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated Infinity AI adapter installed'],
+                'bookmarks' => ['protocols' => ['Bookmarks REST API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated Infinity AI adapter installed'],
+                'forms' => ['protocols' => ['Forms OCS API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated Infinity AI adapter installed'],
                 'comments' => ['protocols' => ['OCS Comments API', 'server-side ICommentsManager'], 'eva_tools' => ['list_comments', 'add_comment', 'delete_comment']],
                 'systemtags' => ['protocols' => ['server-side ISystemTagManager/ISystemTagObjectMapper', 'OCS Files Tags API'], 'eva_tools' => ['list_system_tags', 'tag_file', 'untag_file']],
                 'files_versions' => ['protocols' => ['server-side IVersionManager'], 'eva_tools' => ['list_file_versions', 'restore_file_version']],
@@ -1515,7 +1515,7 @@ class ActionExecutor {
                     'notes' => in_array('notes', $apps, true),
                 ],
                 'api_catalog' => $availableApis,
-                'next_step' => 'Plan with the protocols and EVA tools listed above. Prefer a dedicated EVA adapter; for an enabled app without one, call list_learned_app_apis or discover_app_api first (include_internal=true when needed), then use the exact same-origin discovered route with call_app_api. Generic calls are always confirmation-gated interactively and require the encrypted app token in background runs.',
+                'next_step' => 'Plan with the protocols and Infinity AI tools listed above. Prefer a dedicated Infinity AI adapter; for an enabled app without one, call list_learned_app_apis or discover_app_api first (include_internal=true when needed), then use the exact same-origin discovered route with call_app_api. Generic calls are always confirmation-gated interactively and require the encrypted app token in background runs.',
             ];
         } catch (\Throwable $e) {
             return ['ok' => false, 'error' => 'Nextcloud capability discovery is unavailable.'];
@@ -2005,8 +2005,8 @@ class ActionExecutor {
         $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
         $noTextBuilder = ['doc', 'docm', 'xls', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'];
         if (!$binary && in_array($ext, $noTextBuilder, true)) {
-            return ['ok' => false, 'error' => 'EVA cannot generate .' . $ext . ' files: nothing was created. '
-                . 'Tell the user, and offer a .pdf, .docx, .xlsx, .md or .txt file instead (EVA generates these correctly).'];
+            return ['ok' => false, 'error' => 'Infinity AI cannot generate .' . $ext . ' files: nothing was created. '
+                . 'Tell the user, and offer a .pdf, .docx, .xlsx, .md or .txt file instead (Infinity AI generates these correctly).'];
         }
         // Bytes passed in content_base64 must really be of the announced type: a model
         // asked for a PDF can otherwise base64-encode plain text and write a corrupt file.
@@ -2017,7 +2017,7 @@ class ActionExecutor {
         if ($binary && isset($signatures[$ext])) {
             $matches = array_filter($signatures[$ext], static fn(string $sig): bool => str_starts_with($content, $sig));
             if ($matches === []) {
-                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; pass the text in content instead (EVA generates .pdf, .docx and .xlsx from text), or offer a .md or .txt file.'];
+                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; pass the text in content instead (Infinity AI generates .pdf, .docx and .xlsx from text), or offer a .md or .txt file.'];
             }
         }
         $warning = [];
@@ -2031,7 +2031,7 @@ class ActionExecutor {
                 }
             } catch (\Throwable $e) {
                 if ($e->getMessage() === 'non-Latin text') {
-                    return ['ok' => false, 'error' => 'EVA can generate PDF files only for Latin-script text (French, English, German…). Nothing was created. For Arabic or other scripts, offer a .docx file instead (fully supported).'];
+                    return ['ok' => false, 'error' => 'Infinity AI can generate PDF files only for Latin-script text (French, English, German…). Nothing was created. For Arabic or other scripts, offer a .docx file instead (fully supported).'];
                 }
                 return ['ok' => false, 'error' => 'PDF generation failed: ' . $e->getMessage()];
             }
@@ -2178,7 +2178,7 @@ class ActionExecutor {
             $r++; $cells = $markdown ? $cells : (str_contains($line, "\t") ? explode("\t", $line) : str_getcsv($line, $delim, '"', '\\')); $c = 0; $sheet .= '<row r="' . $r . '">'; foreach ($cells as $value) { $c++; $col = ''; $n = $c; while ($n > 0) { $n--; $col = chr(65 + ($n % 26)) . $col; $n = intdiv($n, 26); } $sheet .= '<c r="' . $col . $r . '" t="inlineStr"><is><t>' . $esc((string)$value) . '</t></is></c>'; } $sheet .= '</row>'; }
         $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');
         $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
-        $zip->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="EVA" sheetId="1" r:id="rId1"/></sheets></workbook>');
+        $zip->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Infinity AI" sheetId="1" r:id="rId1"/></sheets></workbook>');
         $zip->addFromString('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
         $zip->addFromString('xl/worksheets/sheet1.xml', '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' . $sheet . '</sheetData></worksheet>');
         $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
@@ -2680,7 +2680,7 @@ class ActionExecutor {
         }
         $node = $this->resolve($home, $path);
         if ($mode !== 'all' && !$this->isOwned($home, $node)) {
-            return ['ok' => false, 'error' => 'Only files EVA created itself may be deleted (adjust "delete permission" in the app settings to allow more).'];
+            return ['ok' => false, 'error' => 'Only files Infinity AI created itself may be deleted (adjust "delete permission" in the app settings to allow more).'];
         }
         if ($node instanceof Folder && $node->getDirectoryListing() !== []) {
             return ['ok' => false, 'error' => 'Folder is not empty'];
@@ -3852,7 +3852,7 @@ class ActionExecutor {
     }
 
     private function runSafeCommand(array $args): array {
-        if ($this->config->get('safe_commands_enabled') !== '1') return ['ok' => false, 'error' => 'Safe local commands are disabled in EVA settings.'];
+        if ($this->config->get('safe_commands_enabled') !== '1') return ['ok' => false, 'error' => 'Safe local commands are disabled in Infinity AI settings.'];
         $name = trim((string)($args['command'] ?? ''));
         $commands = [
             'date' => ['date'], 'uptime' => ['uptime'], 'php_version' => ['php', '-v'],
@@ -3888,7 +3888,7 @@ class ActionExecutor {
      */
     private function runTerminalCommand(array $args): array {
         if ($this->config->get('terminal_commands_enabled') !== '1') {
-            return ['ok' => false, 'error' => 'Confirmed terminal commands are disabled in EVA settings.'];
+            return ['ok' => false, 'error' => 'Confirmed terminal commands are disabled in Infinity AI settings.'];
         }
         $command = trim((string)($args['command'] ?? ''));
         if ($command === '' || mb_strlen($command) > 1000 || preg_match('/[\x00-\x1F\x7F;&|<>`$()\r\n]/', $command)) {
@@ -4092,7 +4092,7 @@ class ActionExecutor {
                 $prompt .= ' Pay special attention to: ' . mb_substr($focus, 0, 300) . '.';
             }
             $response = $this->ollama->chat([
-                ['role' => 'system', 'content' => 'You are EVA, a careful email assistant. Never expose secrets or claim an action was taken.'],
+                ['role' => 'system', 'content' => 'You are Infinity AI, a careful email assistant. Never expose secrets or claim an action was taken.'],
                 ['role' => 'user', 'content' => $prompt . "\n\n" . implode("\n\n", $documents)],
             ], [], 90);
             $summary = trim((string)($response['answer'] ?? ''));
@@ -4159,7 +4159,7 @@ class ActionExecutor {
                 180,
             );
             $folder = $home->nodeExists('EVA') ? $home->get('EVA') : $home->newFolder('EVA');
-            if (!$folder instanceof Folder) return ['ok' => false, 'error' => 'The EVA folder exists but is not a folder.'];
+            if (!$folder instanceof Folder) return ['ok' => false, 'error' => 'The Infinity AI folder exists but is not a folder.'];
             $name = 'eva-sticker-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(3)) . '.png';
             $file = $folder->newFile($name, $images[0]['bytes']);
             return ['ok' => true, 'result' => ['path' => 'EVA/' . $name, 'file_id' => (int)$file->getId(), 'mime' => $images[0]['mime']]];
