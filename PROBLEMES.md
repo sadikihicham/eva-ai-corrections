@@ -170,6 +170,34 @@ objet de la demande introduit par « un/une/en/new… » ; hôtes d'exemple (exa
 renameFile .md→.docx/.xlsx refusé. **Tests 146/146 ; contre-épreuve : la v3 échoue exactement aux 13 nouveaux cas.**
 Reste (non bloquant, tranche suivante) : note fausse si `fileLinks()` échoue ; move/copy vers .pdf.
 
+**Déployé le 28/09 03:31** (f571cf4). Test admin : Excel ✅ (agenda lu, vrai .xlsx) ; PDF = refus honnête + note ℹ️ (pas
+de générateur) ; recherche web ❌ → cause : réglage PERSONNEL `web_search_provider=bing` du compte hicham (seul des 185)
+masquant le global `searxng`. Corrigé en production (SearXNG, Brave en premier, Bing retiré) ; preuve par
+`RagService::ask` réel : « PHP 8.5.9, 15/08/2026 ». Google et DuckDuckGo répondent CAPTCHA par moments depuis le serveur.
+
+## 7. Outils oubliés : recherche proposée au lieu d'être faite, météo inventée (28/09, commit 421a56f)
+Test admin après déploiement : « appel news ? » → « je ne peux pas consulter les actualités… voulez-vous que je cherche ? »
+(faux : l'outil existe) ; « température de demin à Dubaï » → « 38 °C » sans aucun outil (inventé). `nudgeFor()` : même
+budget de 2 relances que la création ; recherche → le modèle écrit lui-même sa requête (même exposition que quand il
+cherche seul) ; météo → `weather` (la faute « demin » et « à <lieu> » reconnues, pas « température du four à 180 »).
+Mesuré via le client d'eva du compte hicham : 6/6. Tests 165/165.
+
+## 8. Générateur PDF (28/09, agent + revue adverse)
+`ActionExecutor::buildPdf()` : PDF 1.4 en PHP pur, sans dépendance ni date (déterministe), A4, Helvetica / Helvetica-Bold
+/ Courier (WinAnsi, largeurs AFM officielles), Markdown simple (titres, listes, gras, tableaux, code, citations, filets),
+pagination et pied « n / N ». Écriture latine seulement : au-delà de 5 caractères d'une autre écriture (arabe…),
+refus explicite qui oriente vers .docx. Tests `tests/test_pdf.php` 55/55 sur le PHP du serveur ; 13 PDF validés par
+`tests/verif_pdf.py` + poppler (pdfinfo, pdftotext) ; rendu visuel contrôlé. Limites : pas d'arabe en PDF (police à
+embarquer + mise en forme RTL = chantier séparé) ; .docx arabe lisible mais aligné à gauche.
+**Revue adverse (agent séparé) : 🟢, aucun bloquant, injection non exploitable, xref exacte ; 5 importants corrigés** :
+tableau à des milliers de colonnes (épuisement mémoire → refus au-delà de 40 colonnes, plafond ~1000 pages, lignes
+simples si le tableau dépasse la page) ; ligne commençant par ``` avec du texte (perdue → seule une vraie ligne de
+clôture compte, même type pour fermer) ; exposants (10⁶ devenait 106 → 10^6) ; faux refus d'un rapport français avec
+quelques lettres grecques (seuil en proportion, lettres remplacées signalées au modèle par un `warning`) ; ligne
+« | - | - | » supprimée (seule la 2e ligne peut être un séparateur) ; `\|` dans une cellule. Test d'injection figé
+(« ) Tj /JS (… endstream » reste du texte). **82/82 contrôles, 21 PDF validés par poppler.** Non fait : contre-épreuve
+des nouveaux tests sur la version d'avant revue (non conservée) ; tests d'intégration de createFile (Nextcloud requis).
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).
