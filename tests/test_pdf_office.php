@@ -40,11 +40,13 @@ function verifie(string $nom, bool $ok, string $detail = ''): void {
 
 // ---- Partie statique : branchement et messages -------------------------------------------------------------
 $create = extraire($source, 'createFile');
-verifie('createFile : texte non latin → pdfViaOffice', str_contains($create, '$office = $this->pdfViaOffice($content);'));
-verifie('createFile : quelques lettres non latines (« ? ») → aussi par Office, avertissement seulement si Office manque',
-    str_contains($create, 'if ($latin !== null && $replaced === 0) {') && str_contains($create, 'were replaced by "?"'));
-verifie('createFile : Office absent + texte non latin → refus clair, rien créé, .docx proposé',
-    str_contains($create, 'Office did not answer. Nothing was created. Offer a .docx file instead'));
+verifie('createFile : Office SEULEMENT pour un texte en écriture arabe (refusé par buildPdf ou avec « ? »)',
+    str_contains($create, "\$arabic = preg_match('/\\p{Arabic}/u', \$content) === 1;") && str_contains($create, '$office = $arabic && ($latin === null || $replaced > 0) ? $this->pdfViaOffice($content) : null;'));
+verifie('createFile : texte latin avec α (sans arabe) → buildPdf + « ? » + avertissement (liens, pages conservés)',
+    str_contains($create, 'if ($replaced > 0) {') && str_contains($create, 'were replaced by "?"'));
+verifie('createFile : arabe + Office indisponible → refus clair, rien créé, .docx proposé',
+    str_contains($create, 'Office is not available right now. Nothing was created. Offer a .docx file instead'));
+verifie('createFile : autre écriture (CJK…) → refus, jamais de carrés vides', str_contains($create, 'Latin script and in Arabic or Urdu only. Nothing was created.'));
 verifie('description de create_file : PDF arabe/ourdou annoncé', str_contains($source, '.pdf also works in Arabic and Urdu'));
 verifie('plus d\'annonce « Latin-script text only » au modèle', !str_contains($source, 'Latin-script text only'));
 
@@ -62,8 +64,14 @@ if (!is_file('/var/www/html/lib/base.php')) {
     set_error_handler(function (int $n, string $m, string $f = '', int $l = 0): bool { global $echecs; if ($n & (E_DEPRECATED | E_USER_DEPRECATED)) return true; echo "❌ AVERTISSEMENT PHP : $m (ligne $l)\n"; $echecs++; return true; });
     // eval() ne charge que du code extrait de NOTRE fichier versionné src/ActionExecutor.php.
     $corps = extraire($source, 'pdfViaOffice') . "\n" . extraire($source, 'buildDocx');
-    eval('use OCP\Server; class PdfOfficeSousTest { public bool $docxPlain = false;
-        public function pdf(string $t): ?string { return $this->pdfViaOffice($t); } ' . $corps . ' }');
+    $classe = static fn(string $nom, string $c): string => 'use OCP\Server; class ' . $nom . ' { public bool $docxPlain = false; public bool $officeDown = false;
+        public function pdf(string $t): ?string { return $this->pdfViaOffice($t); } ' . $c . ' }';
+    eval($classe('PdfOfficeSousTest', $corps));
+    // Vrais contrôles négatifs (revue de 384609f), sans toucher au code de production :
+    // (1) Office absent : la classe de richdocuments remplacée par un nom inexistant ;
+    eval($classe('PdfOfficeAbsent', str_replace('OCA\\\\Richdocuments', 'OCA\\\\Absent', $corps)));
+    // (2) réponse qui n'est pas un PDF : on demande du texte à Collabora.
+    eval($classe('PdfOfficeTexte', str_replace(", 'pdf');", ", 'txt');", $corps)));
     $t = new PdfOfficeSousTest();
     $dir = sys_get_temp_dir() . '/test-pdf-office-' . getmypid();
     @mkdir($dir, 0700);
@@ -97,15 +105,20 @@ if (!is_file('/var/www/html/lib/base.php')) {
         verifie("PDF $nom : texte relu intact (" . count($attendus) . ' mots)', $manque === [], 'absents : ' . implode(', ', $manque) . ' | relu : ' . mb_substr(str_replace("\n", ' ¶ ', $lu), 0, 200));
         verifie("PDF $nom : aucun « ? » de remplacement", !str_contains($lu, '?'));
     }
+    verifie('Office absent → null (pas d\'exception, repli de createFile)', (new PdfOfficeAbsent())->pdf('نص عربي للتجربة') === null);
+    $txt = new PdfOfficeTexte();
+    verifie('réponse de Collabora qui n\'est pas un PDF → null', $txt->pdf('نص عربي للتجربة') === null);
+    verifie('après un échec, plus d\'appel à Collabora dans la même requête (coupe-circuit)', $txt->officeDown === true && $txt->pdf('نص') === null);
     // Tableau arabe : colonnes inversées dans le .docx (1re colonne à droite).
     $docx = (new ReflectionMethod($t, 'buildDocx'))->invoke($t, "| البند | المبلغ |\n|---|---|\n| الرواتب | 1200 |", true);
     $z = new ZipArchive(); $f = tempnam(sys_get_temp_dir(), 'dx'); file_put_contents($f, $docx); $z->open($f); $doc = (string)$z->getFromName('word/document.xml'); $z->close(); unlink($f);
-    verifie('tableau arabe : bidiVisual (1re colonne à droite) et cellules en bidi', str_contains($doc, '<w:tblPr><w:bidiVisual/><w:tblW') && substr_count($doc, '<w:pPr><w:bidi/><w:spacing w:before="40"') === 3);   // 3 cellules en lettres arabes ; « 1200 » n'a pas de lettre
+    verifie('tableau arabe : bidiVisual (1re colonne à droite) et cellules en bidi', str_contains($doc, '<w:tblPr><w:bidiVisual/><w:tblW') && substr_count($doc, '<w:pPr><w:bidi/><w:spacing w:before="40"') === 4);   // toutes les cellules, « 1200 » compris (alignement)
+    $docx = (new ReflectionMethod($t, 'buildDocx'))->invoke($t, "| Item | Amount |\n|---|---|\n| الرواتب الشهرية للموظفين | 1200 |", true);
+    $z = new ZipArchive(); $f = tempnam(sys_get_temp_dir(), 'dx'); file_put_contents($f, $docx); $z->open($f); $doc = (string)$z->getFromName('word/document.xml'); $z->close(); unlink($f);
+    verifie('tableau à en-tête anglais et corps arabe → inversé (majorité de lettres arabes)', str_contains($doc, '<w:bidiVisual/>'));
     $docx = (new ReflectionMethod($t, 'buildDocx'))->invoke($t, "| Poste | Montant |\n|---|---|\n| Salaires | 1200 |", true);
     $z = new ZipArchive(); $f = tempnam(sys_get_temp_dir(), 'dx'); file_put_contents($f, $docx); $z->open($f); $doc = (string)$z->getFromName('word/document.xml'); $z->close(); unlink($f);
     verifie('tableau français : ni bidiVisual ni bidi', !str_contains($doc, 'bidiVisual') && !str_contains($doc, '<w:bidi/>'));
-    // Contrôle négatif : une conversion qui ne rend pas un PDF est rejetée (null), jamais écrite.
-    verifie('pdfViaOffice rejette une réponse qui n\'est pas un PDF', str_contains(extraire($source, 'pdfViaOffice'), "str_starts_with(\$pdf, '%PDF-') ? \$pdf : null"));
     array_map('unlink', glob("$dir/*") ?: []);
     @rmdir($dir);
 }

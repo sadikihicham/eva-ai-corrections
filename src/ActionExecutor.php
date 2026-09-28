@@ -1972,6 +1972,8 @@ class ActionExecutor {
     /** @return array{ok:true,result:string} */
     /** Set by convertFile() around its createFile() call: the .docx is written as plain lines, not Markdown. */
     private bool $docxPlain = false;
+    /** Set after a failed Office conversion: no second attempt in the same request (pdfViaOffice). */
+    private bool $officeDown = false;
 
     private function createFile(Folder $home, array $args): array {
         $path = $this->cleanPath((string)($args['path'] ?? ''));
@@ -2034,18 +2036,21 @@ class ActionExecutor {
                     return ['ok' => false, 'error' => 'PDF generation failed: ' . $e->getMessage()];
                 }
             }
-            if ($latin !== null && $replaced === 0) {
-                $content = $latin;
+            // Arabic / Urdu text the built-in fonts cannot print (admin 28/09: « PDF arabe ») is rendered by Nextcloud
+            // Office. ONLY Arabic script: a French report with « α = 0,05 » keeps buildPdf (links, quotes, page numbers)
+            // with a "?" and a warning, and scripts Collabora may lack fonts for (CJK…) never come back as empty boxes
+            // (review of 384609f).
+            $arabic = preg_match('/\p{Arabic}/u', $content) === 1;
+            $office = $arabic && ($latin === null || $replaced > 0) ? $this->pdfViaOffice($content) : null;
+            if ($office !== null) {
+                $content = $office;
+            } elseif ($latin === null && $arabic) {
+                return ['ok' => false, 'error' => 'This PDF needs Nextcloud Office (Collabora) for its Arabic-script text, and Office is not available right now. Nothing was created. Offer a .docx file instead (fully supported, right-to-left included).'];
+            } elseif ($latin === null) {
+                return ['ok' => false, 'error' => 'Infinity AI can generate PDF files in Latin script and in Arabic or Urdu only. Nothing was created. For other scripts, offer a .docx file instead (fully supported).'];
             } else {
-                // Arabic, Urdu or another script the built-in fonts cannot print (admin 28/09: « PDF arabe »):
-                // Nextcloud Office renders it. Without Office, the previous behaviour stays.
-                $office = $this->pdfViaOffice($content);
-                if ($office !== null) {
-                    $content = $office;
-                } elseif ($latin === null) {
-                    return ['ok' => false, 'error' => 'This PDF needs Nextcloud Office (Collabora) for its Arabic or other non-Latin text, and Office did not answer. Nothing was created. Offer a .docx file instead (fully supported, right-to-left included).'];
-                } else {
-                    $content = $latin;
+                $content = $latin;
+                if ($replaced > 0) {
                     // Tell the model (and so the user) instead of silently printing "?" (review, 28/09).
                     $warning = ['warning' => $replaced . ' character(s) of a non-Latin script could not be printed in the PDF and were replaced by "?". Tell the user; offer a .docx if that text matters.'];
                 }
@@ -2164,7 +2169,10 @@ class ActionExecutor {
                 . '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/>';
             // Arabic / Urdu table (first letter of its cells): columns mirrored, first column on the right (seen in the
             // Arabic PDF of 28/09, where « البند » stood on the left). tblPr order: bidiVisual before tblW.
-            $tableRtl = $rtl(implode(' ', array_map(static fn(array $c): string => implode(' ', $c), $rows)));
+            // Majority of Arabic-script letters over Latin ones (review of 384609f: an English header over an Arabic
+            // body is still an Arabic table).
+            $all = implode(' ', array_map(static fn(array $c): string => implode(' ', $c), $rows));
+            $tableRtl = preg_match_all('/\p{Arabic}/u', $all) > preg_match_all('/\p{Latin}/u', $all);
             $xml = '<w:tbl><w:tblPr>' . ($tableRtl ? '<w:bidiVisual/>' : '') . '<w:tblW w:w="5000" w:type="pct"/><w:tblBorders>' . $b . '</w:tblBorders><w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr><w:tblGrid>'
                 . str_repeat('<w:gridCol w:w="' . $w . '"/>', $cols) . '</w:tblGrid>';
             foreach ($rows as $r => $cells) {
@@ -2172,7 +2180,7 @@ class ActionExecutor {
                 for ($c = 0; $c < $cols; $c++) {
                     $v = trim((string)preg_replace('/^\*\*(.*)\*\*$/s', '$1', (string)($cells[$c] ?? '')));
                     $xml .= '<w:tc><w:tcPr><w:tcW w:w="' . $w . '" w:type="dxa"/>' . ($r === 0 ? '<w:shd w:val="clear" w:color="auto" w:fill="1F2A37"/>' : '') . '</w:tcPr>'
-                        . '<w:p><w:pPr>' . ($rtl($v) ? '<w:bidi/>' : '') . '<w:spacing w:before="40" w:after="40"/></w:pPr>' . $runs($v, $r === 0, 0, $r === 0 ? 'FFFFFF' : '') . '</w:p></w:tc>';
+                        . '<w:p><w:pPr>' . ($tableRtl || $rtl($v) ? '<w:bidi/>' : '') . '<w:spacing w:before="40" w:after="40"/></w:pPr>' . $runs($v, $r === 0, 0, $r === 0 ? 'FFFFFF' : '') . '</w:p></w:tc>';
                 }
                 $xml .= '</w:tr>';
             }
@@ -2614,9 +2622,16 @@ class ActionExecutor {
      */
     private function pdfViaOffice(string $text): ?string {
         $service = 'OCA\\Richdocuments\\Service\\RemoteService';
+        // One failure per request is enough: a slow or broken Collabora must not block a batch of files N times.
+        if ($this->officeDown) {
+            return null;
+        }
+        $stream = null;
         try {
             // Classes of a disabled app are not autoloaded; the method is checked because it is not a public API.
-            if (!class_exists($service) || !method_exists($service, 'convertTo')) {
+            // Office may be limited to some groups: a user without it does not get it through Infinity AI either.
+            if (!class_exists($service) || !method_exists($service, 'convertTo')
+                || !Server::get(\OCP\App\IAppManager::class)->isEnabledForUser('richdocuments')) {
                 return null;
             }
             $stream = fopen('php://temp', 'w+b');
@@ -2627,11 +2642,24 @@ class ActionExecutor {
             rewind($stream);
             $pdf = Server::get($service)->convertTo('document.docx', $stream, 'pdf');
             if (is_resource($pdf)) {
-                $pdf = stream_get_contents($pdf);
+                $bytes = stream_get_contents($pdf);
+                fclose($pdf);
+                $pdf = $bytes;
             }
-            return is_string($pdf) && str_starts_with($pdf, '%PDF-') ? $pdf : null;
+            if (is_string($pdf) && str_starts_with($pdf, '%PDF-')) {
+                return $pdf;
+            }
+            throw new \RuntimeException('the answer is not a PDF');
         } catch (\Throwable $e) {
+            // Logged (class and message only, never the document): after the HTTPS switch or a Collabora change, the
+            // admin must be able to tell « not installed », « timeout », « 403 » and « not a PDF » apart.
+            $this->officeDown = true;
+            Server::get(\Psr\Log\LoggerInterface::class)->warning('eva_ai: PDF conversion by Nextcloud Office failed: ' . get_class($e) . ': ' . $e->getMessage(), ['app' => 'eva_ai']);
             return null;
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
         }
     }
 
