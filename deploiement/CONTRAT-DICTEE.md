@@ -1,4 +1,4 @@
-# Contrat de la dictée (bouton micro d'Infinity AI) — v2.2, 28/09/2026
+# Contrat de la dictée (bouton micro d'Infinity AI) — v2.3, 28/09/2026
 
 Remplace la v1 (route audio côté serveur, ABANDONNÉE). Toute modification = décision de l'intégrateur.
 
@@ -56,6 +56,10 @@ Aucune route audio dans eva_ai. Le serveur ne reçoit que le message tapé/dict�
 - `transcrire(wav, {signal})` : seule fonction qui parle à Whisper.
 - Enregistrement quasi muet (aucune fenêtre de 20 ms au-dessus de -40 dBFS) ⇒ « rien d'audible », Whisper
   NON appelé (mesuré : sur 40 s de silence, Whisper invente « Thank you. Thank you. »).
+- Moins d'1 s de voix au total (somme des fenêtres de 20 ms au-dessus de -40 dBFS) ⇒ « dictée trop
+  courte », Whisper NON appelé (mesuré le 28/09 sur une vraie dictée : 0,8 s de voix en français ⇒
+  « Washington, MZN. », faux aussi en langue forcée). Conséquence assumée : un mot isolé (« oui »,
+  « merci ») ne se dicte pas, il se tape.
 - Insertion au curseur + événement `input` ; textes fr/en/ar/de/ur ; RTL ; accessibilité ; Échap = annuler ;
   compteur 2 min. Jamais de texte dicté dans la console. Jamais d'appel à un autre hôte que celui de la meta.
 

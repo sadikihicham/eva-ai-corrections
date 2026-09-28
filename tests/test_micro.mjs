@@ -46,7 +46,8 @@ after(() => { for (const w of fenetres) { try { w.close(); } catch (e) { /* déj
  *  meta (URL ou null), corps (HTML), lang, dir, securise, micro ('ok'|'refus'),
  *  whisper(url, init, n) → réponse simulée pour les POST, dispo (bool) pour GET /, sansMediaRecorder,
  *  silencieux (PCM nul), drapeauTest (défaut true : pose window.__EVA_DICTEE_TEST__ avant chargement),
- *  startLeve (MediaRecorder.start lève), decodeEchoue (decodeAudioData rejette), duree (s, défaut 0,5),
+ *  startLeve (MediaRecorder.start lève), decodeEchoue (decodeAudioData rejette), duree (s, défaut 2),
+ *  voix (s de signal au début, le reste muet ; défaut : toute la durée),
  *  oc (objet OC simulé, défaut uid alice), nextcloud(url, init) → réponse à tout fetch hors Whisper (doit rester inutilisé)
  */
 async function monter(o = {}) {
@@ -100,11 +101,11 @@ async function monter(o = {}) {
       }
     };
   }
-  w.AudioContext = class { decodeAudioData() { return o.decodeEchoue ? Promise.reject(new Error('EncodingError')) : Promise.resolve({ duration: o.duree || 0.5 }); } close() { return Promise.resolve(); } };
+  w.AudioContext = class { decodeAudioData() { return o.decodeEchoue ? Promise.reject(new Error('EncodingError')) : Promise.resolve({ duration: o.duree || 2 }); } close() { return Promise.resolve(); } };
   w.OfflineAudioContext = class {
     constructor(canaux, longueur, frequence) { this.longueur = longueur; this.frequence = frequence; this.destination = {}; }
     createBufferSource() { return { connect() {}, start() {} }; }
-    startRendering() { const pcm = new Float32Array(this.longueur); for (let i = 0; i < pcm.length; i++) pcm[i] = o.silencieux ? 0 : Math.sin(i / 7) * 0.5; return Promise.resolve({ getChannelData: () => pcm }); }
+    startRendering() { const pcm = new Float32Array(this.longueur); for (let i = 0; i < pcm.length; i++) pcm[i] = o.silencieux || (o.voix !== undefined && i >= o.voix * this.frequence) ? 0 : Math.sin(i / 7) * 0.5; return Promise.resolve({ getChannelData: () => pcm }); }
   };
   if (o.drapeauTest !== false) w.__EVA_DICTEE_TEST__ = true;
   w.OC = o.oc !== undefined ? o.oc : { webroot: '/workspace', requestToken: 'JETON-OC', getCurrentUser: () => ({ uid: 'alice' }) };
@@ -254,7 +255,7 @@ test('dictée « Auto », langue reconnue : un seul POST local, texte au curseur
   assert.equal(octets.getUint32(24, true), 16000);
   assert.equal(octets.getUint16(22, true), 1);
   assert.equal(octets.getUint16(34, true), 16);
-  assert.equal(octets.byteLength, 44 + 0.5 * 16000 * 2);
+  assert.equal(octets.byteLength, 44 + 2 * 16000 * 2);
   assert.equal(zone.value, 'Bonjour ' + TEXTE_SECRET + ' monde');
   assert.equal(zone.selectionStart, ('Bonjour ' + TEXTE_SECRET).length, 'curseur juste après le texte inséré');
   assert.equal(inputs, 1, 'un événement input');
@@ -597,6 +598,42 @@ test('enregistrement muet : Whisper n’est PAS appelé (il invente du texte sur
   assert.equal(p.posts().length, 0, 'aucun POST sur un silence');
   assert.equal(p.d.getElementById('chatinput').value, '');
   assert.equal(p.msg(), 'Rien d’audible n’a été entendu.');
+  p.fermer();
+});
+
+test('dictée trop courte (0,8 s de voix sur 4 s, cas réel du 28/09) : Whisper PAS appelé, rien inséré', async () => {
+  const p = await monter({ duree: 4, voix: 0.8 });
+  await attendre(() => p.bouton());
+  await dicter(p);
+  assert.equal(p.posts().length, 0, 'aucun POST sur un énoncé trop court');
+  assert.equal(p.d.getElementById('chatinput').value, '');
+  assert.equal(p.msg(), 'Dictée trop courte : parlez au moins une seconde.');
+  p.fermer();
+  const q = await monter({ duree: 4, voix: 0.8, lang: 'ar', dir: 'rtl' });
+  await attendre(() => q.bouton());
+  await dicter(q);
+  assert.equal(q.msg(), 'الإملاء قصير جدًا: تكلّم ثانية واحدة على الأقل.');
+  q.fermer();
+});
+
+test('dictée juste au-dessus du seuil (1,2 s de voix) : transcrite et insérée', async () => {
+  const p = await monter({ duree: 4, voix: 1.2 });
+  await attendre(() => p.bouton());
+  await dicter(p);
+  assert.equal(p.posts().length, 1);
+  assert.equal(p.d.getElementById('chatinput').value, TEXTE_SECRET);
+  p.fermer();
+});
+
+test('dureeVoix : compte les fenêtres de 20 ms au-dessus de -40 dBFS, même dispersées', async () => {
+  const p = await monter();
+  const { dureeVoix } = p.w.EvaDictee.__test__;
+  const pcm = new Float32Array(16000 * 3);
+  for (let k = 0; k < 41; k++) for (let i = 0; i < 320; i++) pcm[k * 640 + i] = 0.2; // 41 fenêtres un sur deux
+  assert.ok(Math.abs(dureeVoix(pcm) - 0.82) < 1e-9);
+  assert.equal(dureeVoix(new Float32Array(16000)), 0);
+  pcm.fill(0.005); // -46 dBFS : bruit de fond, pas de la voix
+  assert.equal(dureeVoix(pcm), 0);
   p.fermer();
 });
 
