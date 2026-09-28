@@ -85,7 +85,8 @@ class RagService {
     /** %s = the reader tool(s) to call. */
     private const PERSONAL_DATA_NUDGE = '[Automatic check by EVA, not written by the user] The user asked about their own data and you answered without '
         . 'reading it: nothing you said about it comes from their account. Call %s now, then answer only from its result (if it returns '
-        . 'nothing, say so plainly - never invent entries), in the language of the user\'s request.';
+        . 'nothing, say so plainly - never invent entries), in the language of the user\'s request. If the request does not need their data '
+        . '(advice, troubleshooting, drafting a text), give your previous answer again unchanged instead.';
     /** @var array<string,true> write tools already refused once by personalDataWriteGuard() in this answer */
     private array $personalWriteBlocked = [];
 
@@ -222,10 +223,8 @@ class RagService {
 				$res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
 					? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
 						: ($autonomousActions
-							// Nobody is present to confirm an unattended run (scheduled briefing): it never destroys data.
-							? ($this->executor->isDestructiveCall((string)$tc['name'], is_array($toolArgs) ? $toolArgs : [])
-								? ['ok' => false, 'error' => 'Deleting or overwriting data is never done in an unattended run: nobody is present to confirm. Tell the user what should be deleted and let them do it in the chat.']
-								: $this->executor->runConfirmed($userId, $tc['name'], $toolArgs))
+							// Nobody is present to confirm an unattended run (scheduled briefing): no deletion, terminal or overwrite.
+							? $this->executor->runUnattended($userId, $tc['name'], $toolArgs)
 							: $this->executor->run($userId, $tc['name'], $toolArgs)));
 				if ($onProgress !== null) $onProgress('tool_result', (string)($tc['name'] ?? ''), [
 					'ok' => !empty($res['ok']),
@@ -813,7 +812,7 @@ $this->executor->setUserId($userId);
             '~(?<!\p{L})(euro\s+(de\s+)?(football|foot)|uefa\s+euro|championnat\s+d[\'’]europe\s+de\s+football)(?!\p{L})~u' => 'uefa euro',
             '~(?<!\p{L})(coupe\s+du\s+monde|world\s+cup|mondial)(?!\p{L})|كأس\s+العالم|(?<!\p{L})champion\p{L}*\s+du\s+monde\s+de\s+(football|foot)(?!\p{L})~u' => 'world cup',
             '~(?<!\p{L})ballon\s+d[\'’]\s*or(?!\p{L})~u' => 'ballon d\'or',
-            '~(?<!\p{L})(jeux\s+olympiques|olympics?|olympiques?|jo)(?!\p{L})|الألعاب\s+الأولمبية~u' => 'olympic games',
+            '~(?<!\p{L})(jeux\s+olympiques|olympics?|olympiques?|jo(?=\s+(de\s+|d[\'’]|20\d\d)))(?!\p{L})|الألعاب\s+الأولمبية~u' => 'olympic games',
             '~(?<!\p{L})(oscars?|academy\s+awards?)(?!\p{L})~u' => 'oscars',
             '~(?<!\p{L})nobel(?!\p{L})~u' => 'nobel prize',
             '~(?<!\p{L})super\s+bowl(?!\p{L})~u' => 'super bowl',
@@ -846,7 +845,7 @@ $this->executor->setUserId($userId);
         } elseif ($token === 'presidential election') {
             // Which country: only a recognised one, else it cannot be rebuilt.
             $country = null;
-            foreach (['~(?<!\p{L})(am[ée]ricaines?|[ée]tats-unis|usa|us|american|united\s+states)(?!\p{L})|الأمريكية~u' => 'us',
+            foreach (['~(?<!\p{L})(am[ée]ricaines?|[ée]tats-unis|usa|u\.s\.|american|united\s+states)(?!\p{L})|الأمريكية~u' => 'us',
                       '~(?<!\p{L})(fran[çc]aises?|france|french)(?!\p{L})|الفرنسية~u' => 'france'] as $re => $name) {
                 if (preg_match($re, $m) === 1) {
                     $country = $name;
@@ -1244,6 +1243,13 @@ $this->executor->setUserId($userId);
      */
     private function personalDataNudge(string $message, string $answer, array $tools): ?string {
         if ($this->isFileCreationRequest($message)) {
+            return null;
+        }
+        // Troubleshooting, drafting or translating mentions "mon email" / "la réunion de demain" without asking for the
+        // data itself (review of corrections-recette: "mon email ne marche plus sur mon iPhone" would read the inbox).
+        if (preg_match('~(?<!\p{L})(pourquoi|why|ne\s+(marche|fonctionne|s[ey]\s+synchronis\p{L}*|s[\'’]affiche|charge)|(doesn|don|isn|won|can)[\'’]?t\s+(work|sync|load|show)'
+            . '|not\s+(working|syncing|loading|showing)|probl[eè]me|problem|bug|erreur|error|panne|param[eè]tr\p{L}*|config\p{L}*|r[ée]glages?|settings?|synchronis\p{L}*|sync'
+            . '|r[ée]dige|r[ée]diger|[ée]cris|[ée]crire|draft|write|compose|traduis|traduire|translate|reformule|rephrase|corrige|proofread)(?!\p{L})~u', mb_strtolower($message)) === 1) {
             return null;
         }
         $missing = $this->unreadPersonalData($message, $tools);

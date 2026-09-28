@@ -1032,6 +1032,28 @@ class ActionExecutor {
     }
 
     /**
+     * Unattended run (scheduled briefing with actions): nobody is present to confirm, so what the dialog would ask
+     * about is refused instead - deleting, a terminal command, replacing an existing file. The rest runs confirmed.
+     */
+    public function runUnattended(string $userId, string $name, array $args): array {
+        $refused = 'This is never done in an unattended run: nobody is present to confirm. Tell the user what should be done and let them do it in the chat.';
+        if ($this->isDestructiveCall($name, $args) || in_array($name, ['run_safe_command', 'run_terminal_command', 'run_terminal_sequence'], true)) {
+            return ['ok' => false, 'error' => $refused];
+        }
+        try {
+            $this->setUserId($userId);
+            if (PHP_SAPI === 'cli') \OC_Util::setupFS($userId);
+            $existing = $this->existingWriteTargets($this->rootFolder->getUserFolder($userId), $name, $args);
+        } catch (\Throwable $e) {
+            $existing = [];
+        }
+        if ($existing !== []) {
+            return ['ok' => false, 'error' => 'The file ' . implode(', ', $existing) . ' already exists. ' . $refused];
+        }
+        return $this->runConfirmed($userId, $name, $args);
+    }
+
+    /**
      * Führt einen Tool-Aufruf aus. Wirft nie - liefert immer {ok, result|error}.
      * @return array{ok:bool,result?:mixed,error?:string,confirmation_required?:bool,tool?:string,risk?:string}
      */

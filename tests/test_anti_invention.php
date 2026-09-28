@@ -610,10 +610,21 @@ verifie('location vide → laissée à l\'outil (qui la refuse)', $t->gardeMeteo
 verifie('une relance d\'EVA n\'est pas la question de l\'utilisateur', $t->gardeMeteo(['location' => 'Abu Dhabi'], [$question("Quel temps fera-t-il demain ?"), ['role' => 'user', 'content' => RagSousTest::WEATHER_NUDGE]]) !== null);
 
 // Suppressions (revue de 229ea02) : jamais en exécution autonome, et une question lisible avant confirmation.
-$auto = strpos($source, '? ($this->executor->isDestructiveCall(');
-verifie('briefing autonome : outil destructif refusé AVANT runConfirmed (contrôle de source)', $auto !== false && ($rc = strpos($source, '$this->executor->runConfirmed(', $auto)) !== false && $rc - $auto < 600);
+verifie('briefing autonome : passe par runUnattended, jamais runConfirmed directement (contrôle de source)', str_contains($source, '? $this->executor->runUnattended($userId,') && !str_contains($source, '$this->executor->runConfirmed('));
 verifie('question de suppression affichée dans les DEUX chemins (ask + askStream)', substr_count($source, '$this->deleteQuestion($confirmationName,') === 2);
 verifie('deleteQuestion : traduite (fr/ar/de/en) et dit « supprime »', str_contains($d = (string)substr($source, (int)strpos($source, 'private function deleteQuestion('), 1500), "'fr' =>") && str_contains($d, "'ar' =>") && str_contains($d, 'supprime'));
+// Relance « données personnelles » : pas pour du dépannage ou de la rédaction (revue de corrections-recette, 🔴)
+$sansDonnees = ["Mon email pro ne marche plus sur mon iPhone, que faire ?", "Mes contacts ne se synchronisent pas avec Android",
+    "Pourquoi mon agenda n'affiche pas les jours fériés ?", "Rédige un mail à mes collègues pour annoncer la réunion de demain"];
+$lecteurs = array_merge($perso, [['type' => 'function', 'function' => ['name' => 'list_contacts']]]);
+foreach ($sansDonnees as $q) {
+    $t = new RagSousTest();
+    verifie('pas de relance données perso : « ' . $q . ' »', $t->relanceGenerale($q, 'Voici quelques pistes.', $lecteurs) === null);
+}
+$t = new RagSousTest();
+verifie('relance toujours là pour « quels sont mes rendez-vous de cette semaine »', $t->relanceGenerale('quels sont mes rendez-vous de cette semaine', "Je ne trouve pas de rendez-vous dans vos fichiers.", $lecteurs) !== null);
+verifie('« Tell us who won the last presidential election in Brazil » → pas de requête « us »', !str_contains((string)json_encode($t->web('Tell us who won the last presidential election in Brazil')), 'us presidential'));
+verifie('« Qu\'a dit Jo lors de la dernière réunion ? » → pas de recherche JO', !str_contains((string)json_encode($t->web("Qu'a dit Jo lors de la dernière réunion ?")), 'olympic'));
 
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
