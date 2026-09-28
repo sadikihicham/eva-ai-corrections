@@ -11,7 +11,7 @@ function extraire(string $src, string $nom): string {
     for ($i = $ouv, $n = strlen($src); $i < $n; $i++) { if ($src[$i] === '{') $niv++; elseif ($src[$i] === '}' && --$niv === 0) return substr($src, $debut, $i - $debut + 1); }
     exit(2);
 }
-eval('class DocxSousTest { ' . extraire($source, 'buildDocx') . ' public function x(string $t): string { return $this->buildDocx($t); } }');
+eval('class DocxSousTest { ' . extraire($source, 'buildDocx') . ' public function x(string $t, bool $md = true): string { return $this->buildDocx($t, $md); } }');
 $echecs = 0; $total = 0;
 function verifie(string $nom, bool $ok, string $d = ''): void { global $echecs, $total; $total++; echo ($ok ? '✅ ' : '❌ ') . $nom . ($ok ? '' : " → $d") . "\n"; if (!$ok) $echecs++; }
 function doc(string $docx): string { $f = tempnam(sys_get_temp_dir(), 'dx'); file_put_contents($f, $docx); $z = new ZipArchive(); $z->open($f); $x = (string)$z->getFromName('word/document.xml'); $z->close(); unlink($f); return $x; }
@@ -28,5 +28,30 @@ $x = doc($g->x("Le mot اردو signifie « urdu »."));
 verifie('ligne française avec un mot arabe → reste de gauche à droite (première lettre)', !str_contains($x, '<w:bidi/>'));
 $x = doc($g->x("دور لي على گوگل"));
 verifie('arabe du Golfe (گ) → langue ar-SA, pas ur-PK', str_contains($x, 'w:bidi="ar-SA"'));
+// Markdown → vrai Word (28/09 : « # » et « - » étaient imprimés tels quels)
+function parts(string $docx): array { $f = tempnam(sys_get_temp_dir(), 'dx'); file_put_contents($f, $docx); $z = new ZipArchive(); $z->open($f); $p = []; for ($i = 0; $i < $z->numFiles; $i++) { $p[$z->getNameIndex($i)] = (string)$z->getFromIndex($i); } $z->close(); @copy($f, '/tmp/eva-test-word.docx'); unlink($f); return $p; }
+$md = "# Plan de formation\nIntroduction avec **gras** au milieu.\n\n## Objectifs\n- Sécuriser\n  - postes\n- Former\n\n1. Audit\n2. Formation\n\nTexte entre deux listes.\n\n1. Reprise\n\n| Poste | Montant |\n|---|---|\n| Serveurs | 12 000 |\n\n```\n# pas un titre\n```\n---\nFin.";
+$p = parts($g->x($md)); $x = $p['word/document.xml'] ?? '';
+foreach (['word/document.xml', 'word/numbering.xml', 'word/styles.xml', 'word/_rels/document.xml.rels', '[Content_Types].xml'] as $n) verifie("partie $n présente", isset($p[$n]));
+verifie('toutes les parties XML bien formées', array_filter($p, static function ($c, $n) { if (!str_ends_with($n, '.xml') && !str_ends_with($n, '.rels')) return false; $d = new DOMDocument(); return !@$d->loadXML($c); }, ARRAY_FILTER_USE_BOTH) === []);
+verifie('titres : « # » retiré, gras 18 pt / 15 pt', !str_contains($x, '># Plan') && !str_contains($x, '>## Objectifs') && str_contains($x, '>Plan de formation<') && str_contains($x, '<w:sz w:val="36"/>') && str_contains($x, '<w:sz w:val="30"/>'));
+verifie('puces : vraie liste Word (numPr numId 1), niveau 2 pour l\'imbrication, « - » retiré', substr_count($x, '<w:numId w:val="1"/>') === 3 && str_contains($x, '<w:ilvl w:val="1"/>') && !preg_match('~<w:t[^>]*>- ~', $x));
+verifie('listes numérotées : chacune repart à 1 (2 listes = 2 numéros distincts avec startOverride)', str_contains($x, '<w:numId w:val="3"/>') && str_contains($x, '<w:numId w:val="4"/>') && substr_count($p['word/numbering.xml'], '<w:startOverride w:val="1"/>') === 2);
+verifie('**gras** → w:b, astérisques retirés', str_contains($x, '<w:b/>') && !str_contains($x, '**'));
+verifie('tableau → w:tbl, en-tête ombré, séparateur retiré', str_contains($x, '<w:tbl>') && str_contains($x, 'w:fill="1F2A37"') && substr_count($x, '<w:tr>') === 2 && !str_contains($x, '---'));
+verifie('bloc de code : « # » gardé en Courier New, pas un titre', str_contains($x, 'Courier New') && str_contains($x, '># pas un titre<'));
+verifie('police par défaut Calibri (styles.xml)', str_contains($p['word/styles.xml'], 'w:ascii="Calibri"'));
+$p = parts($g->x("| a | b |\n|---|---|\n| 1 | 2 |")); verifie('document qui finit par un tableau : paragraphe final ajouté', str_ends_with(explode('<w:sectPr>', $p['word/document.xml'])[0], '<w:p/>'));
+$p = parts($g->x("")); verifie('document vide → XML valide', (new DOMDocument())->loadXML($p['word/document.xml']) === true);
+$p = parts($g->x("## العنوان\n- نقطة أولى")); verifie('titre et puce arabes : bidi dans pPr', substr_count($p['word/document.xml'], '<w:bidi/>') === 2);
+// Revue de 469ba22
+$x = doc($g->x("1. Audit\n\n2. Formation\n   - sous-point\n3. Bilan"));
+verifie('liste aérée + sous-puce = UNE seule liste numérotée (pas 1., 1., 1.)', substr_count($x, '<w:numId w:val="3"/>') === 3 && !str_contains($x, '<w:numId w:val="4"/>'));
+$p = parts($g->x("3. Résultats\n4. Suite")); verifie('liste qui commence à 3 → startOverride 3', str_contains($p['word/numbering.xml'], '<w:startOverride w:val="3"/>'));
+$x = doc($g->x("## Langage C#")); verifie('« ## Langage C# » garde son #', str_contains($x, '>Langage C#<'));
+$x = doc($g->x("```\ncode\n```")); verifie('bloc de code : shd AVANT spacing (ordre du schéma)', str_contains($x, '<w:shd w:val="clear" w:color="auto" w:fill="F2F4F7"/><w:spacing'));
+$x = doc($g->x("- 12 -\n# Titre PDF\n\n______\n**pas du gras**\n| a | b |", false));
+verifie('mode texte (PDF → Word) : rien d\'interprété, lignes vides gardées', !str_contains($x, 'w:numPr') && !str_contains($x, '<w:tbl>') && !str_contains($x, '<w:b/>') && str_contains($x, '>- 12 -<') && str_contains($x, '># Titre PDF<') && str_contains($x, '>______<') && str_contains($x, '>**pas du gras**<') && substr_count($x, '<w:p/>') === 1);
+verifie('convert_file : mode texte sauf source Markdown', str_contains($source, "\$this->docxPlain = !in_array(\$ext, ['md', 'markdown'], true);") && str_contains($source, '$this->buildDocx($content, !$this->docxPlain)'));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
