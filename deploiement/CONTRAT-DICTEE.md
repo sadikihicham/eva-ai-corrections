@@ -33,7 +33,7 @@ Aucune route audio dans eva_ai. Le serveur ne reçoit que le message tapé/dict�
   langue bien détectée pendant la session, sinon la langue de l'interface (fr/ar/en), sinon `fr`.
   Pas de seuil de probabilité pour ce repli (mesuré : un seuil casse l'arabe court).
 - Silence / `[BLANK_AUDIO]` testé AVANT le repli (pas de second appel sur un silence). (Mesuré : la détection a rendu « islandais » sur une vraie dictée courte ;
-  imposer une MAUVAISE langue produit du charabia, d'où le choix manuel.)
+  imposer une MAUVAISE langue produit du charabia : on n'impose donc une langue qu'au repli.)
 - Réponse `[BLANK_AUDIO]` / vide ⇒ message « rien d'audible », rien inséré.
 
 ## Serveur eva_ai (PageController seulement)
@@ -52,8 +52,10 @@ Aucune route audio dans eva_ai. Le serveur ne reçoit que le message tapé/dict�
 - Lit `<meta name="eva-ai-dictation">` ; absent ⇒ ne fait rien.
 - `disponible()` : `GET <origine>/` (délai 2 s) au chargement puis toutes les 60 s ; échec ⇒ **aucun bouton**
   (poste sans Whisper) ; redevenu joignable ⇒ bouton affiché.
-- Bouton micro + menu langue (« Auto », FR, AR, EN) à côté du bouton d'envoi ; `MutationObserver`.
-- `transcrire(wav, langue)` : seule fonction qui parle à Whisper.
+- Bouton micro à côté du bouton d'envoi (pas de menu de langue) ; `MutationObserver`.
+- `transcrire(wav, {signal})` : seule fonction qui parle à Whisper.
+- Enregistrement quasi muet (aucune fenêtre de 20 ms au-dessus de -40 dBFS) ⇒ « rien d'audible », Whisper
+  NON appelé (mesuré : sur 40 s de silence, Whisper invente « Thank you. Thank you. »).
 - Insertion au curseur + événement `input` ; textes fr/en/ar/de/ur ; RTL ; accessibilité ; Échap = annuler ;
   compteur 2 min. Jamais de texte dicté dans la console. Jamais d'appel à un autre hôte que celui de la meta.
 

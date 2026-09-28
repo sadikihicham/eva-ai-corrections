@@ -45,9 +45,9 @@ after(() => { for (const w of fenetres) { try { w.close(); } catch (e) { /* déj
  * Monte une page. options :
  *  meta (URL ou null), corps (HTML), lang, dir, securise, micro ('ok'|'refus'),
  *  whisper(url, init, n) → réponse simulée pour les POST, dispo (bool) pour GET /, sansMediaRecorder,
- *  stockage ('ok'|'casse'), drapeauTest (défaut true : pose window.__EVA_DICTEE_TEST__ avant chargement),
+ *  silencieux (PCM nul), drapeauTest (défaut true : pose window.__EVA_DICTEE_TEST__ avant chargement),
  *  startLeve (MediaRecorder.start lève), decodeEchoue (decodeAudioData rejette), duree (s, défaut 0,5),
- *  oc (objet OC simulé, défaut uid alice), nextcloud(url, init) → réponse au PUT, session {clé: valeur}
+ *  oc (objet OC simulé, défaut uid alice), nextcloud(url, init) → réponse à tout fetch hors Whisper (doit rester inutilisé)
  */
 async function monter(o = {}) {
   const journalConsole = [];
@@ -104,14 +104,10 @@ async function monter(o = {}) {
   w.OfflineAudioContext = class {
     constructor(canaux, longueur, frequence) { this.longueur = longueur; this.frequence = frequence; this.destination = {}; }
     createBufferSource() { return { connect() {}, start() {} }; }
-    startRendering() { const pcm = new Float32Array(this.longueur); for (let i = 0; i < pcm.length; i++) pcm[i] = Math.sin(i / 7) * 0.5; return Promise.resolve({ getChannelData: () => pcm }); }
+    startRendering() { const pcm = new Float32Array(this.longueur); for (let i = 0; i < pcm.length; i++) pcm[i] = o.silencieux ? 0 : Math.sin(i / 7) * 0.5; return Promise.resolve({ getChannelData: () => pcm }); }
   };
-  if (o.stockage === 'casse') {
-    Object.defineProperty(w, 'localStorage', { configurable: true, get() { throw new Error('SecurityError'); } });
-  }
   if (o.drapeauTest !== false) w.__EVA_DICTEE_TEST__ = true;
   w.OC = o.oc !== undefined ? o.oc : { webroot: '/workspace', requestToken: 'JETON-OC', getCurrentUser: () => ({ uid: 'alice' }) };
-  for (const [k, v] of Object.entries(o.session || {})) w.sessionStorage.setItem(k, v);
   let soumissions = 0;
   w.document.addEventListener('submit', (e) => { soumissions++; e.preventDefault(); }, true);
   w.eval(CODE);
@@ -287,15 +283,6 @@ test('Auto, langue détectée hors {fr, ar, en} : UN seul 2e appel avec la langu
   q.fermer();
 });
 
-test('localStorage inaccessible : sans effet, la dictée marche', async () => {
-  const p = await monter({ stockage: 'casse' });
-  await attendre(() => p.bouton());
-  await dicter(p);
-  assert.equal(p.posts().length, 1);
-  assert.equal(p.d.getElementById('chatinput').value, TEXTE_SECRET);
-  p.fermer();
-});
-
 test('messages d’erreur distincts : injoignable, 413, 400, 500, [BLANK_AUDIO]', async () => {
   const cas = [
     { o: { decodeEchoue: true }, attendu: 'Enregistrement illisible. Réessayez.' },
@@ -464,7 +451,7 @@ const bloquant = (init) => new Promise((res, rej) => {
   s.addEventListener('abort', () => rej(new DOMException('abort', 'AbortError')));
 });
 
-test('B2 : re-rendu + Whisper perdu PENDANT l’enregistrement : bouton toujours là, arrêt possible, pistes coupées', async () => {
+test('B2 : re-rendu PENDANT l’enregistrement (disponibilité non revérifiée pendant la dictée) : bouton toujours là, arrêt possible, pistes coupées', async () => {
   const p = await monter();
   await attendre(() => p.bouton());
   p.bouton().click();
@@ -577,20 +564,45 @@ test('repli : indice = DERNIÈRE langue correctement détectée (avant la langue
   p.fermer();
 });
 
-test('événement eva-dictee:langue sans texte + dir posé sur la zone (rtl pour ar, ltr sinon)', async () => {
+test('dir posé sur la zone selon la langue détectée (rtl pour ar, ltr sinon)', async () => {
   const reps = [{ text: 'مرحبا', language: 'arabic' }, { text: 'Bonjour', language: 'french' }];
   const p = await monter({ whisper: (u, i, n) => reponse(200, reps[n - 1]) });
   await attendre(() => p.bouton());
-  const recus = [];
-  p.d.addEventListener('eva-dictee:langue', (e) => recus.push(e.detail));
   await dicter(p);
-  assert.deepEqual(JSON.parse(JSON.stringify(recus)), [{ langue: 'ar' }]);
   assert.equal(p.d.getElementById('chatinput').getAttribute('dir'), 'rtl');
   await dicter(p);
-  assert.deepEqual(JSON.parse(JSON.stringify(recus[1])), { langue: 'fr' });
   assert.equal(p.d.getElementById('chatinput').getAttribute('dir'), 'ltr');
-  assert.ok(!JSON.stringify(recus).includes('مرحبا'), 'jamais le texte dans l’événement');
   p.fermer();
+});
+
+test('silence en plusieurs segments [BLANK_AUDIO] + langue exotique ⇒ un seul appel, rien inséré ; jetons retirés d’un vrai texte', async () => {
+  const p = await monter({ whisper: () => reponse(200, { language: 'icelandic', segments: [{ text: ' [BLANK_AUDIO]' }, { text: '[BLANK_AUDIO]' }] }) });
+  await attendre(() => p.bouton());
+  await dicter(p);
+  assert.equal(p.posts().length, 1);
+  assert.equal(p.d.getElementById('chatinput').value, '');
+  assert.equal(p.msg(), 'Rien d’audible n’a été entendu.');
+  p.fermer();
+  const q = await monter({ whisper: () => reponse(200, { language: 'french', segments: [{ text: ' Bonjour' }, { text: ' [BLANK_AUDIO]' }, { text: ' à tous' }] }) });
+  await attendre(() => q.bouton());
+  await dicter(q);
+  assert.equal(q.d.getElementById('chatinput').value, 'Bonjour à tous');
+  q.fermer();
+});
+
+test('enregistrement muet : Whisper n’est PAS appelé (il invente du texte sur le silence)', async () => {
+  const p = await monter({ silencieux: true });
+  await attendre(() => p.bouton());
+  await dicter(p);
+  assert.equal(p.posts().length, 0, 'aucun POST sur un silence');
+  assert.equal(p.d.getElementById('chatinput').value, '');
+  assert.equal(p.msg(), 'Rien d’audible n’a été entendu.');
+  p.fermer();
+});
+
+test('code : un seul point d’appel réseau (fetch), ni XHR, ni sendBeacon, ni WebSocket, ni navigation', () => {
+  assert.equal((CODE.match(/\bfetch\(/g) || []).length, 1);
+  assert.ok(!/XMLHttpRequest|sendBeacon|WebSocket|EventSource|location\.|sessionStorage|localStorage|eva-dictee:langue/.test(CODE));
 });
 
 test('meta : seule celle du <head> au chargement compte (ajout dans le body ou modification ultérieure ignorés)', async () => {

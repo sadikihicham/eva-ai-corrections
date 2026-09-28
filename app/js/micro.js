@@ -1,6 +1,6 @@
 /*
  * Bouton micro (dictée) d'Infinity AI — eva_ai, fichier NEUF, sans build ni dépendance.
- * Contrat : deploiement/CONTRAT-DICTEE.md (v2, 28/09/2026) + décisions admin du 28/09 (détection
+ * Contrat : deploiement/CONTRAT-DICTEE.md (v2.2, 28/09/2026) + décisions admin du 28/09 (détection
  * automatique seule, sans bascule de langue de l'interface). Repris du prototype ~/whisper-test/prototype/micro.js
  * (encodage WAV 16 kHz vérifié dans Chrome, gardé octet pour octet).
  *
@@ -29,15 +29,17 @@
  * Ce script ne fait AUCUN appel vers Nextcloud : seul Whisper local est contacté.
  *
  * LANGUE (décision admin : détection automatique seule, pas de menu) :
- *  - 1er appel en verbose_json sans `language`. Réponse vide / [BLANK_AUDIO] ⇒ « rien d'audible »,
- *    aucun second appel.
+ *  - Enregistrement quasi muet (aucune fenêtre de 20 ms au-dessus de -40 dBFS) ⇒ « rien d'audible »
+ *    SANS appeler Whisper : sur du silence, Whisper invente du texte (mesuré le 28/09 : 40 s de
+ *    silence ⇒ « Thank you. Thank you. »).
+ *  - 1er appel en verbose_json sans `language`. Jetons [BLANK_AUDIO]/[silence] retirés partout ;
+ *    réponse vide ⇒ « rien d'audible », aucun second appel.
  *  - Langue détectée ∉ {french, arabic, english} ⇒ UN SEUL 2e appel avec `language` = dernière langue
  *    correctement détectée pendant la session (variable de module), sinon langue de l'interface si
  *    fr/ar/en, sinon fr. Aucun seuil de probabilité sur ce repli (un seuil casse l'arabe court).
  *  - Texte : `segments[].text` recollés SANS séparateur (whisper-server coupe parfois au milieu d'un
  *    mot) ; à défaut `text` sans ses « \n ».
- *  - Après chaque transcription réussie : événement `eva-dictee:langue` {detail:{langue}} (jamais le
- *    texte) et attribut `dir` de la zone de saisie (rtl pour ar, sinon ltr).
+ *  - Après chaque transcription réussie : attribut `dir` de la zone de saisie (rtl pour ar, sinon ltr).
  *
  * CONFIDENTIALITÉ : le texte dicté n'est jamais écrit dans la console ; seuls des codes d'erreur.
  */
@@ -98,7 +100,7 @@
       network: 'اس کمپیوٹر پر املا کی سروس تک رسائی نہیں ہو سکی۔', nozone: 'لکھنے کی جگہ نہیں ملی: متن شامل نہیں ہوا۔',
       switched: 'املا منسوخ: آپ نے گفتگو بدل دی۔', cancelled: 'املا منسوخ ہو گیا۔' },
   };
-  const CODES_ERREUR = ['too_long', 'failed', 'invalid_audio', 'network'];
+  const CODES_ERREUR = ['too_long', 'failed', 'invalid_audio', 'network', 'empty'];
   const langueUI = () => String(document.documentElement.lang || '').slice(0, 2).toLowerCase();
   const tx = () => TEXTES[langueUI()] || TEXTES.fr;
 
@@ -153,8 +155,18 @@
     if (Array.isArray(j.segments) && j.segments.length) return j.segments.map((s) => String((s && s.text) || '')).join('');
     return String(j.text || '').replace(/\r?\n/g, '');
   }
-  const normaliser = (t) => String(t || '').replace(/\s+/g, ' ').trim();
-  const estSilence = (t) => t === '' || /^\[(BLANK_AUDIO|silence)\]$/i.test(t);
+  const normaliser = (t) => String(t || '').replace(/\[(BLANK_AUDIO|silence)\]/gi, ' ').replace(/\s+/g, ' ').trim();
+  const estSilence = (t) => normaliser(t) === '';
+  /** Au moins une fenêtre de 20 ms (320 échantillons) dont la valeur efficace dépasse 0,01 (-40 dBFS). */
+  function estAudible(pcm) {
+    for (let d = 0; d < pcm.length; d += 320) {
+      const f = Math.min(pcm.length, d + 320);
+      let s = 0;
+      for (let i = d; i < f; i++) s += pcm[i] * pcm[i];
+      if (Math.sqrt(s / Math.max(1, f - d)) > 0.01) return true;
+    }
+    return false;
+  }
 
   const transportLocal = {
     maxSecondes: 120,
@@ -231,8 +243,9 @@
       const src = hors.createBufferSource();
       src.buffer = audio; src.connect(hors.destination); src.start();
       const pcm = (await hors.startRendering()).getChannelData(0);
+      if (!estAudible(pcm)) throw new ErreurDictee('empty');
       return new Blob([pcmVersWav(pcm).buffer], { type: 'audio/wav' });
-    } catch (e) { throw new ErreurDictee('invalid_audio'); }
+    } catch (e) { throw e instanceof ErreurDictee ? e : new ErreurDictee('invalid_audio'); }
   }
   const TAILLE_MAX = 4000000; // 120 s × 32 000 o/s ≈ 3,84 Mo : garde-fou contre un enregistrement anormal
 
@@ -501,10 +514,7 @@
       inserer(zone, texte);
       afficher(limiteAtteinte ? tx().limit : '', limiteAtteinte);
       const code = rep.language;
-      if (NOM_WHISPER[code]) {
-        zone.setAttribute('dir', code === 'ar' ? 'rtl' : 'ltr');
-        document.dispatchEvent(new CustomEvent('eva-dictee:langue', { detail: { langue: code } }));
-      }
+      if (NOM_WHISPER[code]) zone.setAttribute('dir', code === 'ar' ? 'rtl' : 'ltr');
     } catch (e) {
       if (signal.aborted) afficher(tx().cancelled);
       else {
