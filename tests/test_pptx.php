@@ -65,6 +65,24 @@ verifie('contenu vide → 1 diapositive « Présentation », pas d\'erreur', cou
 $d = ouvre($g->x("## Code\n```\n# pas un titre\n- pas une puce\n```"), 'code');
 verifie('bloc de code : « # » dedans ne crée pas de diapositive', count($d['slides']) === 1);
 verifie('ids de forme uniques par diapositive', (function () use ($g): bool { $d = ouvre($g->x("## A\n- x\n| a | b |\n|---|---|\n| 1 | 2 |\n- y"), 'ids'); preg_match_all('~cNvPr id="(\d+)"~', $d['slides'][0], $m); return count($m[1]) === count(array_unique($m[1])); })());
+// Revue de 2be8964
+$d = ouvre($g->x("## Budget\nContexte en une phrase assez longue pour tenir sur une ligne.\n- point un\n- point deux\n| Poste | Montant |\n|---|---|\n| Serveurs | 12 000 |\n| Licences | 3 000 |"), 'texte-tableau');
+preg_match('~name="Contenu"/>.*?<a:off x="\d+" y="(\d+)"/><a:ext cx="\d+" cy="(\d+)"/>~s', $d['slides'][0], $zt);
+preg_match('~<p:graphicFrame>.*?<a:off x="\d+" y="(\d+)"/>~s', $d['slides'][0], $zg);
+verifie('texte puis tableau : le tableau commence SOUS le texte (plus de recouvrement)', isset($zt[2], $zg[1]) && (int)$zg[1] >= (int)$zt[1] + (int)$zt[2], json_encode([$zt[1] ?? null, $zt[2] ?? null, $zg[1] ?? null]));
+$d = ouvre($g->x("## Objectifs\n- un\n- deux"), 'h2-premier');
+verifie('« ## Objectifs » + 2 puces en premier → diapositive de contenu (puces gardées), pas de titre sombre', !str_contains($d['slides'][0], 'sz="4400"') && str_contains($d['slides'][0], 'char="•"'));
+$rows = implode("\n", array_map(static fn(int $i): string => "| ligne $i | $i |", range(1, 25)));
+$d = ouvre($g->x("## Grand tableau\n| Nom | Valeur |\n|---|---|\n$rows"), 'grand-tableau');
+verifie('tableau de 25 lignes → 3 diapositives, en-tête répété, aucune ligne perdue', count($d['slides']) === 3 && substr_count(implode('', $d['slides']), '>Nom<') === 3 && substr_count(implode(' ', array_map('textes', $d['slides'])), 'ligne ') === 25, (string)count($d['slides']));
+$d = ouvre($g->x(str_repeat("# a\n", 260)), 'plafond');
+verifie('260 titres → 200 diapositives, la dernière dit ce qui manque', count($d['slides']) === 200 && str_contains(textes($d['slides'][199]), '61 diapositive(s) non incluse(s)'), (string)count($d['slides']));
+$d = ouvre($g->x("## Long\n" . implode("\n", array_fill(0, 5, str_repeat('mot ', 60)))), 'long-paras');
+verifie('5 paragraphes de 240 caractères → répartis sur plusieurs diapositives', count($d['slides']) >= 3, (string)count($d['slides']));
+$d = ouvre($g->x("## x\nA\u{FFFE}B"), 'ffff');
+verifie('U+FFFE retiré, XML valide', xmlOk($d['parts']) === [] && str_contains(textes($d['slides'][0]), 'AB'));
+$d = ouvre($g->x("## العنوان\n- نص"), 'lang');
+verifie('texte arabe : lang="ar-AE"', str_contains($d['slides'][0], 'lang="ar-AE"'));
 verifie('câblage : create_file .pptx, convert_file pptx, plus refusé', str_contains($source, "=== 'pptx') {\n            try { \$content = \$this->buildPptx(") && str_contains($source, "CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'pptx'") && !preg_match("~noTextBuilder = \[[^\]]*'pptx'~", $source));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

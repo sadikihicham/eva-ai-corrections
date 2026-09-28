@@ -2017,7 +2017,7 @@ class ActionExecutor {
         if ($binary && isset($signatures[$ext])) {
             $matches = array_filter($signatures[$ext], static fn(string $sig): bool => str_starts_with($content, $sig));
             if ($matches === []) {
-                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; pass the text in content instead (Infinity AI generates .pdf, .docx and .xlsx from text), or offer a .md or .txt file.'];
+                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; pass the text in content instead (Infinity AI generates .pdf, .docx, .xlsx and .pptx from text), or offer a .md or .txt file.'];
             }
         }
         $warning = [];
@@ -2200,15 +2200,15 @@ class ActionExecutor {
         $pal = ['dk1' => '1B2430', 'lt1' => 'FFFFFF', 'dk2' => '0B1F3A', 'lt2' => 'F4F7FB', 'accent1' => '1E6FFF', 'accent2' => '00B3A6',
             'accent3' => 'F5A524', 'accent4' => '7C5CFF', 'accent5' => 'E5484D', 'accent6' => '6B7A90', 'hlink' => '1E6FFF', 'folHlink' => '7C5CFF'];
         $W = 12192000; $H = 6858000; $emu = 914400;
-        $esc = static fn(string $v): string => htmlspecialchars((string)preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $v), ENT_XML1 | ENT_COMPAT, 'UTF-8');
+        $esc = static fn(string $v): string => htmlspecialchars((string)preg_replace(['/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '/[\x{FFFE}\x{FFFF}]/u'], '', $v), ENT_XML1 | ENT_COMPAT | ENT_SUBSTITUTE, 'UTF-8');
         $isRtl = static fn(string $v): bool => preg_match('/\p{Arabic}|\p{Hebrew}/u', $v) === 1;
         // One paragraph's runs, with **bold** kept.
-        $runs = static function (string $v, int $size, bool $bold, string $color) use ($esc): string {
-            $out = '';
+        $runs = static function (string $v, int $size, bool $bold, string $color) use ($esc, $isRtl): string {
+            $out = ''; $lang = $isRtl($v) ? 'ar-AE' : 'fr-FR';
             foreach (preg_split('/(\*\*[^*]+\*\*)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [$v] as $part) {
                 $b = $bold || (str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4);
                 $t = $b && str_starts_with($part, '**') ? substr($part, 2, -2) : $part;
-                $out .= '<a:r><a:rPr lang="fr-FR" sz="' . $size . '"' . ($b ? ' b="1"' : '') . ' dirty="0"><a:solidFill><a:srgbClr val="' . $color . '"/></a:solidFill>'
+                $out .= '<a:r><a:rPr lang="' . $lang . '" sz="' . $size . '"' . ($b ? ' b="1"' : '') . ' dirty="0"><a:solidFill><a:srgbClr val="' . $color . '"/></a:solidFill>'
                     . '<a:latin typeface="Calibri"/><a:cs typeface="Arial"/></a:rPr><a:t>' . $esc($t) . '</a:t></a:r>';
             }
             return $out === '' ? '<a:endParaRPr lang="fr-FR" sz="' . $size . '"/>' : $out;
@@ -2263,15 +2263,16 @@ class ActionExecutor {
         };
 
         // ---- 1. Markdown -> slides: [title, [items]] ; item = ['p'|'b'|'n', level, text] or ['t', rows]
-        $lines = preg_split('/\R/u', trim(str_replace("\t", '    ', $text))) ?: [];
+        $lines = preg_split('/\R/u', trim(str_replace("\t", '    ', $text)));
+        if ($lines === false) throw new \RuntimeException('invalid UTF-8 text');
         $slides = []; $cur = null; $inCode = false;
         $push = static function (?array $s) use (&$slides): void { if ($s !== null && ($s[0] !== '' || $s[1] !== [])) $slides[] = $s; };
         foreach ($lines as $raw) {
             $line = rtrim($raw);
             if (preg_match('/^\s*```/', $line)) { $inCode = !$inCode; continue; }
-            if (!$inCode && preg_match('/^\s{0,3}(#{1,3})\s+(.+?)\s*#*$/u', $line, $m)) { $push($cur); $cur = [trim($m[2]), []]; continue; }
-            if (!$inCode && preg_match('/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/', $line)) { $push($cur); $cur = ['', []]; continue; }
-            $cur ??= ['', []];
+            if (!$inCode && preg_match('/^\s{0,3}(#{1,3})\s+(.+?)\s*#*$/u', $line, $m)) { $push($cur); $cur = [trim($m[2]), [], strlen($m[1])]; continue; }
+            if (!$inCode && preg_match('/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/', $line)) { $push($cur); $cur = ['', [], 0]; continue; }
+            $cur ??= ['', [], 0];
             if (trim($line) === '') continue;
             if (!$inCode && preg_match('/^\s*\|(.+)\|\s*$/u', $line, $m)) {
                 $cells = array_map('trim', preg_split('/(?<!\\\\)\|/', $m[1]) ?: [$m[1]]);
@@ -2287,27 +2288,39 @@ class ActionExecutor {
             $cur[1][] = ['p', -1, trim($line)];
         }
         $push($cur);
-        if ($slides === []) $slides[] = ['Présentation', []];
-        // Too long: at most 7 text lines (a table counts 3, plus one per row over 3) per slide, the rest on "(suite)" slides.
+        if ($slides === []) $slides[] = ['Présentation', [], 1];
+        // Too long: at most 7 lines per slide (a paragraph counts one line per ~75 characters, a table 3 plus one per
+        // row over 3; a table longer than 10 data rows is cut, its header repeated), the rest on "(suite)" slides.
         $split = [];
-        foreach ($slides as [$title, $items]) {
-            $chunk = []; $weight = 0; $part = 0;
+        foreach ($slides as [$title, $items, $level]) {
+            $cut = [];
             foreach ($items as $it) {
-                $w = $it[0] === 't' ? 3 + max(0, count($it[1]) - 3) : 1;
-                if ($chunk !== [] && $weight + $w > 7) { $split[] = [$part++ === 0 ? $title : ($title !== '' ? $title . ' (suite)' : ''), $chunk]; $chunk = []; $weight = 0; }
+                if ($it[0] !== 't' || count($it[1]) <= 11) { $cut[] = $it; continue; }
+                foreach (array_chunk(array_slice($it[1], 1), 10) as $rows) $cut[] = ['t', array_merge([$it[1][0]], $rows)];
+            }
+            $chunk = []; $weight = 0; $part = 0;
+            foreach ($cut as $it) {
+                $w = $it[0] === 't' ? 3 + max(0, count($it[1]) - 3) : max(1, (int)ceil(mb_strlen($it[2]) / 75));
+                if ($chunk !== [] && $weight + $w > 7) { $split[] = [$part++ === 0 ? $title : ($title !== '' ? $title . ' (suite)' : ''), $chunk, $level]; $chunk = []; $weight = 0; }
                 $chunk[] = $it; $weight += $w;
             }
-            $split[] = [$part === 0 ? $title : ($title !== '' ? $title . ' (suite)' : ''), $chunk];
+            $split[] = [$part === 0 ? $title : ($title !== '' ? $title . ' (suite)' : ''), $chunk, $level];
+        }
+        // A deck no viewer can use (100 000 characters of "# a" = 25 000 slides): at most 200, the cut is said on the last one.
+        if (count($split) > 200) {
+            $dropped = count($split) - 199;
+            $split = array_merge(array_slice($split, 0, 199), [['…', [['p', -1, $dropped . ' diapositive(s) non incluse(s) : présentation limitée à 200 diapositives.']], 2]]);
         }
         $slides = $split;
 
         // ---- 2. slide XML
         $ns = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
         $slideXml = [];
-        foreach ($slides as $i => [$title, $items]) {
+        foreach ($slides as $i => [$title, $items, $level]) {
             $id = 1; $shapes = '';
-            $textOnly = array_filter($items, static fn(array $it): bool => $it[0] !== 't');
-            if ($i === 0 && $title !== '' && count($items) <= 2 && count($textOnly) === count($items)) {
+            $plain = array_filter($items, static fn(array $it): bool => $it[0] === 'p');
+            // Title slide: a first "# " heading with at most two plain lines (a "## Objectifs" with bullets stays a content slide).
+            if ($i === 0 && $title !== '' && $level === 1 && count($items) <= 2 && count($plain) === count($items)) {
                 // Title slide: dark band, big title, subtitle lines.
                 $shapes .= $rect('Fond', 0, 0, $W, $H, $pal['dk2']) . $rect('Accent', $isRtl($title) ? $W - (int)($emu * 2.5) : (int)($emu * 0.9), (int)($emu * 4.35), (int)($emu * 1.6), 60000, $pal['accent2']);
                 $shapes .= $box('Titre', (int)($emu * 0.9), (int)($emu * 1.9), (int)($emu * 11.5), (int)($emu * 2.3), $para($title, 4400, true, $pal['lt1']), 'b');
@@ -2320,11 +2333,14 @@ class ActionExecutor {
                     // Under a right-to-left title the accent bar sits on the right.
                     $shapes .= $rect('Accent', $isRtl($title) ? $W - (int)($emu * 1.9) : (int)($emu * 0.7), (int)($emu * 1.36), (int)($emu * 1.2), 45720, $pal['accent1']);
                 }
-                $y = (int)($emu * 1.6); $body = '';
-                $flush = static function () use (&$body, &$shapes, &$y, $box, $emu, $H): void {
+                $y = (int)($emu * 1.6); $body = ''; $bodyLines = 0;
+                // Text before a table gets the height of its lines (~0.5" per line of ~75 characters) and pushes the table
+                // down (review of 2be8964: the table was drawn over it); the last text block runs to the bottom.
+                $flush = static function (bool $last = false) use (&$body, &$bodyLines, &$shapes, &$y, $box, $emu, $H): void {
                     if ($body === '') return;
-                    $shapes .= $box('Contenu', (int)($emu * 0.6), $y, (int)($emu * 12.1), max((int)($emu * 0.6), $H - $y - (int)($emu * 0.5)), $body);
-                    $body = '';
+                    $h = $last ? max((int)($emu * 0.6), $H - $y - (int)($emu * 0.5)) : (int)($emu * (0.5 * $bodyLines + 0.2));
+                    $shapes .= $box('Contenu', (int)($emu * 0.6), $y, (int)($emu * 12.1), $h, $body);
+                    $y += $h; $body = ''; $bodyLines = 0;
                 };
                 foreach ($items as $it) {
                     if ($it[0] === 't') {
@@ -2334,8 +2350,9 @@ class ActionExecutor {
                         continue;
                     }
                     $body .= $para($it[2], $it[0] === 'p' ? 2400 : ($it[1] > 0 ? 2000 : 2400), false, $pal['dk1'], 'l', $it[0] === 'p' ? -1 : $it[1], $it[0] === 'n');
+                    $bodyLines += max(1, (int)ceil(mb_strlen($it[2]) / 75));
                 }
-                $flush();
+                $flush(true);
             }
             $slideXml[] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld ' . $ns . '><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
                 . '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>' . $shapes

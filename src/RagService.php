@@ -954,7 +954,7 @@ $this->executor->setUserId($userId);
         }
         $verb = '(cr[eé]+r?[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|convert\p{L}*|transform\p{L}*|umwandel\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل|حوّل|حول)';
         // Not "tableau / table / markdown / note" alone: "fais un tableau comparatif" is an in-chat answer (second review, 28/09).
-        $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|diaporama|slides|deck|datei|ملف|مستند|اكسل)';
+        $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|diaporama|slides|slide\s+deck|deck\s+(?:de\s+)?slides|deck\s+powerpoint|datei|ملف|مستند|اكسل)';
         // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
         // not a file to create.
         $existing = '(?<!ce )(?<!cet )(?<!cette )(?<!ces )(?<!le )(?<!la )(?<!les )(?<!mon )(?<!ma )(?<!mes )(?<!ton )(?<!ta )(?<!tes )(?<!son )(?<!sa )(?<!ses )(?<!this )(?<!that )(?<!these )(?<!those )(?<!the )(?<!my )(?<!your )(?<!du )(?<!dans )';

@@ -684,5 +684,13 @@ verifie('relance météo : « never guess » + « ask … which city »', str_co
 verifie('prompt : nom Infinity AI en lettres latines + من أنت / من أنا', str_contains($source, 'always written in Latin letters exactly') && str_contains($source, 'من أنت') && str_contains($source, 'أنت …'));
 verifie('bloc KNOWLEDGE.md présenté comme faits sur l\'UTILISATEUR (« me »/« I » = l\'utilisateur)', str_contains($source, 'Personal facts about the USER from their KNOWLEDGE.md') && str_contains($source, '<personal_knowledge>'));
 
+// PowerPoint (28/09) : demandes reconnues ; « Deck » seul = l'app Nextcloud Deck, pas une présentation
+foreach (["crée une présentation powerpoint sur la sécurité", "crée un diaporama de 5 slides", "fais un slide deck sur Nextcloud", "génère un fichier pptx", "convertis Rapport.docx en powerpoint"] as $q) {
+    verifie('demande PowerPoint reconnue : « ' . $q . ' »', $t->fichier($q));
+}
+foreach (["crée une carte Deck pour la réunion", "make a new Deck board", "ajoute une tâche dans Deck"] as $q) {
+    verifie('pas une présentation : « ' . $q . ' »', !$t->fichier($q));
+}
+
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
