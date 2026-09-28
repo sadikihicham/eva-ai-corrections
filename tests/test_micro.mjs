@@ -115,11 +115,9 @@ async function monter(o = {}) {
   let soumissions = 0;
   w.document.addEventListener('submit', (e) => { soumissions++; e.preventDefault(); }, true);
   w.eval(CODE);
-  const recharges = [];
-  if (w.EvaDictee.__test__) w.EvaDictee.__test__.definirRecharger(() => recharges.push(1));
   await pause();
   return {
-    dom, w, d: w.document, appels, appelsNc, recharges, etat, journalConsole, pistesArretees, argsStart,
+    dom, w, d: w.document, appels, appelsNc, etat, journalConsole, pistesArretees, argsStart,
     soumissions: () => soumissions,
     boutons: () => w.document.querySelectorAll('.eva-dictee__micro'),
     bouton: () => w.document.querySelector('.eva-dictee__micro'),
@@ -631,100 +629,31 @@ test('retour sur l’onglet (visibilitychange) : disponibilité revérifiée', a
   p.fermer();
 });
 
-// ------------------------------------------------------------------ bascule de langue de l'interface
-// Forme RÉELLE de whisper-server 1.9.4 (mesurée le 28/09) : probabilités indexées par code.
-const AR_SUR = { text: 'مرحبا بكم', language: 'arabic', detected_language: 'arabic', detected_language_probability: 0.93, language_probabilities: { ar: 0.93, fa: 0.03 } };
 
-test('bascule : toutes conditions réunies ⇒ texte inséré, PUT OCS (langue seule), puis rechargement', async () => {
-  const p = await monter({ lang: 'fr', duree: 3, whisper: () => reponse(200, AR_SUR) });
-  await attendre(() => p.bouton());
-  p.d.getElementById('chatinput').value = 'Note :';
-  p.d.getElementById('chatinput').selectionStart = p.d.getElementById('chatinput').selectionEnd = 6;
-  await dicter(p);
-  await attendre(() => p.recharges.length === 1);
-  assert.equal(p.d.getElementById('chatinput').value, 'Note : مرحبا بكم', 'texte inséré AVANT la bascule');
-  assert.equal(p.appelsNc.length, 1, 'un seul appel vers Nextcloud');
-  const put = p.appelsNc[0];
-  assert.equal(put.url, '/workspace/ocs/v2.php/cloud/users/alice');
-  assert.equal(put.init.method, 'PUT');
-  assert.equal(put.init.credentials, 'same-origin');
-  assert.equal(put.init.headers['OCS-APIRequest'], 'true');
-  assert.equal(put.init.headers.requesttoken, 'JETON-NEXTCLOUD', 'meta requesttoken prioritaire');
-  assert.equal(put.init.headers['Content-Type'], 'application/x-www-form-urlencoded');
-  assert.equal(put.init.body, 'key=language&value=ar', 'le corps ne contient que la langue');
-  assert.ok(!JSON.stringify(put).includes('مرحبا'), 'jamais le texte dicté vers Nextcloud');
-  const sauve = JSON.parse(p.w.sessionStorage.getItem('eva-dictee-restaurer'));
-  assert.equal(sauve.texte, 'Note : مرحبا بكم');
-  assert.equal(sauve.curseur, 'Note : مرحبا بكم'.length);
-  p.fermer();
-});
-
-test('bascule : jamais si probabilité < 0,8 / absente, audio < 2 s, même langue, repli utilisé, < 30 s', async () => {
-  const cas = [
-    { nom: 'prob 0,7', o: { duree: 3, whisper: () => reponse(200, { ...AR_SUR, detected_language_probability: 0.7, language_probabilities: { ar: 0.7 } }) } },
-    { nom: 'prob absente', o: { duree: 3, whisper: () => reponse(200, { text: 'مرحبا', language: 'arabic' }) } },
-    { nom: 'audio 1,5 s', o: { duree: 1.5, whisper: () => reponse(200, AR_SUR) } },
-    { nom: 'même langue', o: { lang: 'ar', duree: 3, whisper: () => reponse(200, AR_SUR) } },
-    { nom: 'repli utilisé', o: { duree: 3, whisper: (u, i, n) => reponse(200, n === 1 ? { text: 'x', language: 'icelandic', language_probabilities: { icelandic: 0.9 } } : AR_SUR) } },
-    { nom: '< 30 s', o: { duree: 3, session: { 'eva-dictee-derniere-bascule': String(Date.now() - 10000) }, whisper: () => reponse(200, AR_SUR) } },
-  ];
-  for (const c of cas) {
-    const p = await monter(c.o);
-    await attendre(() => p.bouton());
-    await dicter(p);
-    await pause(20);
-    assert.equal(p.appelsNc.length, 0, c.nom);
-    assert.equal(p.recharges.length, 0, c.nom);
-    assert.ok(p.d.getElementById('chatinput').value.length > 0, c.nom + ' : texte inséré quand même');
-    assert.equal(p.w.sessionStorage.getItem('eva-dictee-restaurer'), null, c.nom);
-    p.fermer();
-  }
-});
-
-test('bascule refusée par Nextcloud (500) : pas de rechargement, message discret, texte conservé', async () => {
-  const p = await monter({ duree: 3, whisper: () => reponse(200, AR_SUR), nextcloud: () => reponse(500, {}) });
-  await attendre(() => p.bouton());
-  await dicter(p);
-  await attendre(() => p.msg() !== '');
-  assert.equal(p.recharges.length, 0);
-  assert.equal(p.msg(), 'Impossible de changer la langue de l’interface.');
-  assert.equal(p.d.getElementById('chatinput').value, 'مرحبا بكم');
-  assert.equal(p.w.sessionStorage.getItem('eva-dictee-restaurer'), null, 'rien à restaurer');
-  p.fermer();
-});
-
-test('restauration après rechargement : texte et curseur remis dès que la zone apparaît, clé supprimée ; clé expirée ignorée', async () => {
-  const cle = 'eva-dictee-restaurer';
-  const val = JSON.stringify({ texte: 'Note : مرحبا بكم', curseur: 4, t: Date.now() - 10000, langue: 'ar' });
-  const p = await monter({ lang: 'ar', corps: '<div id="vue"></div>', session: { [cle]: val } });
-  await pause(20);
-  assert.equal(p.w.sessionStorage.getItem(cle), null, 'clé supprimée');
-  p.d.getElementById('vue').innerHTML = FORM_MAIN.replace(/^<div id="vue">|<\/div>$/g, '');
-  await attendre(() => p.d.getElementById('chatinput') && p.d.getElementById('chatinput').value !== '');
-  const z = p.d.getElementById('chatinput');
-  assert.equal(z.value, 'Note : مرحبا بكم');
-  assert.equal(z.selectionStart, 4);
-  assert.equal(z.getAttribute('dir'), 'rtl');
-  p.fermer();
-
-  const q = await monter({ session: { [cle]: JSON.stringify({ texte: 'vieux', curseur: 0, t: Date.now() - 180000 }) } });
-  await attendre(() => q.bouton());
-  assert.equal(q.d.getElementById('chatinput').value, '', 'clé expirée : rien restauré');
-  assert.equal(q.w.sessionStorage.getItem(cle), null, 'clé expirée supprimée');
-  q.fermer();
-});
-
-test('bascule : un transport qui signale repli=true n’entraîne jamais de bascule, même probabilité haute', async () => {
-  const p = await monter({ duree: 3 });
-  await attendre(() => p.bouton());
-  await p.w.EvaDictee.definirTransport({
-    disponible: async () => true,
-    transcrire: async () => ({ text: 'مرحبا', language: 'ar', probabilite: 0.99, repli: true }),
+// ------------------------------------------------------------------ plus de bascule de langue (décision admin)
+test('dictée arabe sûre (prob 0,99, 5 s) : aucun appel hors Whisper, pas de rechargement, rien en sessionStorage', async () => {
+  const p = await monter({
+    lang: 'fr', duree: 5,
+    whisper: () => reponse(200, { text: 'مرحبا بكم', language: 'arabic', detected_language_probability: 0.99, language_probabilities: { ar: 0.99, fa: 0.01 } }),
   });
+  let recharge = 0;
+  // location.reload n'est pas redéfinissable dans jsdom : on espionne la navigation non implémentée
+  // (jsdom émet « Not implemented: navigation » sur la console virtuelle) et on compte les écritures.
+  const ecritures = [];
+  const proto = Object.getPrototypeOf(p.w.sessionStorage);
+  const setItem = proto.setItem;
+  proto.setItem = function (k, v) { ecritures.push(k); return setItem.call(this, k, v); };
+  await attendre(() => p.bouton());
   await dicter(p);
-  await pause(20);
-  assert.equal(p.appelsNc.length, 0);
-  assert.equal(p.recharges.length, 0);
-  assert.equal(p.d.getElementById('chatinput').value, 'مرحبا');
+  await pause(50);
+  assert.equal(p.d.getElementById('chatinput').value, 'مرحبا بكم');
+  assert.equal(p.d.getElementById('chatinput').getAttribute('dir'), 'rtl');
+  assert.equal(p.appelsNc.length, 0, 'aucun fetch hors Whisper');
+  assert.ok(p.appels.every((a) => a.url.startsWith('http://localhost:8178/')));
+  recharge = p.journalConsole.filter((l) => /navigation|reload/i.test(l)).length;
+  assert.equal(recharge, 0, 'pas de location.reload');
+  assert.equal(p.w.sessionStorage.length, 0, 'sessionStorage vide');
+  assert.deepEqual(ecritures, [], 'aucune écriture en sessionStorage');
+  assert.equal(p.d.documentElement.lang, 'fr', 'langue de l’interface inchangée');
   p.fermer();
 });

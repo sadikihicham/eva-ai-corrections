@@ -1,7 +1,7 @@
 /*
  * Bouton micro (dictée) d'Infinity AI — eva_ai, fichier NEUF, sans build ni dépendance.
  * Contrat : deploiement/CONTRAT-DICTEE.md (v2, 28/09/2026) + décisions admin du 28/09 (détection
- * automatique seule, bascule de langue). Repris du prototype ~/whisper-test/prototype/micro.js
+ * automatique seule, sans bascule de langue de l'interface). Repris du prototype ~/whisper-test/prototype/micro.js
  * (encodage WAV 16 kHz vérifié dans Chrome, gardé octet pour octet).
  *
  * D'OÙ VIENT LE SÉLECTEUR (lu dans les bundles compilés, aucun octet de ces bundles n'est modifié) :
@@ -23,9 +23,10 @@
  * script ne fait rien). Hôte accepté : exactement localhost ou 127.0.0.1 (forme texte stricte, pas
  * d'IP déguisée), http/https, sans identifiants. Deux fonctions seulement parlent à Whisper :
  *   disponible() → Promise<true|null>   (null ⇒ aucun bouton : poste sans Whisper)
- *   transcrire(wavBlob, {signal}) → Promise<{text, language, probabilite, repli}>
+ *   transcrire(wavBlob, {signal}) → Promise<{text, language}>
  * Appels Whisper : credentials 'omit', aucun en-tête, redirect 'error', referrerPolicy 'no-referrer'.
  * Le texte est inséré dans la zone de saisie ; jamais d'envoi automatique du message.
+ * Ce script ne fait AUCUN appel vers Nextcloud : seul Whisper local est contacté.
  *
  * LANGUE (décision admin : détection automatique seule, pas de menu) :
  *  - 1er appel en verbose_json sans `language`. Réponse vide / [BLANK_AUDIO] ⇒ « rien d'audible »,
@@ -38,20 +39,7 @@
  *  - Après chaque transcription réussie : événement `eva-dictee:langue` {detail:{langue}} (jamais le
  *    texte) et attribut `dir` de la zone de saisie (rtl pour ar, sinon ltr).
  *
- * BASCULE AUTOMATIQUE DE LA LANGUE DE L'INTERFACE (décision admin du 28/09) — toutes les conditions :
- *  langue détectée ∈ {fr, ar, en} au 1er appel (pas de repli) ; language_probabilities[<nom>] ≥ 0,80
- *  (absente ⇒ pas de bascule) ; audio ≥ 2,0 s ; langue ≠ 2 premières lettres de <html lang> ;
- *  aucune bascule dans les 30 dernières secondes (sessionStorage).
- *  Action : le texte est d'abord inséré ; puis {texte complet de la zone, curseur, horodatage} est
- *  gardé en sessionStorage (`eva-dictee-restaurer`) ; puis PUT <webroot>/ocs/v2.php/cloud/users/<uid>
- *  (corps `key=language&value=<code>`, en-têtes OCS-APIRequest + requesttoken, credentials same-origin)
- *  — SEUL appel de ce script vers Nextcloud, qui ne contient jamais le texte. 2xx ⇒ rechargement ;
- *  sinon message discret, le texte reste en place.
- *  Au chargement : clé de moins de 2 min ⇒ texte et curseur remis dans la zone dès qu'elle apparaît,
- *  puis clé supprimée ; clé plus vieille ⇒ supprimée sans rien restaurer.
- *
  * CONFIDENTIALITÉ : le texte dicté n'est jamais écrit dans la console ; seuls des codes d'erreur.
- * Il ne transite en sessionStorage (onglet courant) que le temps d'une bascule de langue.
  */
 (function () {
   'use strict';
@@ -68,8 +56,7 @@
       too_long: 'Enregistrement trop long : raccourcissez-le.',
       invalid_audio: 'Enregistrement illisible. Réessayez.',
       network: 'Service de dictée injoignable sur cet ordinateur.', nozone: 'Zone de saisie introuvable : texte non inséré.',
-      switched: 'Dictée annulée : vous avez changé de conversation.', cancelled: 'Dictée annulée.',
-      uilang: 'Impossible de changer la langue de l’interface.' },
+      switched: 'Dictée annulée : vous avez changé de conversation.', cancelled: 'Dictée annulée.' },
     en: { start: 'Dictate', stop: 'Stop and transcribe', cancel: 'Cancel', sending: 'Transcribing…',
       recording: 'Recording. Press Escape to cancel.', remaining: '15 seconds left.',
       denied: 'Microphone blocked by the browser. Allow it in the site settings.', nomic: 'No microphone found.',
@@ -79,8 +66,7 @@
       too_long: 'Recording too long: please make it shorter.',
       invalid_audio: 'The recording could not be read. Please try again.',
       network: 'Dictation service unreachable on this computer.', nozone: 'Input field not found: text not inserted.',
-      switched: 'Dictation cancelled: you switched conversations.', cancelled: 'Dictation cancelled.',
-      uilang: 'Could not change the interface language.' },
+      switched: 'Dictation cancelled: you switched conversations.', cancelled: 'Dictation cancelled.' },
     ar: { start: 'إملاء', stop: 'إيقاف وتحويل إلى نص', cancel: 'إلغاء', sending: 'جارٍ التحويل…',
       recording: 'جارٍ التسجيل. اضغط Esc للإلغاء.', remaining: 'تبقّت 15 ثانية.',
       denied: 'المتصفح منع الميكروفون. اسمح به في إعدادات الموقع.', nomic: 'لم يُعثر على ميكروفون.',
@@ -90,8 +76,7 @@
       too_long: 'التسجيل طويل جدًا: اختصره.',
       invalid_audio: 'تعذّرت قراءة التسجيل. حاول مرة أخرى.',
       network: 'تعذّر الوصول إلى خدمة الإملاء على هذا الحاسوب.', nozone: 'لم يُعثر على خانة الكتابة: لم يُدرج النص.',
-      switched: 'أُلغي الإملاء: لقد انتقلت إلى محادثة أخرى.', cancelled: 'أُلغي الإملاء.',
-      uilang: 'تعذّر تغيير لغة الواجهة.' },
+      switched: 'أُلغي الإملاء: لقد انتقلت إلى محادثة أخرى.', cancelled: 'أُلغي الإملاء.' },
     de: { start: 'Diktieren', stop: 'Beenden und transkribieren', cancel: 'Abbrechen', sending: 'Wird transkribiert…',
       recording: 'Aufnahme läuft. Esc zum Abbrechen.', remaining: 'Noch 15 Sekunden.',
       denied: 'Mikrofon vom Browser blockiert. Erlauben Sie es in den Website-Einstellungen.', nomic: 'Kein Mikrofon gefunden.',
@@ -101,8 +86,7 @@
       too_long: 'Aufnahme zu lang: bitte kürzer fassen.',
       invalid_audio: 'Aufnahme unlesbar. Bitte erneut versuchen.',
       network: 'Diktierdienst auf diesem Computer nicht erreichbar.', nozone: 'Eingabefeld nicht gefunden: Text nicht eingefügt.',
-      switched: 'Diktat abgebrochen: Sie haben die Unterhaltung gewechselt.', cancelled: 'Diktat abgebrochen.',
-      uilang: 'Die Sprache der Oberfläche konnte nicht geändert werden.' },
+      switched: 'Diktat abgebrochen: Sie haben die Unterhaltung gewechselt.', cancelled: 'Diktat abgebrochen.' },
     ur: { start: 'املا', stop: 'روکیں اور متن میں بدلیں', cancel: 'منسوخ کریں', sending: 'متن میں بدلا جا رہا ہے…',
       recording: 'ریکارڈنگ جاری ہے۔ منسوخ کرنے کے لیے Esc دبائیں۔', remaining: '15 سیکنڈ باقی ہیں۔',
       denied: 'براؤزر نے مائیکروفون روک دیا ہے۔ سائٹ کی ترتیبات میں اجازت دیں۔', nomic: 'کوئی مائیکروفون نہیں ملا۔',
@@ -112,8 +96,7 @@
       too_long: 'ریکارڈنگ بہت طویل ہے: اسے مختصر کریں۔',
       invalid_audio: 'ریکارڈنگ پڑھی نہیں جا سکی۔ دوبارہ کوشش کریں۔',
       network: 'اس کمپیوٹر پر املا کی سروس تک رسائی نہیں ہو سکی۔', nozone: 'لکھنے کی جگہ نہیں ملی: متن شامل نہیں ہوا۔',
-      switched: 'املا منسوخ: آپ نے گفتگو بدل دی۔', cancelled: 'املا منسوخ ہو گیا۔',
-      uilang: 'انٹرفیس کی زبان تبدیل نہیں ہو سکی۔' },
+      switched: 'املا منسوخ: آپ نے گفتگو بدل دی۔', cancelled: 'املا منسوخ ہو گیا۔' },
   };
   const CODES_ERREUR = ['too_long', 'failed', 'invalid_audio', 'network'];
   const langueUI = () => String(document.documentElement.lang || '').slice(0, 2).toLowerCase();
@@ -185,7 +168,7 @@
     },
     /**
      * Détection automatique + repli unique (voir en-tête). Retour :
-     * { text (normalisé), language ('fr'|'ar'|'en'|null), probabilite (1er appel, ou null), repli (bool) }.
+     * { text (normalisé), language ('fr'|'ar'|'en'|null) }.
      */
     async transcrire(wav, opts) {
       const signal = opts && opts.signal;
@@ -204,24 +187,19 @@
         try { j = await r.json(); } catch (e) { throw new ErreurDictee('failed'); }
         if (!j || typeof j !== 'object') throw new ErreurDictee('failed');
         const nom = String(j.language || '').toLowerCase();
-        // whisper-server 1.9.4 (mesuré le 28/09) : `detected_language_probability` (nombre) et
-        // `language_probabilities` indexé par CODE (« ar »), pas par nom (« arabic »).
-        const probas = j.language_probabilities && typeof j.language_probabilities === 'object' ? j.language_probabilities : null;
-        let p = Number(j.detected_language_probability);
-        if (!Number.isFinite(p) && probas) p = Number(probas[LANGUES_WHISPER[nom]] ?? probas[nom]);
-        return { text: normaliser(texteDesSegments(j)), nom, probabilite: Number.isFinite(p) ? p : null };
+        return { text: normaliser(texteDesSegments(j)), nom };
       };
       const premier = await appel(null);
       const code = LANGUES_WHISPER[premier.nom] || null;
       // Silence, langue reconnue ou langue absente de la réponse : pas de second appel.
       if (estSilence(premier.text) || code || !premier.nom) {
         if (code && !estSilence(premier.text)) derniereLangue = code;
-        return { text: premier.text, language: code, probabilite: premier.probabilite, repli: false };
+        return { text: premier.text, language: code };
       }
       const ui = langueUI();
       const indice = derniereLangue || (NOM_WHISPER[ui] ? ui : 'fr');
       const second = await appel(indice);
-      return { text: second.text, language: indice, probabilite: null, repli: true };
+      return { text: second.text, language: indice };
     },
   };
   let transport = transportLocal;
@@ -256,7 +234,6 @@
       return new Blob([pcmVersWav(pcm).buffer], { type: 'audio/wav' });
     } catch (e) { throw new ErreurDictee('invalid_audio'); }
   }
-  const OCTETS_PAR_SECONDE = 32000;
   const TAILLE_MAX = 4000000; // 120 s × 32 000 o/s ≈ 3,84 Mo : garde-fou contre un enregistrement anormal
 
   /** Insère au curseur, avec une espace de séparation si besoin, puis signale la saisie. */
@@ -268,84 +245,6 @@
     zone.focus();
     try { zone.selectionStart = zone.selectionEnd = (avant + ajout).length; } catch (e) { /* type sans sélection */ }
     zone.dispatchEvent(new Event('input', { bubbles: true }));
-  }
-
-  // ---------------------------------------------------------------- bascule de langue de l'interface
-  const CLE_RESTAURER = 'eva-dictee-restaurer';
-  const CLE_BASCULE = 'eva-dictee-derniere-bascule';
-  const RESTAURER_MAX_MS = 120000;
-  const BASCULE_ECART_MS = 30000;
-  const session = {
-    lire(cle) { try { return window.sessionStorage.getItem(cle); } catch (e) { return null; } },
-    ecrire(cle, v) { try { window.sessionStorage.setItem(cle, v); return true; } catch (e) { return false; } },
-    retirer(cle) { try { window.sessionStorage.removeItem(cle); } catch (e) { /* stockage bloqué */ } },
-  };
-  let recharger = () => window.location.reload();
-
-  function doitBasculer(rep, secondes) {
-    const code = rep.language;
-    if (rep.repli || !NOM_WHISPER[code]) return false;
-    if (!(typeof rep.probabilite === 'number' && rep.probabilite >= 0.8)) return false;
-    if (!(secondes >= 2)) return false;
-    if (code === langueUI()) return false;
-    const derniere = Number(session.lire(CLE_BASCULE));
-    if (Number.isFinite(derniere) && derniere > 0 && Date.now() - derniere < BASCULE_ECART_MS) return false;
-    return true;
-  }
-
-  function urlUtilisateurOcs() {
-    const OC = window.OC;
-    let uid = null;
-    try { uid = OC && typeof OC.getCurrentUser === 'function' && OC.getCurrentUser() && OC.getCurrentUser().uid; } catch (e) { uid = null; }
-    uid = uid || (document.head && document.head.dataset && document.head.dataset.user) || null;
-    if (!uid) return null;
-    const racine = (OC && typeof OC.webroot === 'string') ? OC.webroot : '';
-    return racine + '/ocs/v2.php/cloud/users/' + encodeURIComponent(uid);
-  }
-  function jetonNextcloud() {
-    const meta = document.querySelector('meta[name="requesttoken"]');
-    return (meta && meta.getAttribute('content')) || (window.OC && window.OC.requestToken) || '';
-  }
-
-  /** Seul appel vers Nextcloud : ne contient que la langue. true si la page va être rechargée. */
-  async function basculerInterface(code, zone, signal) {
-    const url = urlUtilisateurOcs();
-    if (!url) return false;
-    session.ecrire(CLE_BASCULE, String(Date.now()));
-    session.ecrire(CLE_RESTAURER, JSON.stringify({ texte: zone.value, curseur: zone.selectionEnd ?? zone.value.length, t: Date.now(), langue: code }));
-    let r = null;
-    try {
-      r = await fetch(url, {
-        method: 'PUT', credentials: 'same-origin', signal,
-        headers: { 'OCS-APIRequest': 'true', requesttoken: jetonNextcloud(), 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-        body: 'key=language&value=' + encodeURIComponent(code),
-      });
-    } catch (e) { r = null; }
-    if (r && r.ok) { recharger(); return true; }
-    session.retirer(CLE_RESTAURER);
-    return false;
-  }
-
-  let aRestaurer = null;
-  function preparerRestauration() {
-    const brut = session.lire(CLE_RESTAURER);
-    if (!brut) return;
-    session.retirer(CLE_RESTAURER);
-    let o = null;
-    try { o = JSON.parse(brut); } catch (e) { o = null; }
-    if (o && typeof o.texte === 'string' && Number.isFinite(o.t) && Date.now() - o.t >= 0 && Date.now() - o.t < RESTAURER_MAX_MS) aRestaurer = o;
-  }
-  function tenterRestauration() {
-    if (!aRestaurer) return;
-    const c = trouverZone();
-    if (!c) return;
-    const o = aRestaurer; aRestaurer = null;
-    c.zone.value = o.texte;
-    if (NOM_WHISPER[o.langue]) c.zone.setAttribute('dir', o.langue === 'ar' ? 'rtl' : 'ltr');
-    const pos = Math.max(0, Math.min(Number(o.curseur) || 0, o.texte.length));
-    c.zone.focus();
-    try { c.zone.selectionStart = c.zone.selectionEnd = pos; } catch (e) { /* type sans sélection */ }
-    c.zone.dispatchEvent(new Event('input', { bubbles: true }));
   }
 
   // ---------------------------------------------------------------- accroche dans la page
@@ -605,10 +504,6 @@
       if (NOM_WHISPER[code]) {
         zone.setAttribute('dir', code === 'ar' ? 'rtl' : 'ltr');
         document.dispatchEvent(new CustomEvent('eva-dictee:langue', { detail: { langue: code } }));
-        if (doitBasculer(rep, (wav.size - 44) / OCTETS_PAR_SECONDE)) {
-          const recharge = await basculerInterface(code, zone, signal);
-          if (!recharge && !signal.aborted) afficher(tx().uilang, true);
-        }
       }
     } catch (e) {
       if (signal.aborted) afficher(tx().cancelled);
@@ -651,7 +546,6 @@
 
   let planifie = false;
   const observateur = new MutationObserver(() => {
-    if (aRestaurer) tenterRestauration();
     if (planifie || (statut === null && etat === 'repos')) return;
     planifie = true;
     Promise.resolve().then(() => { planifie = false; attacher(); });
@@ -661,8 +555,6 @@
   function demarrerModule() {
     cible = lireUrlDictee();
     if (!cible) return; // meta absente ou refusée : fonction éteinte, rien d'autre
-    preparerRestauration();
-    tenterRestauration();
     observateur.observe(document.body || document.documentElement, { childList: true, subtree: true });
     document.addEventListener('keydown', surTouche, true);
     document.addEventListener('visibilitychange', () => { if (!document.hidden && etat === 'repos') verifierStatut(); });
@@ -677,12 +569,11 @@
     Object.assign(api, {
       ErreurDictee,
       transportLocal,
-      /** { disponible() → Promise<true|null>, transcrire(wav, {signal}) → Promise<{text, language, probabilite, repli}>, maxSecondes? } */
+      /** { disponible() → Promise<true|null>, transcrire(wav, {signal}) → Promise<{text, language}>, maxSecondes? } */
       definirTransport(t) { transport = t || transportLocal; return verifierStatut(); },
       __test__: {
         ecrireEnteteWav, pcmVersWav, verifierStatut, trouverZone, lireUrlDictee,
         etat: () => etat, statut: () => statut, arreterIntervalle: () => clearInterval(intervalle),
-        definirRecharger(fn) { recharger = fn; },
       },
     });
   }
