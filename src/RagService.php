@@ -52,8 +52,17 @@ class RagService {
         . 'access the web or real-time news, and do not offer to search. Call web_search now with a short query for the user\'s request, then '
         . 'answer from the results in the language of the user\'s request.';
     private const WEATHER_NUDGE = '[Automatic check by EVA, not written by the user] You answered a weather question without calling the `weather` '
-        . 'tool, so any figure you gave is invented. Call `weather` now with the place from the request (ask the user only if no place is given), '
-        . 'then answer from its result in the language of the user\'s request.';
+        . 'tool, so any figure you gave is invented. You DO have the `weather` tool: never say you cannot get weather data and never send the '
+        . 'user to another service. Call `weather` now with the place from the request; if the request names no place, ask the user in one '
+        . 'short question which city they mean (never guess one). Answer in the language of the user\'s request.';
+    /**
+     * Recette 28/09 (H.2, after the write guard): the write was refused, the model read the calendar, then only LISTED the
+     * appointments - no file. The creation nudge does not fire once a file tool was tried, so this one says to write now.
+     */
+    private const WRITE_AFTER_READ_NUDGE = '[Automatic check by EVA, not written by the user] The user asked for a FILE and no file was written: your '
+        . 'first write was refused only because the data had not been read yet. You have now read it: call create_file now with exactly '
+        . 'the data the tool returned (nothing invented; if it returned nothing, write that there is no entry), with the file type the '
+        . 'user asked for. Answer in the language of the user\'s request.';
     /** Tools a call written as text may run (recoverTextToolCalls): creation, search and read only. */
     private const RECOVERABLE_TOOLS = ['create_file', 'create_files', 'convert_file', 'create_note', 'create_folder', 'web_search', 'weather', 'current_time',
         'read_file', 'extract_file_text', 'search_files', 'list_files', 'list_calendar_events'];
@@ -89,6 +98,8 @@ class RagService {
         . '(advice, troubleshooting, drafting a text), give your previous answer again unchanged instead.';
     /** @var array<string,true> write tools already refused once by personalDataWriteGuard() in this answer */
     private array $personalWriteBlocked = [];
+    /** Write-tool calls in this answer, the ones refused by personalWriteBlocked included (needsWriteAfterRead). */
+    private int $writeAttempts = 0;
 
     public function __construct(
         private AppConfig $config,
@@ -147,6 +158,7 @@ class RagService {
         $this->writeToolSucceeded = false;
         $this->calledTools = [];
         $this->personalWriteBlocked = [];
+        $this->writeAttempts = 0;
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -305,6 +317,7 @@ class RagService {
             $this->writeToolSucceeded = false;
             $this->calledTools = [];
             $this->personalWriteBlocked = [];
+        $this->writeAttempts = 0;
         try {
             if ($this->clientDisconnected()) {
                 return;
@@ -510,6 +523,7 @@ $this->executor->setUserId($userId);
         // "no file was created" notice (copy, move, restore… do not fill $createdFiles).
         if (in_array($toolName, self::WRITE_TOOLS, true)) {
             $this->fileToolAttempted = true;
+            $this->writeAttempts++;
             if (!empty($res['ok'])) {
                 $this->writeToolSucceeded = true;
             }
@@ -1018,6 +1032,9 @@ $this->executor->setUserId($userId);
                 && $this->isFileCreationRequest($message) && $this->offersCreationInstead($answer))) {
             return self::CREATION_NUDGE;
         }
+        if ($this->needsWriteAfterRead($message, $tools)) {
+            return self::WRITE_AFTER_READ_NUDGE;
+        }
         // Before the search nudge: "voulez-vous que je cherche…" about the user's agenda is no web search.
         if (($personal = $this->personalDataNudge($message, $answer, $tools)) !== null) {
             return $personal;
@@ -1026,10 +1043,43 @@ $this->executor->setUserId($userId);
             return self::SEARCH_NUDGE;
         }
         if (!isset($this->calledTools['weather']) && $this->hasTool($tools, 'weather') && $this->isWeatherQuestion($message)
-            && preg_match('~[?؟]\s*$~u', trim($answer)) !== 1) {
+            && !$this->asksForPlace($answer)) {
             return self::WEATHER_NUDGE;
         }
         return null;
+    }
+
+    /**
+     * The answer asks the user which place they mean - the one question a weather request without a place needs. Any
+     * other ending, even a question (recette 28/09, G.2: "je n'ai pas accès à la météo… voulez-vous que je vous aide à
+     * trouver une source ?"), still gets the weather nudge.
+     */
+    private function asksForPlace(string $answer): bool {
+        $a = mb_strtolower(trim($answer));
+        // Not "…trouver une source fiable dans votre région ?": sending the user elsewhere is what G.2 must not do.
+        return preg_match('~[?؟]\s*$~u', $a) === 1
+            && preg_match('~(?<!\p{L})(sources?|services?|sites?|applications?|apps?|website|trouver|find)(?!\p{L})~u', $a) !== 1
+            && preg_match('~(?<!\p{L})(ville|villes|lieu|endroit|localit[ée]|r[ée]gion|pays|o[uù]\s+(ça|cela|[êe]tes|es-tu|vous\s+trouvez|te\s+trouves)|city|cities|place|location|where|town|area|مدينة|المدينة|أين|مكان|stadt|wo\s)(?!\p{L})~u', $a) === 1;
+    }
+
+    /**
+     * H.2 after the write guard: a file of the user's own data was asked for, the first write was refused by
+     * personalDataWriteGuard(), the data has since been read, and still no file exists.
+     */
+    private function needsWriteAfterRead(string $message, array $tools): bool {
+        // Any successful write counts (a file without links, copy_file…: review of ef71676), and only the refused
+        // writes may have been tried: after a write that failed for another reason, the nudge would be wrong.
+        if ($this->createdFiles !== [] || $this->writeToolSucceeded || $this->personalWriteBlocked === []
+            || $this->writeAttempts > count($this->personalWriteBlocked)
+            || !$this->hasTool($tools, 'create_file') || !$this->isFileCreationRequest($message)) {
+            return false;
+        }
+        foreach ($this->personalDataKinds($message) as $kind) {
+            if (array_intersect_key($this->calledTools, array_flip(self::PERSONAL_DATA_READERS[$kind])) === []) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1406,6 +1456,12 @@ $this->executor->setUserId($userId);
     /** A question about the weather (forecast, rain, outside temperature), not "the oven temperature". */
     private function isWeatherQuestion(string $message): bool {
         $m = mb_strtolower(trim($message));
+        // Rain or snow in a creative or planning request is no forecast ("écris un poème sur la pluie", "des idées
+        // d'activités s'il pleut": review of ef71676).
+        if (preg_match('~(?<!\p{L})(po[èe]me|poem|po[ée]sie|histoire|story|chanson|song|haïku|haiku|id[ée]es?|ideas?|activit[ée]s?|activities|r[ée]dige|[ée]cris|write|dessin\p{L}*|draw)(?!\p{L})~u', $m) === 1
+            && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|pr[ée]visions?)(?!\p{L})~u', $m) !== 1) {
+            return false;
+        }
         return $m !== '' && mb_strlen($m) <= 300 && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|wetter|pr[ée]visions?\s+m[ée]t[ée]o|pleuvoir|pleut|pluie|neige|rain|snow|الطقس)(?!\p{L})'
             . '|temps\s+(qu[\'’]il\s+)?(fait|fera)|temp[ée]rature[^.?!\n]{0,30}(demain|demin|aujourd|ce\s+soir|cette\s+semaine|week-?end|dehors|ext[ée]rieur|tomorrow|today|tonight|outside)'
             . '|temp[ée]rature[^.?!\n]{0,40}(?<!\p{L})(à|a|au|en|in|at)\s+\p{L}{3,}'

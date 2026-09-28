@@ -38,6 +38,7 @@ eval('class RagSousTest {
     public array $createdFiles = [];
     public bool $fileToolAttempted = false;   // ajoutée par la branche anti-invention
     public bool $writeToolSucceeded = false;
+    public int $writeAttempts = 0;
     public array $calledTools = [];
     ' . ($ecriture[0] ?? '') . '
     public array $toolSources = [];
