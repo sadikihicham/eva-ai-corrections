@@ -198,6 +198,75 @@ quelques lettres grecques (seuil en proportion, lettres remplacées signalées a
 (« ) Tj /JS (… endstream » reste du texte). **82/82 contrôles, 21 PDF validés par poppler.** Non fait : contre-épreuve
 des nouveaux tests sur la version d'avant revue (non conservée) ; tests d'intégration de createFile (Nextcloud requis).
 
+## 9. Tests admin du 28/09 (04:52 et 05:14) : relances, Excel, « crerr », appel d'outil en texte (après ae24527)
+**Déploiements en production le 28/09** : 10f1b45 (04:51), 8c1c657 (05:12), 3e8d892 (05:23). Chaque fois,
+`deploiement/appliquer-pdf.sh` prend pour référence la version en production (405755e, 85829b5, 73c3600 ;
+surchargeable par `REFERENCE=`). Tests exécutés avec le PHP 8.5 du serveur.
+
+**9.1 « ok merci » relançait une création (10f1b45, revue adverse de ae24527 : 🔴)**
+**Cause** : `requestIntent` rattachait un simple « oui » / une clôture à la demande de fichier précédente ;
+`offersCreationInstead` prenait « proceed/procède » (« Shall I proceed? » = clarification) pour une offre ;
+`isFileCreationRequest` reconnaissait « creat\p{L}* » (created, creative).
+**Correction** : un « oui » n'est rattaché que si eva vient de poser une question sans avoir livré de fichier ; clôtures
+exclues (merci, thanks, c'est bon, parfait, شكرا…) ; ponctuation arabe ، ؟ ; « ja » retiré ; « creat » seul (faute de
+frappe). `finishAnswer` retire le marqueur `[EVA: file created…]` n'importe où, sans tenir compte de la casse, nom
+contenant « ] » compris, sans manger l'indentation de tête. `buildXlsx` : seule l'intro avant le 1er tableau est
+écartée, la prose suivante reste en colonne A, tableaux séparés par une ligne vide, séparateur = 2e ligne du tableau
+seulement, `**` retiré seulement autour d'une cellule.
+**Preuve** : anti-invention 194/194 (ae24527 : 14 échecs), liens 10/10, xlsx 7/7 (ae24527 : 1 échec), pdf OK.
+
+**9.2 Excel « ; » tout en colonne A, « crerr un fichier doc pour expliquer… » non reconnu et .docx affirmé, contenu
+« rendez-vous » hors sujet (2195949, test admin 04:52)**
+**Causes** : `buildXlsx` ne connaissait que « , » (le CSV Excel français utilise « ; ») ; la faute « crerr » n'était pas
+reconnue et « un doc pour expliquer le fichier » était pris pour une question « comment faire » → la relance ne
+partait pas et eva a affirmé un .docx inexistant ; le modèle a repris les données d'un fichier sans rapport
+(« rendez-vous » pour une demande « 4 employés + performance »).
+**Correction** : séparateur « ; » quand il domine « , » ; « crerr » reconnu ; description de `create_file` : nom et
+contenu doivent répondre à la demande EN COURS, jamais reprendre les données d'un fichier sans rapport.
+**Preuve** : anti-invention 198/198 (HEAD précédent : 3 échecs), liens 10/10, xlsx 9/9 (précédent : 1), pdf OK,
+extensions 7/7.
+**Revue adverse de 2195949 : 🔴** → **8c1c657** : la clause « pour/to/qui/that + expliquer/décrire » ne vaut demande
+que si le texte AVANT elle est lui-même une demande de fichier (« Pour expliquer à mon équipe, comment créer… ? »,
+« le document qui décrit comment… » restent des questions) ; séparateur Excel décidé sur la 1re ligne non vide, hors
+texte entre guillemets (« a; b » dans une cellule, décimales « 48,85 » ne décident plus).
+**Preuve** : anti-invention 202/202 (2195949 : 4 échecs), liens 10/10, xlsx 11/11 (2195949 : 2 échecs), pdf OK.
+
+**9.3 Appel d'outil écrit en texte `<tool_call>` affiché à l'utilisateur (652f592, test admin 05:14)**
+**Symptôme** : « crerr un fichier doc… » → l'utilisateur a vu l'appel `create_file` en texte, aucun fichier créé.
+**Cause** : le modèle a écrit l'appel en texte, avec un saut de ligne brut dans une chaîne JSON → le parseur vLLM l'a
+abandonné.
+**Correction** : `recoverTextToolCalls()` (format Hermes, JSON réparé en échappant les caractères de contrôle dans les
+chaînes) ; SEULS les outils proposés au modèle sont acceptés (sinon rien) ; même chemin d'exécution qu'un vrai appel
+(politique, confirmation) ; branché dans `ask()` et `askStream()` ; journal « EVA recovered N tool call(s) written as
+text ».
+**Preuve** : anti-invention 209/209 (+7), liens 10/10.
+**Revue sécu de 652f592 : 🔴** → **0d1cf93** (un `<tool_call>` CITÉ n'est jamais exécuté) : la réponse doit COMMENCER
+par `<tool_call>` (pas de préambule), sans bloc de code ; refus si « <tool_call> » apparaît dans ce qu'a reçu le modèle
+(page, mail, fichier, historique, contexte) : écho ; jamais en mode autonome (`ask(autonomousActions)` : briefings
+planifiés) ; liste fermée `RECOVERABLE_TOOLS` : création / recherche / lecture seulement (jamais partage, suppression,
+envoi, mise à jour). **Preuve** : anti-invention 214/214, liens 10/10 ; mutation : retirer chaque garde (écho, liste,
+ancrage, bloc de code) fait échouer au moins un test.
+**Contre-revue sécu de 0d1cf93 : 🟢 + recommandation** → **3e8d892** : `recoveredOverwrite()` refuse un `create_file` /
+`create_files` récupéré si un chemin existe déjà ; échec du côté sûr si la vérification échoue ; branché dans `ask()`
+et `askStream()`. **Preuve** : anti-invention 222/222 (+8, dont contrôles de source de la garde autonome et du
+branchement dans les deux boucles), liens 10/10.
+
+**9.4 Déplacer/copier vers .pdf/.xlsx… (cb37cd2)** : `binaryExtensionChangeError()` reprend la règle de `renameFile`
+pour `moveFile` / `copyFile` (fichiers seulement) ; le message oriente vers `extract_file_text` puis `create_file`.
+**Preuve** : `tests/test_extensions.php` 7/7 (l'ancien code échoue). Traite le reste « move/copy vers .pdf » du §6.
+
+**Limites restantes** :
+- la balise masquée `&lt;tool_call&gt;` n'est pas récupérée ;
+- texte streamé avant `done.answer` (`holdText` faux) : le marqueur `[EVA: file created…]` peut être visible brièvement ;
+- une conversation dont l'historique contient déjà un `<tool_call>` affiché ne récupère plus rien (limite assumée) ;
+- la garde « jamais en mode autonome » (`!autonomousActions` dans `ask()`) n'est vérifiée que par contrôle de source,
+  pas par test unitaire ;
+- « au debut un fichier excel a creer » (00:54:10 UTC) : aucune réponse enregistrée, aucune erreur au journal hors
+  embeddings — **cause non prouvée**.
+
+**Constat infra (hors code)** : l'indexation des documents échoue — modèle `nomic-embed-text` absent de l'Ollama
+192.168.1.38 (HTTP 404), 1907 erreurs au journal. Aucun commit ne le corrige : à traiter côté Ollama.
+
 ## Ce qui reste à faire (hors ce dépôt)
 - Publier `signalement-eva-editeur.md` (dossier parent) sur GitHub, avec ces deux correctifs proposés.
 - Décider si/quand appliquer 1 et 2 sur workspace4 (geste séparé, avec sauvegarde et confirmation).
