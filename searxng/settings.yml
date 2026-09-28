@@ -1,0 +1,80 @@
+# SearXNG pour eva_ai (workspace4), instance INTERNE : joignable uniquement depuis le réseau Docker
+# nextcloud_frontend, sans port publié. Monté en lecture seule sur /etc/searxng/settings.yml.
+# Doc : https://docs.searxng.org/admin/settings/settings.html
+#
+# secret_key : ABSENT de ce fichier volontairement. Fourni par la variable d'environnement SEARXNG_SECRET
+# (qui remplace server.secret_key), lue depuis /srv/searxng/secret.env, généré sur le serveur par installer.sh.
+
+use_default_settings:
+  engines:
+    # On ne garde QUE ces moteurs des réglages par défaut. Les autres sont retirés.
+    keep_only:
+      - google
+      - bing
+      - duckduckgo
+      - wikipedia
+      - brave
+      - google news
+      - bing news
+
+general:
+  instance_name: "SearXNG eva"
+  debug: false
+
+server:
+  # Instance privée, non publique : le limiter (anti-abus, qui exige Valkey) ne sert à rien ici.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  # 0 = aucun, 1 = modéré, 2 = strict. eva envoie de toute façon safesearch=1 (ou 0 si web_search_safe_search=0).
+  safe_search: 1
+  # Langue par défaut (interface et requêtes sans paramètre language). Attention : eva envoie language=all.
+  default_lang: "fr"
+  autocomplete: ""
+  # json est OBLIGATOIRE pour eva (requête /search?format=json) ; sans lui, SearXNG répond 403.
+  formats:
+    - html
+    - json
+
+ui:
+  default_locale: "fr"
+
+outgoing:
+  # 3 s par défaut. Google répond parfois plus lentement ; eva attend jusqu'à 10 s (web_search_timeout).
+  request_timeout: 4.0
+  max_request_timeout: 8.0
+
+engines:
+  # Mesuré le 28/09 depuis workspace4 : Google répond CAPTCHA dès la 1re ou 2e requête puis est suspendu ;
+  # DuckDuckGo idem ; Bing renvoie beaucoup de bruit (YouTube, Google Play, Gmail pour « version de PHP ») ;
+  # Brave donne les bons résultats (php.net, python.org, nextcloud.com, kitco). → Brave en premier, Google gardé
+  # (utile quand il n'est pas bloqué), Bing retiré.
+  - name: brave
+    disabled: false
+    weight: 2.0
+  - name: google
+    disabled: false
+    weight: 1.5
+  - name: duckduckgo
+    disabled: false
+  - name: bing
+    disabled: true
+  # Wikipédia en anglais (moteur par défaut, langue forcée) + une seconde instance en français.
+  - name: wikipedia
+    disabled: false
+    language: en
+  - name: wikipedia fr
+    engine: wikipedia
+    shortcut: wpfr
+    language: fr
+    categories: [general]
+    display_type: ["infobox"]
+    disabled: false
+  # Actualité (catégorie « news » : utilisée seulement si la requête demande categories=news).
+  - name: google news
+    disabled: false
+  - name: bing news
+    disabled: true
