@@ -54,6 +54,9 @@ class RagService {
     private const WEATHER_NUDGE = '[Automatic check by EVA, not written by the user] You answered a weather question without calling the `weather` '
         . 'tool, so any figure you gave is invented. Call `weather` now with the place from the request (ask the user only if no place is given), '
         . 'then answer from its result in the language of the user\'s request.';
+    /** Tools a call written as text may run (recoverTextToolCalls): creation, search and read only. */
+    private const RECOVERABLE_TOOLS = ['create_file', 'create_files', 'create_note', 'create_folder', 'web_search', 'weather', 'current_time',
+        'read_file', 'extract_file_text', 'search_files', 'list_files', 'list_calendar_events'];
     private const WRITE_TOOLS = ['create_file', 'create_files', 'create_note', 'copy_file', 'move_file', 'rename_file', 'restore_file_version', 'create_sticker'];
 
     /**
@@ -162,7 +165,7 @@ class RagService {
 			if (isset($chat['error'])) {
 				return ['answer' => '', 'sources' => $this->answerSources($byDoc), 'model' => $this->config->get('chat_model'), 'error' => $chat['error'], 'followups' => []];
 			}
-			if (($chat['tool_calls'] ?? []) === [] && ($recovered = $this->recoverTextToolCalls((string)($chat['answer'] ?? ''), $tools)) !== null) {
+			if (($chat['tool_calls'] ?? []) === [] && !$autonomousActions && ($recovered = $this->recoverTextToolCalls((string)($chat['answer'] ?? ''), $tools, $messages)) !== null) {
 				[$chat['tool_calls'], $chat['raw_tool_calls'], $chat['answer']] = $recovered;
 			}
 			$toolCalls = $chat['tool_calls'] ?? [];
@@ -350,7 +353,7 @@ $this->executor->setUserId($userId);
                 if ($this->clientDisconnected()) {
                     return;
                 }
-                if ($toolCalls === [] && ($recovered = $this->recoverTextToolCalls($answer, $tools)) !== null) {
+                if ($toolCalls === [] && ($recovered = $this->recoverTextToolCalls($answer, $tools, $messages)) !== null) {
                     [$toolCalls, $rawToolCalls, $answer] = $recovered;
                 }
                 if ($toolCalls === []) {
@@ -906,14 +909,23 @@ $this->executor->setUserId($userId);
     /**
      * A tool call the model wrote as TEXT ("<tool_call>{json}</tool_call>", Hermes format) instead of a real call: seen
      * 28/09 05:14, the JSON held a raw line break inside a string, so vLLM's parser gave it up and the user saw the call
-     * printed, with no file. Only tools offered to the model are accepted; the call then runs through the same path
-     * (policy, confirmation) as a real one.
+     * printed, with no file. The call then runs through the same path (policy, confirmation) as a real one.
+     * A QUOTED call must never run (security review of 652f592): the whole answer must be the call (no preamble, no code
+     * block), no "<tool_call>" may appear anywhere in what the model was given (a web page, mail or file echoing one),
+     * never in autonomous runs (caller), and only creation / search / read tools: never share, delete, send or update.
      *
      * @return null|array{0:list<array{name:string,arguments:array<string,mixed>}>,1:list<array<string,mixed>>,2:string}
      */
-    private function recoverTextToolCalls(string $answer, array $tools): ?array {
-        if ($tools === [] || !str_contains($answer, '<tool_call>')
-            || preg_match_all('~<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)~s', $answer, $found, PREG_SET_ORDER) < 1) {
+    private function recoverTextToolCalls(string $answer, array $tools, array $messages): ?array {
+        if ($tools === [] || preg_match('~^\s*<tool_call>~', $answer) !== 1 || str_contains($answer, '```')) {
+            return null;
+        }
+        foreach ($messages as $m) {
+            if (str_contains(is_string($m['content'] ?? null) ? $m['content'] : json_encode($m['content'] ?? '', JSON_UNESCAPED_UNICODE), '<tool_call>')) {
+                return null;
+            }
+        }
+        if (preg_match_all('~<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)~s', $answer, $found, PREG_SET_ORDER) < 1) {
             return null;
         }
         $calls = [];
@@ -943,7 +955,7 @@ $this->executor->setUserId($userId);
             if (is_string($args)) {
                 $args = json_decode($args, true);
             }
-            if ($name === '' || !is_array($args) || !$this->hasTool($tools, $name)) {
+            if ($name === '' || !is_array($args) || !in_array($name, self::RECOVERABLE_TOOLS, true) || !$this->hasTool($tools, $name)) {
                 return null;
             }
             $calls[] = ['name' => $name, 'arguments' => $args];
