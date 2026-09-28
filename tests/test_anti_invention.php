@@ -773,5 +773,26 @@ verifie('refus Deck en allemand', str_contains($t->refusDeck('erstelle eine Deck
 verifie('refus Deck : aucun lien, aucun ancien nom, aucune promesse d\'action à la place', !str_contains($r, 'http') && !str_contains($r, 'EVA') && !preg_match('/je peux (ajouter|créer)/u', $r));
 verifie('refus Deck branché dans ask() et askStream()', substr_count($source, '$this->deckRefusal($userId, $message)') === 2);
 
+// Prod 28/09 16:19 : PDF arabe réellement créé, mais le modèle avait écrit un faux lien → l'avertissement disait
+// « aucun fichier n'a été créé », contredit par le vrai lien ajouté juste après.
+$t = new RagSousTest(); $t->langue = 'fr';
+$t->createdFiles = [3661117 => ['name' => 'تقرير-تجربة.pdf', 'url' => 'http://192.168.1.99/workspace/index.php/f/3661117', 'download_url' => 'http://192.168.1.99/workspace/remote.php/dav/files/hicham/x.pdf']];
+$r = $t->finir("Le fichier est prêt : [Télécharger](http://192.168.1.99/workspace/index.php/f/999999)", [], 'crée un pdf');
+verifie('fichier créé + faux lien : avertissement « lien retiré », jamais « aucun fichier créé »', str_contains($r, "n'était pas valide et a été retiré. Seuls les fichiers dont le lien figure") && !str_contains($r, "aucun fichier correspondant n'a été créé"), $r);
+verifie('fichier créé + faux lien : le vrai lien est ajouté', str_contains($r, 'index.php/f/3661117'));
+// Revue de 38a3756 : A créé, B annoncé avec un faux lien → le message ne dit pas que B est « ci-dessous ».
+$r = (function () { $t = new RagSousTest(); $t->langue = 'fr';
+    $t->createdFiles = [11 => ['name' => 'A.pdf', 'url' => 'http://192.168.1.99/workspace/index.php/f/11', 'download_url' => 'http://192.168.1.99/workspace/remote.php/dav/files/hicham/A.pdf']];
+    return $t->finir("A.pdf et B.xlsx sont prêts : [B.xlsx](http://192.168.1.99/workspace/index.php/f/999998)", [], 'crée A.pdf et B.xlsx'); })();
+verifie('A créé + faux lien vers B : B barré, A listé, message sans « ci-dessous »', str_contains($r, 'index.php/f/11') && !str_contains($r, 'f/999998)') && !str_contains($r, 'ci-dessous') && str_contains($r, 'Seuls les fichiers dont le lien figure'), $r);
+// Vrais liens de A déjà cités par le modèle + faux lien : aucune ligne 📄 ajoutée, le message reste vrai.
+$r = (function () { $t = new RagSousTest(); $t->langue = 'fr';
+    $t->createdFiles = [11 => ['name' => 'A.pdf', 'url' => 'http://192.168.1.99/workspace/index.php/f/11', 'download_url' => 'http://192.168.1.99/workspace/remote.php/dav/files/hicham/A.pdf']];
+    return $t->finir("A : http://192.168.1.99/workspace/index.php/f/11 et http://192.168.1.99/workspace/remote.php/dav/files/hicham/A.pdf — B : http://192.168.1.99/workspace/index.php/f/999998", [], 'crée A.pdf'); })();
+verifie('vrais liens déjà cités + faux lien : message vrai sans ligne ajoutée', str_contains($r, 'Seuls les fichiers dont le lien figure') && !str_contains($r, '📄'), $r);
+$t = new RagSousTest(); $t->langue = 'fr';
+$r = $t->finir("Le fichier est prêt : [Télécharger](http://192.168.1.99/workspace/index.php/f/999999)", [], 'crée un pdf');
+verifie('aucun fichier créé + faux lien : avertissement d\'origine conservé', str_contains($r, "aucun fichier correspondant n'a été créé"), $r);
+
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
