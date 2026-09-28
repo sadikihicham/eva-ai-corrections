@@ -162,6 +162,9 @@ class RagService {
 			if (isset($chat['error'])) {
 				return ['answer' => '', 'sources' => $this->answerSources($byDoc), 'model' => $this->config->get('chat_model'), 'error' => $chat['error'], 'followups' => []];
 			}
+			if (($chat['tool_calls'] ?? []) === [] && ($recovered = $this->recoverTextToolCalls((string)($chat['answer'] ?? ''), $tools)) !== null) {
+				[$chat['tool_calls'], $chat['raw_tool_calls'], $chat['answer']] = $recovered;
+			}
 			$toolCalls = $chat['tool_calls'] ?? [];
 			if ($toolCalls === []) {
 				$nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($intent, (string)($chat['answer'] ?? ''), $tools) : null;
@@ -346,6 +349,9 @@ $this->executor->setUserId($userId);
                 }
                 if ($this->clientDisconnected()) {
                     return;
+                }
+                if ($toolCalls === [] && ($recovered = $this->recoverTextToolCalls($answer, $tools)) !== null) {
+                    [$toolCalls, $rawToolCalls, $answer] = $recovered;
                 }
                 if ($toolCalls === []) {
                     $nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($intent, $answer, $tools) : null;
@@ -895,6 +901,57 @@ $this->executor->setUserId($userId);
         $a = mb_strtolower(trim($answer));
         return $a !== '' && preg_match('~(would\s+you\s+like|do\s+you\s+want|shall\s+i|should\s+i|voulez-vous|souhaitez-vous|veux-tu|dois-je)'
             . '(\s+(me|que\s+je|que\s+j[\'’]))?(\s+to)?\s+(create|cr[ée]e|g[ée]n[èe]re|generate|make|faire|fasse|produce|prepare|pr[ée]pare)~u', $a) === 1;
+    }
+
+    /**
+     * A tool call the model wrote as TEXT ("<tool_call>{json}</tool_call>", Hermes format) instead of a real call: seen
+     * 28/09 05:14, the JSON held a raw line break inside a string, so vLLM's parser gave it up and the user saw the call
+     * printed, with no file. Only tools offered to the model are accepted; the call then runs through the same path
+     * (policy, confirmation) as a real one.
+     *
+     * @return null|array{0:list<array{name:string,arguments:array<string,mixed>}>,1:list<array<string,mixed>>,2:string}
+     */
+    private function recoverTextToolCalls(string $answer, array $tools): ?array {
+        if ($tools === [] || !str_contains($answer, '<tool_call>')
+            || preg_match_all('~<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)~s', $answer, $found, PREG_SET_ORDER) < 1) {
+            return null;
+        }
+        $calls = [];
+        $raw = [];
+        foreach ($found as $f) {
+            $data = json_decode($f[1], true);
+            if (!is_array($data)) {
+                // Escape the control characters left raw INSIDE strings, then retry.
+                $fixed = '';
+                $inString = false;
+                $escaped = false;
+                foreach (preg_split('//u', $f[1], -1, PREG_SPLIT_NO_EMPTY) ?: [] as $ch) {
+                    if ($inString && !$escaped && ($ch === "\n" || $ch === "\r" || $ch === "\t")) {
+                        $fixed .= ["\n" => '\n', "\r" => '\r', "\t" => '\t'][$ch];
+                        continue;
+                    }
+                    if ($ch === '"' && !$escaped) {
+                        $inString = !$inString;
+                    }
+                    $escaped = $inString && $ch === '\\' && !$escaped;
+                    $fixed .= $ch;
+                }
+                $data = json_decode($fixed, true);
+            }
+            $name = is_array($data) ? (string)($data['name'] ?? '') : '';
+            $args = is_array($data) ? ($data['arguments'] ?? $data['parameters'] ?? []) : [];
+            if (is_string($args)) {
+                $args = json_decode($args, true);
+            }
+            if ($name === '' || !is_array($args) || !$this->hasTool($tools, $name)) {
+                return null;
+            }
+            $calls[] = ['name' => $name, 'arguments' => $args];
+            $raw[] = ['id' => 'call_' . bin2hex(random_bytes(4)), 'type' => 'function', 'function' => ['name' => $name, 'arguments' => json_encode($args, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)]];
+        }
+        $rest = trim((string)preg_replace('~<tool_call>.*?(?:</tool_call>|$)~s', '', $answer));
+        $this->logger->warning('EVA recovered ' . count($calls) . ' tool call(s) written as text by the model');
+        return [$calls, $raw, $rest];
     }
 
     /**

@@ -38,7 +38,7 @@ foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE'] as $c) {
 // eval() ne charge que du code extrait de NOTRE fichier versionné src/RagService.php (voir test_liens_fichiers.php).
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
     'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
-    'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool'];
+    'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool', 'recoverTextToolCalls'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -50,6 +50,8 @@ eval('class RagSousTest {
     ' . $ecriture[0] . $autres . '
     public array $toolSources = [];
     public string $langue = "fr";
+    public object $logger;
+    public function __construct() { $this->logger = new class { public array $w = []; public function warning(string $m): void { $this->w[] = $m; } }; }
     /** fichiers « existants » du faux utilisateur hicham : ids et chemins */
     public array $existants = ["ids" => [3660073, 55], "chemins" => ["Rendezvous_summary.docx", "CR.docx"]];
     private function uiLanguage(): string { return $this->langue; }
@@ -69,6 +71,7 @@ eval('class RagSousTest {
     public function meteo(string $q): bool { return $this->isWeatherQuestion($q); }
     public function intention(string $m, array $h): string { return $this->requestIntent($m, $h); }
     public function inconnu(array $r): array { return $this->explainUnknownTool($r); }
+    public function recupere(string $a, array $outils): ?array { return $this->recoverTextToolCalls($a, $outils); }
     public function fichier(string $q): bool { return $this->isFileCreationRequest($q); }
     public function relance(string $q, string $reponse, array $outils): bool { return $this->needsCreationNudge($q, $reponse, $outils); }
     public function collecter(string $outil, array $res): void { $this->collectToolSources($outil, $res); }
@@ -297,6 +300,16 @@ verifie('« crée un document pour expliquer comment faire » = demande de fichi
 foreach (['I want you to explain how to export a csv file', 'Pour expliquer à mon équipe, comment créer un fichier excel ?', 'Quel est le document qui décrit comment créer un pdf ?', 'Is there a doc that describes how to create a pdf file?'] as $qc) {
     verifie('question, pas une demande (revue 2195949) : ' . $qc, !$t->fichier($qc));
 }
+// Test admin 28/09 05:14 : l'appel d'outil écrit en TEXTE, avec un vrai saut de ligne dans la chaîne JSON.
+$texte = "<tool_call>\n{\"name\": \"create_file\", \"arguments\": {\"path\": \"Documents/Explication.docx\", \"content\": \"Ligne 1.\n2. **Performance** : score\\n\\nFin.\"}}\n</tool_call>";
+$rec = $t->recupere($texte, $tous);
+verifie('appel écrit en texte (JSON avec saut de ligne brut) → récupéré et exécutable', $rec !== null && $rec[0][0]['name'] === 'create_file' && $rec[0][0]['arguments']['path'] === 'Documents/Explication.docx' && str_contains($rec[0][0]['arguments']['content'], "Ligne 1.\n2. **Performance**") && $rec[2] === '', json_encode($rec, JSON_UNESCAPED_UNICODE));
+verifie('… format brut compatible canonicalToolCalls (arguments = JSON)', $rec !== null && is_array(json_decode($rec[1][0]['function']['arguments'], true)));
+verifie('outil non proposé au modèle (delete_file) → PAS récupéré', $t->recupere('<tool_call>{"name": "delete_file", "arguments": {"path": "x"}}</tool_call>', $tous) === null);
+verifie('aucun outil (lecture seule) → PAS récupéré', $t->recupere($texte, []) === null);
+verifie('JSON illisible → PAS récupéré', $t->recupere('<tool_call>{"name": "create_file", "arguments": {"path": </tool_call>', $tous) === null);
+verifie('texte autour conservé, balise non fermée acceptée', ($r2 = $t->recupere("Je crée le fichier.\n<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"php\"}}", $tous)) !== null && $r2[2] === 'Je crée le fichier.', json_encode($r2, JSON_UNESCAPED_UNICODE));
+verifie('réponse normale → rien', $t->recupere('Bonjour, voici la réponse.', $tous) === null);
 verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
 $r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
 verifie('« Would you like me to create a new PDF…? » en réponse à une demande de PDF → relance création', $r === RagSousTest::CREATION_NUDGE, (string)$r);
