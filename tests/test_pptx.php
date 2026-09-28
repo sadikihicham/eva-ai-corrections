@@ -83,6 +83,12 @@ $d = ouvre($g->x("## x\nA\u{FFFE}B"), 'ffff');
 verifie('U+FFFE retiré, XML valide', xmlOk($d['parts']) === [] && str_contains(textes($d['slides'][0]), 'AB'));
 $d = ouvre($g->x("## العنوان\n- نص"), 'lang');
 verifie('texte arabe : lang="ar-AE"', str_contains($d['slides'][0], 'lang="ar-AE"'));
+// Prod 28/09 : le modèle écrit des étiquettes de structure comme titres
+$d = ouvre($g->x("## Diapositive 1: Titre\n\n**Cybersécurité en entreprise : Une priorité absolue**\n\n## Sous-titre\nProtection des données et responsabilité collective.\n\n## Diapositive 2: Introduction à la cybersécurité\nLa cybersécurité protège les systèmes.\n\n## Slide 3 - Les menaces\n- Phishing"), 'etiquettes');
+verifie('« Titre » + « Sous-titre » → une vraie diapositive de titre (titre + sous-titre)', count($d['slides']) === 3 && str_contains($d['slides'][0], 'sz="4400"') && textes($d['slides'][0]) === 'Cybersécurité en entreprise : Une priorité absolue | Protection des données et responsabilité collective.', textes($d['slides'][0]));
+verifie('préfixes « Diapositive 2: » / « Slide 3 - » retirés des titres', str_starts_with(textes($d['slides'][1]), 'Introduction à la cybersécurité') && str_starts_with(textes($d['slides'][2]), 'Les menaces'), textes($d['slides'][1]) . ' / ' . textes($d['slides'][2]));
+$d = ouvre($g->x("## Titre de la présentation\n- a"), 'titre-normal');
+verifie('un vrai titre qui commence par « Titre » est gardé', str_starts_with(textes($d['slides'][0]), 'Titre de la présentation'));
 verifie('câblage : create_file .pptx, convert_file pptx, plus refusé', str_contains($source, "=== 'pptx') {\n            try { \$content = \$this->buildPptx(") && str_contains($source, "CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'pptx'") && !preg_match("~noTextBuilder = \[[^\]]*'pptx'~", $source));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

@@ -241,7 +241,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_file',
-                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table), .pptx (a PowerPoint deck: each # or ## heading starts a new slide, then - bullets, **bold**, | tables |; a short first section becomes the title slide) and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
+                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table), .pptx (a PowerPoint deck: each # or ## heading starts a new slide, then - bullets, **bold**, | tables |; a short first section becomes the title slide; write REAL titles, never labels such as "Slide 1: Title" or "Subtitle" — e.g. "# Cybersecurity at work\nA shared priority\n\n## Main threats\n- Phishing\n- Ransomware\n\n## Good practices\n- …") and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'path' => ['type' => 'string', 'description' => 'Relative path from the home folder, e.g. "Documents/Plan.md" or "Report.txt".'],
                     'content' => ['type' => 'string', 'description' => 'Full UTF-8 text content.'],
@@ -2289,6 +2289,22 @@ class ActionExecutor {
         }
         $push($cur);
         if ($slides === []) $slides[] = ['Présentation', [], 1];
+        // Models write structure labels as titles (prod 28/09: "## Diapositive 1: Titre", "## Sous-titre", "## Diapositive 2:
+        // Introduction…"): the "Diapositive N :" prefix goes, a "Titre" slide becomes the real title slide (its first line
+        // is the title) and a "Sous-titre" slide right after it becomes its subtitle.
+        $unbold = static fn(string $v): string => trim((string)preg_replace('/^\*\*(.*)\*\*$/s', '$1', trim($v)));
+        foreach ($slides as $k => $sl) {
+            $t = trim((string)preg_replace('/^(?:diapositive|diapo|slide|folie|شريحة)\s*\d+\s*(?:[:.\-–—]\s*|$)/iu', '', $sl[0]));
+            if (preg_match('/^(?:titre(?:\s+principal)?|page\s+de\s+titre|title(?:\s+slide)?|titel|عنوان)$/iu', $t) === 1 && ($sl[1][0][0] ?? '') === 'p') {
+                $t = $unbold($sl[1][0][2]); array_shift($sl[1]); $sl[2] = 1;
+            }
+            $sl[0] = $t; $slides[$k] = $sl;
+        }
+        if (count($slides) > 1 && $slides[0][2] === 1 && preg_match('/^(?:sous-titre|subtitle|untertitel|عنوان\s+فرعي)$/iu', $slides[1][0]) === 1
+            && array_filter($slides[1][1], static fn(array $it): bool => $it[0] !== 'p') === []) {
+            foreach ($slides[1][1] as $it) $slides[0][1][] = ['p', -1, $unbold($it[2])];
+            array_splice($slides, 1, 1);
+        }
         // Too long: at most 7 lines per slide (a paragraph counts one line per ~75 characters, a table 3 plus one per
         // row over 3; a table longer than 10 data rows is cut, its header repeated), the rest on "(suite)" slides.
         $split = [];
