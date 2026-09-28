@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 SSH=(ssh -o UserKnownHostsFile="$HOME/.ssh/known_hosts_workspace4" -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15 ubuntu@192.168.1.99)
 DC='cd /home/ubuntu/docker && sudo docker compose --env-file .env exec -T'
 APP=/var/www/html/custom_apps/eva_ai/lib/Service
-REFERENCE=${REFERENCE:-6d7455e}   # production depuis le 28/09 11:24 (corrections de la recette, PR #7) ; surchargeable : REFERENCE=<sha> bash …
+REFERENCE=${REFERENCE:-4fe6752}   # production depuis le 28/09 12:08 (H.2 + G.2, PR #9 et #10) ; surchargeable : REFERENCE=<sha> bash …
 FICHIERS=(ActionExecutor.php RagService.php ToolPolicy.php)
 h() { shasum -a 256 | cut -c1-64; }
 r() { "${SSH[@]}" "$@" </dev/null; }
