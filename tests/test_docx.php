@@ -24,5 +24,9 @@ verifie('français : pas de bidi', !str_contains($p[1][0], '<w:bidi/>') && !str_
 verifie('urdu : paragraphe bidi + rtl + langue ur-PK', str_contains($p[1][1], '<w:bidi/>') && str_contains($p[1][1], '<w:rtl/>') && str_contains($p[1][1], 'w:bidi="ur-PK"'));
 verifie('arabe : bidi + langue ar-SA', str_contains($p[1][2], '<w:bidi/>') && str_contains($p[1][2], 'w:bidi="ar-SA"'));
 verifie('texte urdu conservé', str_contains($x, 'یہ ایک مثال ہے'));
+$x = doc($g->x("Le mot اردو signifie « urdu »."));
+verifie('ligne française avec un mot arabe → reste de gauche à droite (première lettre)', !str_contains($x, '<w:bidi/>'));
+$x = doc($g->x("دور لي على گوگل"));
+verifie('arabe du Golfe (گ) → langue ar-SA, pas ur-PK', str_contains($x, 'w:bidi="ar-SA"'));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

@@ -2119,8 +2119,9 @@ class ActionExecutor {
         // showed them left-aligned, punctuation on the wrong side). Urdu is told apart by letters Arabic does not have.
         $paras = '';
         foreach ($lines as $line) {
-            if (preg_match('/\p{Arabic}/u', $line) === 1) {
-                $lang = preg_match('/[ٹڈڑںےہھگچپژ]/u', $line) === 1 ? 'ur-PK' : 'ar-SA';
+            // Direction from the first letter: « Le mot اردو signifie… » stays a left-to-right paragraph.
+            if (preg_match('/\p{L}/u', $line, $first) === 1 && preg_match('/\p{Arabic}/u', $first[0]) === 1) {
+                $lang = preg_match('/[ٹڈڑںےہ]/u', $line) === 1 ? 'ur-PK' : 'ar-SA';
                 $paras .= '<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rFonts w:cs="Arial"/><w:rtl/><w:lang w:bidi="' . $lang . '"/></w:rPr><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
             } else {
                 $paras .= '<w:p><w:r><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
@@ -2211,10 +2212,10 @@ class ActionExecutor {
             'accent3' => 'F5A524', 'accent4' => '7C5CFF', 'accent5' => 'E5484D', 'accent6' => '6B7A90', 'hlink' => '1E6FFF', 'folHlink' => '7C5CFF'];
         $W = 12192000; $H = 6858000; $emu = 914400;
         $esc = static fn(string $v): string => htmlspecialchars((string)preg_replace(['/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '/[\x{FFFE}\x{FFFF}]/u'], '', $v), ENT_XML1 | ENT_COMPAT | ENT_SUBSTITUTE, 'UTF-8');
-        $isRtl = static fn(string $v): bool => preg_match('/\p{Arabic}|\p{Hebrew}/u', $v) === 1;
+        $isRtl = static fn(string $v): bool => preg_match('/\p{L}/u', $v, $f) === 1 && preg_match('/\p{Arabic}|\p{Hebrew}/u', $f[0]) === 1;   // first letter decides
         // One paragraph's runs, with **bold** kept.
         $runs = static function (string $v, int $size, bool $bold, string $color) use ($esc, $isRtl): string {
-            $out = ''; $lang = !$isRtl($v) ? 'fr-FR' : (preg_match('/[ٹڈڑںےہھگچپژ]/u', $v) === 1 ? 'ur-PK' : 'ar-AE');
+            $out = ''; $lang = !$isRtl($v) ? 'fr-FR' : (preg_match('/[ٹڈڑںےہ]/u', $v) === 1 ? 'ur-PK' : 'ar-AE');
             foreach (preg_split('/(\*\*[^*]+\*\*)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [$v] as $part) {
                 $b = $bold || (str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4);
                 $t = $b && str_starts_with($part, '**') ? substr($part, 2, -2) : $part;

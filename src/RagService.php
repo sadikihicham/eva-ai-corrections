@@ -935,16 +935,16 @@ $this->executor->setUserId($userId);
         return $message;
     }
 
-    /** True when the user asks EVA to produce a file (not how to make one). */
     /**
      * Urdu is written in the Arabic script and the model answered Urdu requests in Arabic (measured 28/09: « آپ کون ہیں؟ »
      * → « أنا Infinity AI… »). When the request asks for Urdu (« en urdu », « اردو ») or is written in Urdu (letters Arabic
-     * does not have: ٹ ڈ ڑ ں ے ہ ھ گ چ پ ژ), the model is told plainly to write Urdu, and how to translate a file into it.
+     * never uses: ٹ ڈ ڑ ں ے ہ), the model is told plainly to write Urdu, and how to translate a file into it.
      */
     private function urduHint(string $message): string {
         $m = mb_strtolower($message);
-        $asksUrdu = preg_match('~(?<!\p{L})(urdu|ourdou|ourdu|urdû|اردو|اُردو)(?!\p{L})~u', $m) === 1;
-        $writesUrdu = preg_match('~[ٹڈڑںےہھگچپژ]~u', $message) === 1;
+        $asksUrdu = preg_match('~(?<!\p{L})(urdu|ourdou|ourdu|urdû|اردو|اُردو|أردو|الأردية|الاردية)(?!\p{L})~u', $m) === 1;
+        // Only letters Arabic never uses: Gulf Arabic writes چ and گ (« گوگل »), which must not turn an Arab user into an Urdu one.
+        $writesUrdu = preg_match('~[ٹڈڑںےہ]~u', $message) === 1;
         if (!$asksUrdu && !$writesUrdu) {
             return '';
         }
@@ -955,6 +955,7 @@ $this->executor->setUserId($userId);
             . 'A .pdf cannot hold Urdu script: for Urdu use .docx, .pptx, .md or .txt (say so if a PDF was asked for).';
     }
 
+    /** True when the user asks EVA to produce a file (not how to make one). */
     private function isFileCreationRequest(string $message): bool {
         $m = mb_strtolower(trim($message));
         if ($m === '' || mb_strlen($m) > 2000) {
@@ -985,9 +986,7 @@ $this->executor->setUserId($userId);
             || preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})\s+(moi\s+|me\s+|nous\s+|it\s+|this\s+|ça\s+|cela\s+|le\s+tout\s+)?(en\s+|as\s+|to\s+|au\s+format\s+)?(pdf|docx|word|excel|xlsx|csv|pptx|powerpoint)(?!\p{L})~u', $m) === 1
             // "convert this file to pdf": a conversion names its target format, no "new" article (test 28/09 ~07:15).
             || preg_match('~(?<!\p{L})(convert\p{L}*|transform\p{L}*|umwandel\p{L}*|حوّل|حول)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,60}(?<!\p{L})(en|to|into|in|as|vers|au\s+format|إلى|الى)\s+(\p{L}+\s+)?(pdf|docx|word|excel|xlsx|csv|pptx|powerpoint)(?!\p{L})~u', $m) === 1
-            || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,40}(ملف|مستند|اكسل)~u', $m) === 1
-            // "traduis le fichier X en urdu": the translation is a NEW file (admin 28/09, Urdu), not a chat answer.
-            || preg_match('~(?<!\p{L})(tradui\p{L}*|translat\p{L}*|übersetz\p{L}*|ترجم\p{L}*)(?!\p{L})(?:[^?!\n]){0,60}(?<!\p{L})(?:ال)?(fichier|document|doc|docx|file|datei|ملف|مستند|\S+\.(?:docx?|pdf|md|txt|pptx|xlsx|odt))(?!\p{L})~u', $m) === 1;
+            || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,40}(ملف|مستند|اكسل)~u', $m) === 1;
         if ($creation) {
             return true;
         }
@@ -997,6 +996,12 @@ $this->executor->setUserId($userId);
         // A question about a change already made is no request ("qui a modifié le fichier ?", "did you update the file?").
         if (preg_match('~^\s*(qui|quand|who|when|what|which|quel\p{L}*|est-ce\s+qu\p{L}*|did|has|have|as-tu|avez-vous)(?!\p{L})~u', $m) === 1) {
             return false;
+        }
+        // "traduis le fichier X en urdu": the translation is a NEW file (admin 28/09, Urdu), not a chat answer. Imperative or
+        // infinitive only (« as-tu traduit… », « I translated… », « ترجمة الملف » are not requests), never « dans le chat ».
+        if (preg_match('~(?<!\p{L})(tradui[st]|traduisez|traduire|translate(?![ds])|übersetze?n?|ترجم(?!ة)|ترجمي)(?!\p{L})(?:[^?!\n]){0,60}(?<!\p{L})(?:ال)?(fichier|document|doc|docx|file|datei|ملف|مستند|\S+\.(?:docx?|pdf|md|txt|pptx|xlsx|odt))(?!\p{L})~u', $m) === 1
+            || preg_match('~(فائل|دستاویز|ملف)(?:[^?!\n]){0,40}ترجمہ\s+کر(یں|و|دیں)~u', $m) === 1) {
+            return preg_match('~(?<!\p{L})(dans\s+(le\s+)?chat|in\s+(the\s+)?chat|ici|here)(?!\p{L})~u', $m) !== 1;
         }
         return false
             || preg_match('~(?<!\p{L})(ajoute[rz]?|rajoute[rz]?|ins[èée]re[rz]?|compl[èée]te[rz]?|modifie[rz]?|[ée]dite[rz]?|corrige[rz]?|remplace[rz]?|mets\s+[àa]\s+jour|mettez\s+[àa]\s+jour|mettre\s+[àa]\s+jour|add|append|insert|edit|update|modify|change|أضف|اضف|عدّل|عدل)(?!\p{L})[^?!\n]{0,80}(?<!\p{L})(dans|au|à|a|to|in|into|في|إلى|الى)\s+(le|la|l[\'’]|ce|cet|cette|mon|ma|the|this|my|that)?\s*(ال)?(fichier|document|doc|docx|word|excel|xlsx|pdf|tableur|classeur|file|spreadsheet|ملف|مستند)(?!\p{L})~u', $m) === 1
@@ -1417,7 +1422,7 @@ $this->executor->setUserId($userId);
         // Urdu / Persian letter forms → Arabic ones (« دبئی » = « دبئي »), so one alias covers both scripts.
         $t = strtr($t, ['ی' => 'ي', 'ک' => 'ك', 'ہ' => 'ه', 'ۃ' => 'ة', 'ھ' => 'ه', 'ے' => 'ي']);
         $t = ' ' . trim((string)preg_replace('/[^\p{L}\p{N}]+/u', ' ', $t)) . ' ';
-        $aliases = ['دبئي' => 'dubai', 'دبيي' => 'dubai', 'ابوظهبي' => 'abu dhabi', 'ابو ظهبي' => 'abu dhabi', 'شارجه' => 'sharjah', 'كراچي' => 'karachi', 'لاهور' => 'lahore',
+        $aliases = ['دبئي' => 'dubai', 'دبيي' => 'dubai' /* دبئی once intl decomposed ئ */, 'ابوظهبي' => 'abu dhabi', 'ابو ظهبي' => 'abu dhabi', 'شارجه' => 'sharjah', 'كراچي' => 'karachi', 'لاهور' => 'lahore',
             'اسلام اباد' => 'islamabad', 'پشاور' => 'peshawar', 'doubai' => 'dubai', 'dubay' => 'dubai', 'دبي' => 'dubai', 'abou dhabi' => 'abu dhabi', 'abou dabi' => 'abu dhabi', 'abu dabi' => 'abu dhabi',
             'ابو ظبي' => 'abu dhabi', 'ابوظبي' => 'abu dhabi', 'charjah' => 'sharjah', 'الشارقة' => 'sharjah', 'عجمان' => 'ajman', 'العين' => 'al ain',
             'ras el khaimah' => 'ras al khaimah', 'راس الخيمة' => 'ras al khaimah', 'الفجيرة' => 'fujairah', 'الرياض' => 'riyadh', 'riyad' => 'riyadh', 'جدة' => 'jeddah', 'djeddah' => 'jeddah',
@@ -1497,7 +1502,11 @@ $this->executor->setUserId($userId);
             && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|pr[ée]visions?)(?!\p{L})~u', $m) !== 1) {
             return false;
         }
-        return $m !== '' && mb_strlen($m) <= 300 && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|wetter|pr[ée]visions?\s+m[ée]t[ée]o|pleuvoir|pleut|pluie|neige|rain|snow|الطقس|موسم)(?!\p{L})'
+        // « موسم » is the Urdu weather word but means « season » in Arabic (« موسم الحج ») : counted in Urdu text only.
+        if ($m !== '' && mb_strlen($m) <= 300 && str_contains($m, 'موسم') && preg_match('~[ٹڈڑںےہ]~u', $m) === 1) {
+            return true;
+        }
+        return $m !== '' && mb_strlen($m) <= 300 && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|wetter|pr[ée]visions?\s+m[ée]t[ée]o|pleuvoir|pleut|pluie|neige|rain|snow|الطقس)(?!\p{L})'
             . '|temps\s+(qu[\'’]il\s+)?(fait|fera)|temp[ée]rature[^.?!\n]{0,30}(demain|demin|aujourd|ce\s+soir|cette\s+semaine|week-?end|dehors|ext[ée]rieur|tomorrow|today|tonight|outside)'
             . '|temp[ée]rature[^.?!\n]{0,40}(?<!\p{L})(à|a|au|en|in|at)\s+\p{L}{3,}'
             . '|درجة\s+الحرارة~u', $m) === 1;

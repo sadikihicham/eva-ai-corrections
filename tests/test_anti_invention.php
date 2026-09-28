@@ -710,6 +710,14 @@ verifie('question météo en urdu (موسم) reconnue', $t->meteo('کل دبئی
 verifie('garde météo : « دبئی » dans la question = Dubai', $t->gardeMeteo(['location' => 'Dubai'], [['role' => 'user', 'content' => 'کل دبئی میں موسم کیسا ہوگا؟']]) === null);
 verifie('garde météo : کراچی = Karachi, لاہور = Lahore', $t->gardeMeteo(['location' => 'Karachi'], [['role' => 'user', 'content' => 'کراچی میں موسم']]) === null && $t->gardeMeteo(['location' => 'Lahore'], [['role' => 'user', 'content' => 'لاہور کا موسم']]) === null);
 verifie('garde météo : ville absente toujours refusée en urdu', $t->gardeMeteo(['location' => 'Abu Dhabi'], [['role' => 'user', 'content' => 'کل موسم کیسا ہوگا؟']]) !== null);
+// Revue de d07ffe9
+verifie('consigne urdu : « ترجم الملف إلى الأردية »', str_contains($t->ourdou('ترجم الملف إلى الأردية'), 'Urdu (اردو) is NOT Arabic'));
+verifie('arabe du Golfe avec گ / چ (« دور لي على گوگل وين أحصل چاي ») → PAS de consigne urdu', $t->ourdou('دور لي على گوگل وين أحصل چاي') === '');
+verifie('« موسم الحج » (saison, arabe) → pas une question météo', !$t->meteo('متى موسم الحج؟'));
+verifie('traduction en urdu (اس فائل کا اردو میں ترجمہ کریں) = demande de fichier', $t->fichier('اس فائل کا اردو میں ترجمہ کریں'));
+foreach (["as-tu traduit le fichier ?", "traduis le document que je t'ai envoyé en anglais dans le chat", "I translated the file yesterday, summarize it", "هل ترجمة الملف صحيحة؟", "what does fichier translate to?"] as $q) {
+    verifie('pas une demande de fichier : « ' . $q . ' »', !$t->fichier($q));
+}
 foreach (["traduis « bonjour » en urdu", "comment traduire un fichier en urdu ?", "translate hello into Urdu"] as $q) {
     verifie('pas une demande de fichier : « ' . $q . ' »', !$t->fichier($q));
 }
