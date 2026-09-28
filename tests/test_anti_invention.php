@@ -734,7 +734,9 @@ foreach (["crée une carte Deck pour la réunion de lundi", "ajoute une tâche d
     "أنشئ بطاقة Deck للاجتماع", "Deck کارڈ بنائیں", "liste Deck « courses »", "erstelle eine Deck-Karte",
     // Revue de 4548ce6 : oubliés
     "crée une tâche Deck", "new Deck task", "nouvelle carte dans l'app Deck", "create a card in the Deck app", "erstelle eine Karte im Deck",
-    "füge eine Aufgabe zu Deck hinzu", "أضف مهمة إلى ديك", "ڈیک میں کارڈ بنائیں", "crée une carte deck pour demain"] as $q) {
+    "füge eine Aufgabe zu Deck hinzu", "أضف مهمة إلى ديك", "ڈیک میں کارڈ بنائیں", "crée une carte deck pour demain",
+    "Neue Aufgabe in Deck: Budget prüfen",
+    "Voici les notes de la réunion d'hier avec l'équipe produit, merci de les garder en tête pour la suite de la semaine. Ensuite, crée une carte Deck « relancer le fournisseur » pour vendredi avec la description ci-dessus."] as $q) {
     verifie('demande Deck reconnue : « ' . $q . ' »', $t->deck($q));
 }
 foreach (["crée un slide deck sur la cybersécurité", "fais un deck de présentation", "crée un deck powerpoint", "un pitch deck pour les investisseurs",
@@ -746,7 +748,14 @@ foreach (["crée un slide deck sur la cybersécurité", "fais un deck de présen
     "the cards deck is shuffled", "my magic card deck needs more lands", "list deck cards for Hearthstone", "tableau deck de Mario Kart", "liste deck magic",
     "wir essen auf Deck", "auf Deck 7 gibt es eine Bar", "Karten auf dem Deck kaufen", "switch to deck B on the mixer", "plug the mixer into deck A",
     "ajoute 2 cartes au Deck B", "Deck of cards: explain the rules", "crée une carte du Deck de présentation", "le rapport_Deck.docx contient des tâches",
-    "enregistre ça dans Deck", "ajoute ce tableau au deck investisseurs", "الديك يصيح في الصباح"] as $q) {
+    "enregistre ça dans Deck", "ajoute ce tableau au deck investisseurs", "الديك يصيح في الصباح",
+    // Seconde revue (6c0d991) : noms de produits, dossiers, allemand, titres, dinde, textes longs
+    "Ajoute une carte du Moyen-Orient au Pitch Deck", "Pitch Deck: create a task list for the investor meeting", "Slide Deck review task for Monday",
+    "Update the Stream Deck config for the task switcher", "Steam Deck: which cards games run well?", "Mets la carte de la région dans le Deck Q3",
+    "Open the folder Deck and list the tasks inside", "Ouvre le dossier Deck et liste les tâches",
+    "Mein Commander Deck braucht mehr Karten", "Welche Karten gehören in ein gutes Deck?", "Karten fürs Deck kaufen", "Die Aufgabe heute: das Holz für unser Deck bestellen",
+    "Tâches de la semaine : finir le Deck commercial", "Deck building: which cards should I add?", "بطاقة ديك رومي",
+    "Chaque lundi matin, fais-moi un point : liste mes tâches ouvertes, résume les mails non lus de la semaine, rappelle-moi les rendez-vous importants et les documents à relire, dont le Deck pour le comité de direction, et propose trois priorités."] as $q) {
     verifie('pas une demande Deck : « ' . $q . ' »', !$t->deck($q));
 }
 $r = $t->refusDeck('crée une carte Deck pour la réunion de lundi');
@@ -756,6 +765,7 @@ verifie('refus Deck en ourdou (pas en arabe)', str_contains($t->refusDeck('Deck 
 verifie('refus Deck en anglais', str_contains($t->refusDeck('make a new Deck board'), 'is not installed'));
 verifie('refus Deck en anglais pour « create a Deck card » (create ≠ crée)', str_contains($t->refusDeck('create a Deck card for the sprint'), 'is not installed'));
 verifie('refus Deck en ourdou sans ٹڈڑںےہ (« Deck پر کام شامل کرو »)', str_contains($t->refusDeck('Deck پر کام شامل کرو'), 'انسٹال نہیں'));
+verifie('refus Deck en allemand (« Neue Aufgabe in Deck: Budget prüfen »)', str_contains($t->refusDeck('Neue Aufgabe in Deck: Budget prüfen'), 'nicht installiert'));
 verifie('refus Deck en arabe écrit « ديك »', str_contains($t->refusDeck('أضف مهمة إلى ديك'), 'غير مثبت'));
 verifie('ask() : même forme de retour que le chemin normal (clé error)', str_contains($source, '\'model\' => $this->config->get(\'chat_model\'), \'error\' => null, \'followups\' => []];'));
 verifie('Deck activé vérifié pour l\'utilisateur de la requête (Talk, tâches de fond : pas de session)', str_contains($source, 'isEnabledForUser(\'deck\', $user)'));

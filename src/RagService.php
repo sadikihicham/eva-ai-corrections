@@ -983,10 +983,16 @@ $this->executor->setUserId($userId);
         }
         $m = mb_strtolower($raw);
         $notFile = '(?![\p{L}\p{N}_])(?![.\/\\\\]\S)';
-        $app = '(?<![\p{L}\p{N}_.\/\\\\-])(?<!dem )(?<!das )(?<!vom )(?<!aufs )Deck' . $notFile . '(?!\s+(?:[A-Z]|\p{N}+)(?![\p{L}\p{N}]))(?!\s+(?:of|de|du|des|en)(?!\p{L}))';
+        // Not a product (« Pitch Deck », « Stream Deck »), a folder or file (« le dossier Deck »), a ship or card deck in German
+        // (« aufs Deck », « unser Deck »), nor a numbered one (« Deck 2 », « Deck B », « Deck Q3 ») (second review, 6c0d991).
+        $app = '(?<![\p{L}\p{N}_.\/\\\\-])(?<!(?i)pitch |slide |sales |stream |steam |commander |investor |dossier |folder |ordner |fichier |file |datei |dem |das |vom |aufs |ein |fürs |unser |mein |gutes |neues |eigenes |ganzes )Deck'
+            . $notFile . '(?!\s+(?:[A-Z][A-Z\p{N}]*|\p{N}+)(?![\p{L}\p{N}]))(?!\s+(?:of|de|du|des|en|commercial|investisseurs?|marketing|building|builder)(?!\p{L}))';
+        $cardWord = '(cartes?|t[âa]ches?|cards?|tasks?|karten?|aufgaben?|بطاقة|بطاقات|مهمة|مهام|کارڈ|ٹاسک)';
         if (preg_match('~' . $app . '~u', $raw) === 1) {
-            // Deck's own vocabulary anywhere in the request; « tableau / liste / board » are generic, so only right next to it.
-            if (preg_match('~(?<!\p{L})(cartes?|t[âa]ches?|cards?|tasks?|kanban|karten?|aufgaben?|بطاقة|بطاقات|مهمة|مهام|کارڈ|ٹاسک)(?!\p{L})~u', $m) === 1
+            // Deck's own vocabulary anywhere in a short request; in a long text (briefing, pasted notes) only right next to it.
+            // « tableau / liste / board » are generic, so always only right next to it.
+            if ((mb_strlen($raw) <= 200 && preg_match('~(?<!\p{L})(' . $cardWord . '|kanban)(?!\p{L})~u', $m) === 1)
+                || preg_match('~(?<!\p{L})(?i:' . $cardWord . ')\s+(?:(?i:dans|in|im|sur|on|to|zu)\s+|في\s+)?' . $app . '|' . $app . '[\s-](?i:cards?|tasks?|karte\p{L}*)(?!\p{L})~u', $raw) === 1
                 || preg_match('~(?<!\p{L})((?i:app|appli|application|anwendung|tableaux?|listes?|boards?|stacks?|brett|bretter)|تطبيق|لوحة|بورڈ)\s+' . $app
                     . '|' . $app . '[\s-]((?i:app|application|boards?|stacks?|lists?|brett\p{L}*)|ایپ|بورڈ)(?!\p{L})~u', $raw) === 1) {
                 return true;
@@ -994,7 +1000,7 @@ $this->executor->setUserId($userId);
         }
         return preg_match('~(?<!\p{L})(cartes?|t[âa]ches?)\s+deck' . $notFile . '(?!\s+(?:de|du|des)(?!\p{L}))~u', $m) === 1
             // Deck written in Arabic / Urdu script (« ديك » alone is a rooster: only with a card, task or app word).
-            || preg_match('~(تطبيق|بطاقة|بطاقات|لوحة|مهمة|مهام)\s+(?:(?:في|على|إلى|الى)\s+)?ديك(?!\p{L})~u', $m) === 1
+            || preg_match('~(تطبيق|بطاقة|بطاقات|لوحة|مهمة|مهام)\s+(?:(?:في|على|إلى|الى)\s+)?ديك(?!\p{L})(?!\s+رومي)~u', $m) === 1
             || (preg_match('~(?<!\p{L})ڈیک(?!\p{L})~u', $m) === 1 && preg_match('~(کارڈ|بورڈ|ٹاسک|ایپ)~u', $m) === 1);
     }
 
@@ -1004,7 +1010,7 @@ $this->executor->setUserId($userId);
         if (preg_match('~\p{Arabic}~u', $m) === 1) {
             // ی and ک are the Persian-Urdu forms (Arabic writes ي and ك), so « Deck پر کام شامل کرو » is Urdu too.
             $lang = preg_match('~[ٹڈڑںےہیک]~u', $m) === 1 ? 'ur' : 'ar';
-        } elseif (preg_match('~(?<!\p{L})(karten?|brett|erstell\p{L}*|füg\p{L}*|zeig\p{L}*|verschieb\p{L}*|eine?)(?!\p{L})~u', $m) === 1) {
+        } elseif (preg_match('~(?<!\p{L})(karten?|brett|aufgabe\p{L}*|erstell\p{L}*|füg\p{L}*|zeig\p{L}*|verschieb\p{L}*|anlegen|prüf\p{L}*|neue?|eine?|zu)(?!\p{L})~u', $m) === 1) {
             $lang = 'de';
         } elseif (preg_match('~(?<!\p{L})(cartes?|tableaux?|listes?|dans|sur|cr[ée][ée]?r?s?|t[âa]ches?|ajout\p{L}*|montr\p{L}*|d[ée]plac\p{L}*|mets|mes|une?)(?!\p{L})~u', $m) === 1) {
             $lang = 'fr';
