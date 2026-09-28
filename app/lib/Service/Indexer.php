@@ -1404,7 +1404,9 @@ class Indexer {
             $profile = $tmpDir . '/profile';
             @mkdir($outDir, 0700, true);
             file_put_contents($in, $file->getContent());
-            $cmd = escapeshellarg($bin) . ' --headless -env:UserInstallation=file://' . escapeshellarg($profile)
+            // Time bound: a corrupt or hostile file must never block the indexing cron.
+            // -k 10: SIGKILL 10 s after the SIGTERM if soffice does not stop.
+            $cmd = 'timeout -k 10 120 ' . escapeshellarg($bin) . ' --headless -env:UserInstallation=file://' . escapeshellarg($profile)
                 . ' --convert-to "txt:Text (encoded):UTF8" --outdir ' . escapeshellarg($outDir)
                 . ' ' . escapeshellarg($in) . ' 2>/dev/null';
             shell_exec($cmd);
