@@ -1,0 +1,33 @@
+chauffe 4B (chargement compris) : 11.8 s
+
+30b        ✅   1.7 s | réflexion     0 car. | outils - | Explique en deux phrases ce qu'est Nextcloud. | Nextcloud est une plateforme de stockage et de gestion de fichiers en 
+30b        ✅   0.8 s | réflexion     0 car. | outils - | Combien font 12 fois 7 ? | 12 fois 7 font 84.
+30b        ❌   0.7 s | réflexion     0 car. | outils ['current_time'] | Quels sont mes rendez-vous de demain ? | 
+30b        ❌   2.4 s | réflexion     0 car. | outils - | creer un fichier excel pour me lister mes ron | Je vais créer un fichier Excel pour lister vos rendez-vous de cette se
+30b        ✅   2.0 s | réflexion     0 car. | outils ['create_file'] | Crée un fichier idees.md avec 3 idées pour am | 
+30b        ❌   1.2 s | réflexion     0 car. | outils - | Quelle est la dernière version stable de PHP  | La dernière version stable de PHP est actuellement la version 8.3. Vou
+30b        ✅   2.9 s | réflexion     0 car. | outils - | اكتب فقرة قصيرة تشرح فوائد مشاركة الملفات بشك | تُعد مشاركة الملفات بشكل آمن داخل الشركة من الأمور الأساسية التي تضمن 
+30b        ✅   0.7 s | réflexion     0 car. | outils ['unread_mail_count'] | Combien de mails non lus ai-je ? | 
+
+4b-rapide  ✅   3.6 s | réflexion     0 car. | outils - | Explique en deux phrases ce qu'est Nextcloud. | Nextcloud est un service de stockage cloud et de collaboration qui per
+4b-rapide  ✅   2.3 s | réflexion     0 car. | outils - | Combien font 12 fois 7 ? | 12 × 7 = **84**
+4b-rapide  ❌   2.3 s | réflexion     0 car. | outils ['current_time'] | Quels sont mes rendez-vous de demain ? | 
+4b-rapide  ✅   3.0 s | réflexion     0 car. | outils ['list_calendar_events'] | creer un fichier excel pour me lister mes ron | Je vais d'abord vérifier vos rendez-vous de cette semaine dans votre c
+4b-rapide  ✅   7.6 s | réflexion     0 car. | outils ['create_file'] | Crée un fichier idees.md avec 3 idées pour am | 
+4b-rapide  ❌   3.5 s | réflexion     0 car. | outils - | Quelle est la dernière version stable de PHP  | La dernière version stable de PHP est **PHP 8.4**.  Les versions récen
+4b-rapide  ✅   5.8 s | réflexion     0 car. | outils - | اكتب فقرة قصيرة تشرح فوائد مشاركة الملفات بشك | مشاركة الملفات بشكل آمن داخل الشركة توفر عدة فوائد رئيسية:  **تحسين ال
+4b-rapide  ✅   2.4 s | réflexion     0 car. | outils ['unread_mail_count'] | Combien de mails non lus ai-je ? | 
+
+4b-actuel  ✅   5.7 s | réflexion   620 car. | outils - | Explique en deux phrases ce qu'est Nextcloud. | Nextcloud est un service de stockage cloud et de collaboration qui per
+4b-actuel  ✅   4.0 s | réflexion   358 car. | outils - | Combien font 12 fois 7 ? | 12 fois 7 font **84**.
+4b-actuel  ❌   3.4 s | réflexion   275 car. | outils ['current_time'] | Quels sont mes rendez-vous de demain ? | 
+4b-actuel  ✅   3.9 s | réflexion   338 car. | outils ['list_calendar_events'] | creer un fichier excel pour me lister mes ron | 
+4b-actuel  ✅  10.1 s | réflexion   672 car. | outils ['create_file'] | Crée un fichier idees.md avec 3 idées pour am | 
+4b-actuel  ✅   3.9 s | réflexion   301 car. | outils ['web_search'] | Quelle est la dernière version stable de PHP  | 
+4b-actuel  ✅   5.9 s | réflexion   394 car. | outils - | اكتب فقرة قصيرة تشرح فوائد مشاركة الملفات بشك | مشاركة الملفات بشكل آمن داخل الشركة توفر عدة فوائد رئيسية: أولاً، تسهي
+4b-actuel  ✅   3.3 s | réflexion   220 car. | outils ['unread_mail_count'] | Combien de mails non lus ai-je ? | 
+
+BILAN (médiane des durées, justes / total)
+  30b        médiane   1.7 s | max   2.9 s | justes 5/8
+  4b-rapide  médiane   3.5 s | max   7.6 s | justes 6/8
+  4b-actuel  médiane   4.0 s | max  10.1 s | justes 7/8

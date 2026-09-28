@@ -211,7 +211,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_file',
-                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Use content for text; use content_base64 for validated binary/ZIP-based files such as generated Office documents.',
+                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table) and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'path' => ['type' => 'string', 'description' => 'Relative path from the home folder, e.g. "Documents/Plan.md" or "Report.txt".'],
                     'content' => ['type' => 'string', 'description' => 'Full UTF-8 text content.'],
@@ -1916,6 +1916,44 @@ class ActionExecutor {
         if ($typeError !== null) {
             return ['ok' => false, 'error' => $typeError];
         }
+        // Binary formats EVA has no generator for: plain text saved under such a
+        // name is a corrupt file that no viewer opens (seen 28/09 with ".pdf", which
+        // now has its own generator, buildPdf). Refuse clearly so the model offers
+        // a format it can really produce.
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        $noTextBuilder = ['doc', 'docm', 'xls', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'];
+        if (!$binary && in_array($ext, $noTextBuilder, true)) {
+            return ['ok' => false, 'error' => 'EVA cannot generate .' . $ext . ' files: nothing was created. '
+                . 'Tell the user, and offer a .pdf, .docx, .xlsx, .md or .txt file instead (EVA generates these correctly).'];
+        }
+        // Bytes passed in content_base64 must really be of the announced type: a model
+        // asked for a PDF can otherwise base64-encode plain text and write a corrupt file.
+        $signatures = ['pdf' => ['%PDF-'], 'png' => ["\x89PNG"], 'jpg' => ["\xFF\xD8\xFF"], 'jpeg' => ["\xFF\xD8\xFF"], 'gif' => ['GIF8'],
+            'zip' => ["PK\x03\x04"], 'docx' => ["PK\x03\x04"], 'xlsx' => ["PK\x03\x04"], 'pptx' => ["PK\x03\x04"], 'docm' => ["PK\x03\x04"],
+            'xlsm' => ["PK\x03\x04"], 'pptm' => ["PK\x03\x04"], 'odt' => ["PK\x03\x04"], 'ods' => ["PK\x03\x04"], 'odp' => ["PK\x03\x04"], 'epub' => ["PK\x03\x04"],
+            'doc' => ["\xD0\xCF\x11\xE0"], 'xls' => ["\xD0\xCF\x11\xE0"], 'ppt' => ["\xD0\xCF\x11\xE0"], '7z' => ["7z\xBC\xAF"], 'webp' => ['RIFF']];
+        if ($binary && isset($signatures[$ext])) {
+            $matches = array_filter($signatures[$ext], static fn(string $sig): bool => str_starts_with($content, $sig));
+            if ($matches === []) {
+                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; pass the text in content instead (EVA generates .pdf, .docx and .xlsx from text), or offer a .md or .txt file.'];
+            }
+        }
+        $warning = [];
+        if (!$binary && $ext === 'pdf') {
+            try {
+                $replaced = 0;
+                $content = $this->buildPdf($content, $replaced);
+                if ($replaced > 0) {
+                    // Tell the model (and so the user) instead of silently printing "?" (review, 28/09).
+                    $warning = ['warning' => $replaced . ' character(s) of a non-Latin script could not be printed in the PDF and were replaced by "?". Tell the user; offer a .docx if that text matters.'];
+                }
+            } catch (\Throwable $e) {
+                if ($e->getMessage() === 'non-Latin text') {
+                    return ['ok' => false, 'error' => 'EVA can generate PDF files only for Latin-script text (French, English, German…). Nothing was created. For Arabic or other scripts, offer a .docx file instead (fully supported).'];
+                }
+                return ['ok' => false, 'error' => 'PDF generation failed: ' . $e->getMessage()];
+            }
+        }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'docx') {
             try { $content = $this->buildDocx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'DOCX generation is unavailable on this server: ' . $e->getMessage()]; }
         }
@@ -1929,7 +1967,7 @@ class ActionExecutor {
             if ($existing instanceof File) {
                 $existing->putContent($content);
                 $this->bumpSearchRevision();
-                return ['ok' => true, 'result' => 'Updated ' . $path] + $this->fileLinks($home, $existing);
+                return ['ok' => true, 'result' => 'Updated ' . $path] + $warning + $this->fileLinks($home, $existing);
             }
             return ['ok' => false, 'error' => 'A folder with that name already exists at ' . $path];
         }
@@ -1944,9 +1982,9 @@ class ActionExecutor {
         try {
             $created = $folder->get($name);
         } catch (\Throwable $e) {
-            return ['ok' => true, 'result' => 'Created ' . $path];
+            return ['ok' => true, 'result' => 'Created ' . $path] + $warning;
         }
-        return ['ok' => true, 'result' => 'Created ' . $path] + $this->fileLinks($home, $created);
+        return ['ok' => true, 'result' => 'Created ' . $path] + $warning + $this->fileLinks($home, $created);
     }
 
     /**
@@ -2006,13 +2044,361 @@ class ActionExecutor {
         if ($tmp === false || $zip->open($tmp, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) throw new \RuntimeException('could not create archive');
         $esc = static fn(string $v): string => htmlspecialchars($v, ENT_XML1 | ENT_COMPAT, 'UTF-8');
         $rows = preg_split('/\R/u', trim($text)) ?: []; $sheet = ''; $r = 0;
-        foreach ($rows as $line) { $r++; $cells = str_contains($line, "\t") ? explode("\t", $line) : str_getcsv($line); $c = 0; $sheet .= '<row r="' . $r . '">'; foreach ($cells as $value) { $c++; $col = ''; $n = $c; while ($n > 0) { $n--; $col = chr(65 + ($n % 26)) . $col; $n = intdiv($n, 26); } $sheet .= '<c r="' . $col . $r . '" t="inlineStr"><is><t>' . $esc((string)$value) . '</t></is></c>'; } $sheet .= '</row>'; }
+        // Models often send a Markdown table ("| a | b |"), sometimes after an intro sentence (seen 28/09: every line
+        // landed in a single cell). Then the intro before the first table is dropped; later prose (notes, totals) is
+        // kept in column A, and a separator is only the 2nd line of a table (a data row "| - | - |" stays).
+        $first = null;
+        foreach ($rows as $k => $l) { if (str_starts_with(ltrim($l), '|')) { $first = $k; break; } }
+        $markdown = $first !== null;
+        if ($markdown) $rows = array_slice($rows, $first);
+        $blockRow = 0;
+        // French Excel writes "a;b;c" (seen 28/09: the whole row landed in column A). Decided on the header line, quoted
+        // text left out: ";" inside cells or French decimals "48,85" in the data must not choose (review of 2195949).
+        $header = (string)preg_replace('/"[^"]*"/', '', (string)(array_values(array_filter($rows, static fn(string $l): bool => trim($l) !== ''))[0] ?? ''));
+        $delim = substr_count($header, ';') > substr_count($header, ',') ? ';' : ',';
+        foreach ($rows as $line) {
+            if ($markdown) {
+                $inner = trim($line);
+                if (!str_starts_with($inner, '|')) {
+                    $blockRow = 0;
+                    if ($inner === '') continue;
+                    $cells = [$inner];
+                } else {
+                    $blockRow++;
+                    $inner = substr($inner, 1, str_ends_with($inner, '|') && !str_ends_with($inner, '\\|') && strlen($inner) > 1 ? -1 : null);
+                    $cells = array_map(static fn(string $c): string => (string)preg_replace(['/^\*\*(.*)\*\*$/s', '/^`(.*)`$/s'], '$1', trim(str_replace('\\|', '|', $c))), preg_split('/(?<!\\\\)\|/', $inner) ?: [$inner]);
+                    if ($blockRow === 2 && array_filter($cells, static fn(string $c): bool => !preg_match('/^:?-+:?$/', $c)) === []) continue;   // |---|:--:| separator
+                    if ($blockRow === 1 && $r > 0) $r++;   // an empty row between two tables
+                }
+            }
+            $r++; $cells = $markdown ? $cells : (str_contains($line, "\t") ? explode("\t", $line) : str_getcsv($line, $delim, '"', '\\')); $c = 0; $sheet .= '<row r="' . $r . '">'; foreach ($cells as $value) { $c++; $col = ''; $n = $c; while ($n > 0) { $n--; $col = chr(65 + ($n % 26)) . $col; $n = intdiv($n, 26); } $sheet .= '<c r="' . $col . $r . '" t="inlineStr"><is><t>' . $esc((string)$value) . '</t></is></c>'; } $sheet .= '</row>'; }
         $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');
         $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
         $zip->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="EVA" sheetId="1" r:id="rId1"/></sheets></workbook>');
         $zip->addFromString('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
         $zip->addFromString('xl/worksheets/sheet1.xml', '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' . $sheet . '</sheetData></worksheet>');
         $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
+    }
+
+    /**
+     * Build a PDF 1.4 (A4 portrait) from plain text or simple Markdown, in pure PHP (zlib optional).
+     * Uses the standard, non-embedded Type 1 fonts Helvetica, Helvetica-Bold and Courier with
+     * WinAnsiEncoding, and wraps lines with the official Adobe AFM widths, so the layout matches
+     * what every viewer renders. Understands # headings, - / * / 1. lists, **bold**, [links](url),
+     * > quotes, | tables | (Courier, aligned), ``` code blocks and --- rules; paginates automatically
+     * and prints "page / total" in the footer. Deterministic: no date in the file.
+     * Throws \RuntimeException('non-Latin text') when more than a few letters cannot be shown in
+     * WinAnsi (Arabic, Cyrillic, CJK…): the standard fonts would print "?" instead of the letters.
+     * Emoji and decorative symbols are removed. Self-contained (closures only) so that
+     * tests/test_pdf.php can extract and run this very method.
+     */
+    private function buildPdf(string $text, ?int &$replaced = null): string {
+        // ---- 1. UTF-8 -> Windows-1252 bytes, character by character --------------------------
+        $text = mb_scrub($text, 'UTF-8');
+        if (class_exists(\Normalizer::class)) {
+            $nfc = \Normalizer::normalize($text, \Normalizer::FORM_C);
+            if (is_string($nfc)) $text = $nfc;
+        }
+        $text = str_replace(["\r\n", "\r", "\t"], ["\n", "\n", '    '], $text);
+        // Unicode code points of the 0x80-0x9F block of Windows-1252.
+        $cp1252 = [0x20AC => 0x80, 0x201A => 0x82, 0x0192 => 0x83, 0x201E => 0x84, 0x2026 => 0x85, 0x2020 => 0x86, 0x2021 => 0x87,
+            0x02C6 => 0x88, 0x2030 => 0x89, 0x0160 => 0x8A, 0x2039 => 0x8B, 0x0152 => 0x8C, 0x017D => 0x8E, 0x2018 => 0x91, 0x2019 => 0x92,
+            0x201C => 0x93, 0x201D => 0x94, 0x2022 => 0x95, 0x2013 => 0x96, 0x2014 => 0x97, 0x02DC => 0x98, 0x2122 => 0x99, 0x0161 => 0x9A,
+            0x203A => 0x9B, 0x0153 => 0x9C, 0x017E => 0x9E, 0x0178 => 0x9F];
+        // Characters LLMs often write that WinAnsi lacks: readable ASCII replacements.
+        $ascii = [0x2192 => '->', 0x2190 => '<-', 0x2194 => '<->', 0x21D2 => '=>', 0x2264 => '<=', 0x2265 => '>=', 0x2260 => '!=',
+            0x2248 => '~', 0x2212 => '-', 0x2713 => 'OK', 0x2714 => 'OK', 0x2705 => 'OK', 0x2611 => 'OK', 0x2717 => 'X', 0x2718 => 'X',
+            0x274C => 'X', 0x2032 => "'", 0x2033 => '"', 0x0131 => 'i', 0x0142 => 'l', 0x0141 => 'L', 0x0111 => 'd', 0x0110 => 'D',
+            0x0127 => 'h', 0x0126 => 'H',
+            // Superscripts: « 10⁶ » must not become « 106 » (review, 28/09). ¹ ² ³ exist in Latin-1.
+            0x2070 => '^0', 0x2074 => '^4', 0x2075 => '^5', 0x2076 => '^6', 0x2077 => '^7', 0x2078 => '^8', 0x2079 => '^9', 0x207A => '^+', 0x207B => '^-',
+            0x2605 => '*', 0x2606 => '*', 0x2610 => '[ ]', 0x2611 => '[x]', 0x2612 => '[x]', 0x221E => 'inf', 0x221A => 'sqrt', 0x2211 => 'sum',
+            0x20B9 => 'INR', 0x20BD => 'RUB', 0x20BF => 'BTC', 0x2153 => '1/3', 0x2154 => '2/3'];
+        $foreign = 0;
+        $cache = [];
+        $convert = static function (array $m) use (&$foreign, &$cache, $cp1252, $ascii): string {
+            $ch = $m[0];
+            if (!isset($cache[$ch])) {
+                $cp = mb_ord($ch, 'UTF-8');
+                $out = null;
+                if ($cp === false) $out = ['', false];
+                elseif ($cp >= 0xA0 && $cp <= 0xFF) $out = [chr($cp), false];
+                elseif (isset($cp1252[$cp])) $out = [chr($cp1252[$cp]), false];
+                elseif (isset($ascii[$cp])) $out = [$ascii[$cp], false];
+                elseif (preg_match('/^\p{Zs}$/u', $ch)) $out = [' ', false];
+                elseif (preg_match('/^[\p{Zl}\p{Zp}]$/u', $ch)) $out = ["\n", false];
+                if ($out === null && class_exists(\Normalizer::class)) {
+                    // Compatibility decomposition: ş -> s, ₂ -> 2, ﬁ -> fi, ℃ -> °C, full-width letters -> ASCII.
+                    $k = \Normalizer::normalize($ch, \Normalizer::FORM_KD);
+                    $k = is_string($k) ? (preg_replace('/\p{Mn}+/u', '', $k) ?? '') : '';
+                    if ($k !== '' && preg_match('/^[\x{20}-\x{7E}\x{A0}-\x{FF}]+$/u', $k)) $out = [(string)mb_convert_encoding($k, 'ISO-8859-1', 'UTF-8'), false];
+                }
+                if ($out === null) {
+                    if (preg_match('/^\p{L}$/u', $ch)) $out = ['?', true];               // a letter of another script
+                    elseif (preg_match('/^\p{N}$/u', $ch)) $out = ['?', false];
+                    elseif (preg_match('/^\p{Pd}$/u', $ch)) $out = ['-', false];
+                    elseif (preg_match('/^[\p{Pi}\p{Pf}]$/u', $ch)) $out = ['"', false];
+                    else $out = ['', false];     // emoji, symbols, combining marks, control and format characters
+                }
+                $cache[$ch] = $out;
+            }
+            if ($cache[$ch][1]) $foreign++;
+            return $cache[$ch][0];
+        };
+        $text = preg_replace_callback('/[^\x{20}-\x{7E}\n]/u', $convert, $text);
+        if (!is_string($text)) throw new \RuntimeException('text is not valid UTF-8');
+        // A document IN another script is refused (orient to .docx); a few Greek letters or an Arabic word in a
+        // French report are not: they print as "?" and createFile() warns (review, 28/09: a count alone refused
+        // a technical report with α β γ Δ λ σ).
+        if ($foreign > 5 && $foreign > 0.02 * max(1, strlen($text))) throw new \RuntimeException('non-Latin text');
+        $replaced = $foreign;
+        // From here on $text holds single-byte WinAnsi: no more /u regexes.
+
+        // ---- 2. Metrics (Adobe AFM widths, 1/1000 em, WinAnsi codes 32-255) --------------------
+        $afm = static fn(string $csv): array => array_merge(array_fill(0, 32, 0), array_map('intval', explode(',', $csv)));
+        $widths = [
+            'F1' => $afm('278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,278,278,584,584,584,556,1015,667,667,722,722,667,611,778,722,278,500,667,556,833,722,778,667,778,722,667,611,722,667,944,667,667,611,278,278,278,469,556,333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,556,556,333,500,278,556,500,722,500,500,500,334,260,334,584,350,556,350,222,556,333,1000,556,556,333,1000,667,333,1000,350,611,350,350,222,222,333,333,350,556,1000,333,1000,500,333,944,350,500,667,278,333,556,556,556,556,260,556,333,737,370,556,584,333,737,333,400,584,333,333,333,556,537,278,333,333,365,556,834,834,834,611,667,667,667,667,667,667,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,500,556,556,556,556,278,278,278,278,556,556,556,556,556,556,556,584,611,556,556,556,556,500,556,500'),
+            'F2' => $afm('278,333,474,556,556,889,722,238,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,333,333,584,584,584,611,975,722,722,722,722,667,611,778,722,278,556,722,611,833,722,778,667,778,722,667,611,722,667,944,667,667,611,333,278,333,584,556,333,556,611,556,611,556,333,611,611,278,278,556,278,889,611,611,611,611,389,556,333,611,556,778,556,556,500,389,280,389,584,350,556,350,278,556,500,1000,556,556,333,1000,667,333,1000,350,611,350,350,278,278,500,500,350,556,1000,333,1000,556,333,944,350,500,667,278,333,556,556,556,556,280,556,333,737,370,556,584,333,737,333,400,584,333,333,333,611,556,278,333,333,365,556,834,834,834,611,722,722,722,722,722,722,1000,722,667,667,667,667,278,278,278,278,722,722,778,778,778,778,778,584,778,722,722,722,722,667,667,611,556,556,556,556,556,556,889,556,556,556,556,556,278,278,278,278,611,611,611,611,611,611,611,584,611,611,611,611,611,556,611,556'),
+            'F3' => array_fill(0, 256, 600),
+        ];
+        $measure = static function (string $s, string $font, float $size) use ($widths): float {
+            $table = $widths[$font];
+            $w = 0;
+            for ($i = 0, $n = strlen($s); $i < $n; $i++) $w += $table[ord($s[$i])];
+            return $w * $size / 1000;
+        };
+        $pageW = 595; $pageH = 842; $margin = 56;
+        $maxW = $pageW - 2 * $margin;
+        $top = $pageH - $margin; $bottom = $margin;
+
+        // Inline Markdown -> runs [[font, text], ...]: **bold**, [label](url), `code` markers.
+        $inline = static function (string $s, bool $bold = false): array {
+            $s = preg_replace('/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/', '$1 ($2)', $s) ?? $s;
+            $parts = explode('**', str_replace('`', '', $s));
+            if (count($parts) % 2 === 0) {         // odd number of markers: the last one is literal
+                $last = array_pop($parts);
+                $parts[count($parts) - 1] .= '**' . $last;
+            }
+            $runs = [];
+            foreach ($parts as $i => $p) {
+                if ($p !== '') $runs[] = [($bold || $i % 2 === 1) ? 'F2' : 'F1', $p];
+            }
+            return $runs;
+        };
+        // Greedy word wrap on real widths; a word wider than the line is cut character by
+        // character (always at least one character per line: no infinite loop).
+        $wrap = static function (array $runs, float $size, float $width) use ($measure): array {
+            $lines = []; $cur = []; $curW = 0.0; $sep = []; $sepW = 0.0; $word = []; $wordW = 0.0;
+            $runs[] = ['', ' '];                     // sentinel: a space closes the last word
+            foreach ($runs as [$font, $str]) {
+                foreach (preg_split('/( +)/', $str, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [] as $tok) {
+                    if ($tok[0] !== ' ') {
+                        $word[] = [$font, $tok];
+                        $wordW += $measure($tok, $font, $size);
+                        continue;
+                    }
+                    if ($word !== []) {
+                        if ($cur !== [] && $curW + $sepW + $wordW <= $width + 0.001) {
+                            foreach ($sep as $r) $cur[] = $r;
+                            foreach ($word as $r) $cur[] = $r;
+                            $curW += $sepW + $wordW;
+                        } else {
+                            if ($cur !== []) { $lines[] = $cur; $cur = []; $curW = 0.0; }
+                            if ($wordW <= $width + 0.001) {
+                                $cur = $word; $curW = $wordW;
+                            } else {
+                                foreach ($word as [$f, $t]) {
+                                    for ($i = 0, $n = strlen($t); $i < $n; $i++) {
+                                        $cw = $measure($t[$i], $f, $size);
+                                        if ($cur !== [] && $curW + $cw > $width + 0.001) { $lines[] = $cur; $cur = []; $curW = 0.0; }
+                                        $k = count($cur) - 1;
+                                        if ($k >= 0 && $cur[$k][0] === $f) $cur[$k][1] .= $t[$i]; else $cur[] = [$f, $t[$i]];
+                                        $curW += $cw;
+                                    }
+                                }
+                            }
+                        }
+                        $word = []; $wordW = 0.0; $sep = []; $sepW = 0.0;
+                    }
+                    // Runs of spaces collapse to one (proportional text: spaces cannot align anything).
+                    if ($font !== '' && $cur !== [] && $sep === []) { $sep[] = [$font, ' ']; $sepW = $measure(' ', $font, $size); }
+                }
+            }
+            if ($cur !== []) $lines[] = $cur;
+            return $lines;
+        };
+
+        // ---- 3. Blocks -> items (one item = one printed line, or a vertical gap) --------------
+        $items = [];
+        $gap = static function (float $h) use (&$items): void {
+            $k = count($items) - 1;
+            if ($k >= 0 && isset($items[$k]['gap'])) $items[$k]['gap'] = max($items[$k]['gap'], $h);
+            else $items[] = ['gap' => $h];
+        };
+        $add = static function (array $runs, float $size, float $lead, float $x, ?array $label = null, bool $keep = false) use (&$items, $wrap, $margin, $maxW): void {
+            foreach ($wrap($runs, $size, $maxW - ($x - $margin)) as $n => $l) {
+                $items[] = ['h' => $lead, 'size' => $size, 'x' => $x, 'runs' => $l, 'label' => $n === 0 ? $label : null, 'keep' => $keep];
+                if (count($items) > 60000) throw new \RuntimeException('document too long (more than about 1000 pages)');
+            }
+        };
+        $mono = static function (string $s, float $size) use (&$items, $margin, $maxW): void {
+            $chars = max(1, (int)floor($maxW / (0.6 * $size)));
+            foreach ($s === '' ? [''] : str_split($s, $chars) as $chunk) {
+                $items[] = ['h' => $size * 1.3, 'size' => $size, 'x' => $margin, 'runs' => $chunk === '' ? [] : [['F3', $chunk]], 'label' => null, 'keep' => false];
+                if (count($items) > 60000) throw new \RuntimeException('document too long (more than about 1000 pages)');
+            }
+        };
+        $src = explode("\n", $text);
+        $count = count($src);
+        $inCode = '';     // the fence that opened the current code block ('```' or '~~~'), '' outside
+        for ($i = 0; $i < $count; $i++) {
+            $raw = rtrim($src[$i], ' ');
+            // A fence is a line of its own (optionally a language name): "```ls -la``` lists files" is text (review, 28/09).
+            if (preg_match('/^\s*(```|~~~)[\w+#.-]*\s*$/', $raw, $fence) && ($inCode === '' || $inCode === $fence[1])) {
+                $inCode = $inCode === '' ? $fence[1] : '';
+                $gap(4);
+                continue;
+            }
+            if ($inCode !== '') { $mono($raw, 9); continue; }
+            $t = trim($raw);
+            if ($t === '') { $gap(6); continue; }
+            if ($t[0] === '|') {
+                // Consecutive table rows, rendered in Courier with padded, aligned columns.
+                $rows = [];
+                for ($first = $i; $i < $count && ($row = trim($src[$i])) !== '' && $row[0] === '|'; $i++) {
+                    $row = substr($row, 1, str_ends_with($row, '|') && !str_ends_with($row, '\\|') && strlen($row) > 1 ? -1 : null);
+                    $cells = array_map(static fn(string $c): string => trim(str_replace(['**', '`', '\\|'], ['', '', '|'], $c)), preg_split('/(?<!\\\\)\|/', $row) ?: [$row]);
+                    // Only the 2nd line of a table can be the |---|:--:| separator: a data row "| - | - |" is kept (review, 28/09).
+                    if ($i === $first + 1 && array_filter($cells, static fn(string $c): bool => !preg_match('/^:?-+:?$/', $c)) === []) continue;
+                    $rows[] = $cells;
+                }
+                $i--;
+                if ($rows === []) continue;
+                $colW = [];
+                foreach ($rows as $cells) foreach ($cells as $c => $v) $colW[$c] = max($colW[$c] ?? 0, strlen($v));
+                if (count($colW) > 40) throw new \RuntimeException('table has too many columns (max 40)');
+                $total = array_sum($colW) + 3 * (count($colW) - 1);
+                if ($total > (int)floor($maxW / 3.6)) {
+                    // Wider than the page even at 6 pt (3.6 pt per Courier char): aligning is pointless; too wide to align anyway: plain "a | b | c" rows, no padding (padding every row to the widest cell
+                    // could blow memory up, review 28/09).
+                    $gap(4);
+                    foreach ($rows as $cells) $mono(implode(' | ', $cells), 6.0);
+                    $gap(4);
+                    continue;
+                }
+                $size = max(6.0, min(9.0, $maxW / (0.6 * max(1, $total))));
+                $gap(4);
+                foreach ($rows as $r => $cells) {
+                    $line = [];
+                    foreach ($colW as $c => $w) $line[] = str_pad($cells[$c] ?? '', $w);
+                    $mono(rtrim(implode(' | ', $line)), $size);
+                    if ($r === 0 && count($rows) > 1) {
+                        $mono(implode('-+-', array_map(static fn(int $w): string => str_repeat('-', $w), $colW)), $size);
+                    }
+                }
+                $gap(4);
+                continue;
+            }
+            if (preg_match('/^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/', $raw, $m)) {
+                $size = [1 => 18.0, 2 => 15.0][strlen($m[1])] ?? 13.0;
+                $gap($size * 0.7);
+                $add($inline($m[2], true), $size, $size * 1.3, $margin, null, true);
+                $gap(3);
+                continue;
+            }
+            if (preg_match('/^\s*([-*_])(?:\s*\1){2,}\s*$/', $raw)) {
+                $items[] = ['h' => 12.0, 'rule' => true];
+                continue;
+            }
+            if (preg_match('/^(\s*)([-*+\x95]|\d{1,3}[.)])\s+(.*)$/', $raw, $m)) {
+                $x0 = $margin + 16 * min(3, intdiv(strlen($m[1]), 2));
+                $label = ctype_digit($m[2][0]) ? $m[2] : "\x95";
+                $x = $x0 + max(14.0, $measure($label, 'F1', 11) + 5);
+                $add($inline(trim($m[3])), 11, 15.4, $x, [$x0, 'F1', $label]);
+                continue;
+            }
+            if (preg_match('/^\s*>\s?(.*)$/', $raw, $m)) {
+                $add($inline(trim($m[1])), 11, 15.4, $margin + 16);
+                continue;
+            }
+            $add($inline($t), 11, 15.4, $margin);
+        }
+
+        // ---- 4. Pagination -> one content stream per page --------------------------------------
+        $esc = static fn(string $s): string => strtr($s, ['\\' => '\\\\', '(' => '\\(', ')' => '\\)']);
+        $pages = [];
+        $ops = '';
+        $y = $top;
+        foreach ($items as $it) {
+            if (isset($it['gap'])) {
+                if ($y < $top) $y -= $it['gap'];      // no gap at the top of a page
+                continue;
+            }
+            $need = $it['h'] + (!empty($it['keep']) ? 2 * 15.4 : 0);   // keep a heading with what follows
+            if ($y - $need < $bottom && $y < $top) {
+                $pages[] = $ops; $ops = ''; $y = $top;
+            }
+            $y -= $it['h'];
+            if (!empty($it['rule'])) {
+                $ry = $y + $it['h'] / 2;
+                $ops .= sprintf("0.6 w 0.6 G %.2F %.2F m %.2F %.2F l S 0 G\n", $margin, $ry, $margin + $maxW, $ry);
+                continue;
+            }
+            $base = $y + $it['h'] / 2 - 0.25 * $it['size'];
+            if ($it['label'] !== null) {
+                [$lx, $lf, $lt] = $it['label'];
+                $ops .= sprintf('BT /%s %.2F Tf %.2F %.2F Td (', $lf, $it['size'], $lx, $base) . $esc($lt) . ") Tj ET\n";
+            }
+            if ($it['runs'] !== []) {
+                $line = sprintf('BT %.2F %.2F Td', $it['x'], $base);
+                $font = ''; $buf = '';
+                foreach ($it['runs'] as [$f, $s]) {
+                    if ($f !== $font) {
+                        if ($buf !== '') { $line .= ' (' . $esc($buf) . ') Tj'; $buf = ''; }
+                        $line .= sprintf(' /%s %.2F Tf', $f, $it['size']);
+                        $font = $f;
+                    }
+                    $buf .= $s;
+                }
+                if ($buf !== '') $line .= ' (' . $esc($buf) . ') Tj';
+                $ops .= $line . " ET\n";
+            }
+        }
+        $pages[] = $ops;
+
+        // ---- 5. Objects, cross-reference table, trailer ------------------------------------------
+        $np = count($pages);
+        $kids = [];
+        for ($p = 0; $p < $np; $p++) $kids[] = (7 + 2 * $p) . ' 0 R';
+        $objs = [
+            1 => '<< /Type /Catalog /Pages 2 0 R >>',
+            2 => '<< /Type /Pages /Kids [' . implode(' ', $kids) . '] /Count ' . $np . ' >>',
+            3 => '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
+            4 => '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>',
+            5 => '<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>',
+            6 => '<< /Producer (EVA - Nextcloud assistant) >>',
+        ];
+        foreach ($pages as $p => $content) {
+            $footer = ($p + 1) . ' / ' . $np;
+            $content .= sprintf("0.45 g\nBT /F1 9.00 Tf %.2F 28.00 Td (%s) Tj ET\n0 g\n", ($pageW - $measure($footer, 'F1', 9)) / 2, $footer);
+            $data = function_exists('gzcompress') ? gzcompress($content, 6) : false;
+            $filter = is_string($data) ? ' /Filter /FlateDecode' : '';
+            if (!is_string($data)) $data = $content;
+            $objs[7 + 2 * $p] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' . $pageW . ' ' . $pageH . '] '
+                . '/Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents ' . (8 + 2 * $p) . ' 0 R >>';
+            $objs[8 + 2 * $p] = '<< /Length ' . strlen($data) . $filter . " >>\nstream\n" . $data . "\nendstream";
+        }
+        $pdf = "%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
+        $size = count($objs) + 1;                    // + object 0 (head of the free list)
+        $offsets = [];
+        for ($id = 1; $id < $size; $id++) {
+            $offsets[$id] = strlen($pdf);
+            $pdf .= $id . " 0 obj\n" . $objs[$id] . "\nendobj\n";
+        }
+        $xref = strlen($pdf);
+        $pdf .= "xref\n0 " . $size . "\n0000000000 65535 f \n";
+        for ($id = 1; $id < $size; $id++) $pdf .= sprintf("%010d 00000 n \n", $offsets[$id]);
+        return $pdf . "trailer\n<< /Size " . $size . " /Root 1 0 R /Info 6 0 R >>\nstartxref\n" . $xref . "\n%%EOF\n";
     }
 
     /** Create several files while preserving per-file validation/results. */
@@ -2087,12 +2473,28 @@ class ActionExecutor {
         }
         $node = $this->resolve($home, $path);
         $parent = $node->getParent();
+        if (($error = $this->binaryExtensionChangeError($path, $newName, 'renaming', 'renamed')) !== null) {
+            return ['ok' => false, 'error' => $error];
+        }
         if ($parent->nodeExists($newName)) {
             return ['ok' => false, 'error' => 'Target name already exists'];
         }
         $node->move($parent->getPath() . '/' . $newName);
         $this->bumpSearchRevision();
         return ['ok' => true, 'result' => 'Renamed to ' . $newName];
+    }
+
+    /**
+     * Same rule as createFile: a text file renamed, moved or copied to .pdf/.xlsx/… is a corrupt file under a
+     * trusted name. Returns the error to give back, or null when the extension does not change into a binary one.
+     */
+    private function binaryExtensionChangeError(string $fromPath, string $toName, string $verb, string $done): ?string {
+        $toExt = strtolower(pathinfo($toName, PATHINFO_EXTENSION));
+        if (in_array($toExt, ['pdf', 'doc', 'docx', 'docm', 'xls', 'xlsx', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'], true)
+            && strtolower(pathinfo($fromPath, PATHINFO_EXTENSION)) !== $toExt) {
+            return 'Changing a file into .' . $toExt . ' by ' . $verb . ' is not allowed: the content would not be a real .' . $toExt . ' file. Nothing was ' . $done . '. To get a real .' . $toExt . ', read the source with extract_file_text and call create_file with the .' . $toExt . ' name.';
+        }
+        return null;
     }
 
     /** Move a file or folder to a new relative path, creating destination folders. */
@@ -2110,6 +2512,9 @@ class ActionExecutor {
         $targetName = $this->cleanName($targetName);
         if ($targetName === '') {
             return ['ok' => false, 'error' => 'A valid target name is required'];
+        }
+        if ($node instanceof File && ($error = $this->binaryExtensionChangeError($path, $targetName, 'moving', 'moved')) !== null) {
+            return ['ok' => false, 'error' => $error];
         }
         $destination = $this->ensureFolderPath($home, $targetDir);
         if ($destination->nodeExists($targetName)) {
@@ -2134,6 +2539,9 @@ class ActionExecutor {
         [$targetDir, $targetName] = $this->splitPath($targetPath);
         $targetName = $this->cleanName($targetName);
         if ($targetName === '') return ['ok' => false, 'error' => 'A valid target name is required'];
+        if ($node instanceof File && ($error = $this->binaryExtensionChangeError($path, $targetName, 'copying', 'copied')) !== null) {
+            return ['ok' => false, 'error' => $error];
+        }
         $destination = $this->ensureFolderPath($home, $targetDir);
         if ($destination->nodeExists($targetName)) return ['ok' => false, 'error' => 'Target already exists'];
         $node->copy($destination->getPath() . '/' . $targetName);

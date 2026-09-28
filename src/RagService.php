@@ -40,6 +40,36 @@ class RagService {
     private array $toolImages = [];
     /** @var array<int,array{name:string,url:string,download_url:string}> files written in this answer, by file id */
     private array $createdFiles = [];
+    /** True once the model called a file-writing tool in this answer, even if the write failed. */
+    private bool $fileToolAttempted = false;
+    /** Set by removeUnbackedFileLinks() for the current answer. */
+    private bool $removedFileLinks = false;
+    /** A tool that writes to the user's files succeeded in this answer. */
+    private bool $writeToolSucceeded = false;
+    /** @var array<string,true> tools called (or forced) in this answer, by name */
+    private array $calledTools = [];
+    private const SEARCH_NUDGE = '[Automatic check by EVA, not written by the user] You DO have the web_search tool and it works: never say you cannot '
+        . 'access the web or real-time news, and do not offer to search. Call web_search now with a short query for the user\'s request, then '
+        . 'answer from the results in the language of the user\'s request.';
+    private const WEATHER_NUDGE = '[Automatic check by EVA, not written by the user] You answered a weather question without calling the `weather` '
+        . 'tool, so any figure you gave is invented. Call `weather` now with the place from the request (ask the user only if no place is given), '
+        . 'then answer from its result in the language of the user\'s request.';
+    /** Tools a call written as text may run (recoverTextToolCalls): creation, search and read only. */
+    private const RECOVERABLE_TOOLS = ['create_file', 'create_files', 'create_note', 'create_folder', 'web_search', 'weather', 'current_time',
+        'read_file', 'extract_file_text', 'search_files', 'list_files', 'list_calendar_events'];
+    private const WRITE_TOOLS = ['create_file', 'create_files', 'create_note', 'copy_file', 'move_file', 'rename_file', 'restore_file_version', 'create_sticker'];
+
+    /**
+     * Sent (at most twice) when the user asked for a file and the model answered without
+     * calling any tool: on 28/09 it replied "I have created Rendezvous_list.xlsx"
+     * with invented links while nothing had been written. Measured on the real
+     * vLLM (28/09): 8/9 correct (reads the calendar first, then writes); a
+     * shorter version made it write invented appointments.
+     */
+    private const CREATION_NUDGE = '[Automatic check by EVA, not written by the user] Nothing was done: you answered without calling any tool, so no file exists '
+        . 'and any link you wrote is invalid. Do it now, in this order: (1) if the file must contain the user\'s own data (calendar events, '
+        . 'mails, tasks, contacts, files), FIRST call the tool that reads that data (e.g. list_calendar_events for appointments) - never write '
+        . 'data you have not read with a tool; (2) then call create_file with that real content. Answer in the language of the user\'s request.';
 
     public function __construct(
         private AppConfig $config,
@@ -94,6 +124,9 @@ class RagService {
         $this->toolSources = [];
         $this->toolImages = [];
         $this->createdFiles = [];
+        $this->fileToolAttempted = false;
+        $this->writeToolSucceeded = false;
+        $this->calledTools = [];
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -111,7 +144,17 @@ class RagService {
 		// the model must never receive mutating tools for a read-only run.
 		$tools = $allowActions && $this->actionsEnabled() ? $this->executor->tools() : [];
 		$messages = $this->buildMessages($userId, $message, $history, $context, count($results), $tools !== [], $instructions, $persona, $this->dateContext($userId), $extraContext);
+		$intent = $this->requestIntent($message, $history);
 		$seenToolCalls = [];
+		$nudges = 0;
+		$forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
+		if ($forced !== null && ($shouldStop === null || !$shouldStop())) {
+			if ($onProgress !== null) $onProgress('tool', 'web_search', $forced);
+			$startedAt = microtime(true);
+			$res = $this->runForcedWebSearch($userId, $forced, $messages);
+			// Always close the trace entry, even when nothing was injected.
+			if ($onProgress !== null) $onProgress('tool_result', 'web_search', ['ok' => !empty($res['ok']), 'error' => $res === null ? 'skipped' : mb_substr((string)($res['error'] ?? ''), 0, 300), 'result' => $this->safeToolResult($res['result'] ?? null), 'elapsed_ms' => max(0, (int)round((microtime(true) - $startedAt) * 1000))]);
+		}
 
         for ($round = 0; $round < $maxToolRounds; $round++) {
             if ($shouldStop !== null && $shouldStop()) return ['answer' => '', 'sources' => $this->answerSources($byDoc), 'model' => $this->config->get('chat_model'), 'error' => 'cancelled', 'followups' => []];
@@ -122,10 +165,20 @@ class RagService {
 			if (isset($chat['error'])) {
 				return ['answer' => '', 'sources' => $this->answerSources($byDoc), 'model' => $this->config->get('chat_model'), 'error' => $chat['error'], 'followups' => []];
 			}
+			if (($chat['tool_calls'] ?? []) === [] && !$autonomousActions && ($recovered = $this->recoverTextToolCalls((string)($chat['answer'] ?? ''), $tools, $messages)) !== null) {
+				[$chat['tool_calls'], $chat['raw_tool_calls'], $chat['answer']] = $recovered;
+			}
 			$toolCalls = $chat['tool_calls'] ?? [];
 			if ($toolCalls === []) {
+				$nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($intent, (string)($chat['answer'] ?? ''), $tools) : null;
+				if ($nudge !== null) {
+					$nudges++;
+					$messages[] = ['role' => 'assistant', 'content' => (string)($chat['answer'] ?? '')];
+					$messages[] = ['role' => 'user', 'content' => $nudge];
+					continue;
+				}
 				$answer = $chat['answer'] ?? '';
-				$answer = $this->appendFileLinks($this->appendImageMarkdown((string)$answer));
+				$answer = $this->finishAnswer($userId, $intent, (string)$answer, $messages);
 				return [
 					'answer' => $answer,
 					'sources' => $this->answerSources($byDoc),
@@ -145,11 +198,12 @@ class RagService {
                     : $tc['arguments'];
                 if ($onProgress !== null) $onProgress('tool', (string)($tc['name'] ?? ''), is_array($toolArgs) ? $toolArgs : []);
 				$toolStartedAt = microtime(true);
-				$res = $seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
+				$overwrite = !empty($tc['recovered']) ? $this->recoveredOverwrite($userId, $tc) : null;
+				$res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
 					? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
 						: ($autonomousActions
 							? $this->executor->runConfirmed($userId, $tc['name'], $toolArgs)
-							: $this->executor->run($userId, $tc['name'], $toolArgs));
+							: $this->executor->run($userId, $tc['name'], $toolArgs)));
 				if ($onProgress !== null) $onProgress('tool_result', (string)($tc['name'] ?? ''), [
 					'ok' => !empty($res['ok']),
 					'error' => mb_substr((string)($res['error'] ?? ''), 0, 300),
@@ -159,6 +213,7 @@ class RagService {
 					'result' => $this->safeToolResult($res['result'] ?? null),
 					'elapsed_ms' => max(0, (int)round((microtime(true) - $toolStartedAt) * 1000)),
 				]);
+				$res = $this->explainUnknownTool($res);
 				$this->collectToolSources($tc['name'], $res);
 				if (!empty($res['confirmation_required'])) {
 					$confirmationName = (string)($res['tool'] ?? $tc['name'] ?? '');
@@ -192,7 +247,7 @@ class RagService {
         // tool chain into an empty reply was the worst possible outcome.
         $final = $this->ollama->chat($messages, []);
         $answer = trim((string)($final['answer'] ?? ''));
-        $answer = $this->appendFileLinks($this->appendImageMarkdown($answer));
+        $answer = $this->finishAnswer($userId, $intent, $answer, $messages);
         if ($answer !== '') {
             return [
                 'answer' => $answer,
@@ -222,6 +277,9 @@ class RagService {
             $this->toolSources = [];
             $this->toolImages = [];
             $this->createdFiles = [];
+            $this->fileToolAttempted = false;
+            $this->writeToolSucceeded = false;
+            $this->calledTools = [];
         try {
             if ($this->clientDisconnected()) {
                 return;
@@ -239,13 +297,31 @@ class RagService {
 $this->executor->setUserId($userId);
             $tools = $this->actionsEnabled() ? $this->executor->tools() : [];
             $messages = $this->buildMessages($userId, $message, $history, $context, count($results), $tools !== [], $instructions, $persona, $this->dateContext($userId));
+            $intent = $this->requestIntent($message, $history);
 
             $answer = '';
             $model = $this->ollama->selectedChatModel();
             $toolActivity = false;
             $toolFailure = false;
             $seenToolCalls = [];
+            $nudges = 0;
+            // When a file is requested, the model's text is not streamed live: if it only claims the file, the
+            // retry replaces it, and the browser never shows the invented text (it gets `done.answer`).
+            $holdText = $this->isFileCreationRequest($intent) || $this->isWeatherQuestion($intent);
 			$requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
+            $forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
+            if ($forced !== null && !$this->clientDisconnected()) {
+                yield json_encode(['type' => 'tool', 'name' => 'web_search', 'arguments' => $this->safeToolArguments($forced)], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+                $startedAt = microtime(true);
+                $res = $this->runForcedWebSearch($userId, $forced, $messages);
+                $toolActivity = $res !== null;
+                // Always close the trace entry, even when nothing was injected, so it never stays "running".
+                yield json_encode(['type' => 'tool_result', 'name' => 'web_search', 'ok' => !empty($res['ok']), 'error' => $res === null ? 'skipped' : ($res['error'] ?? null), 'url' => null,
+                    'result' => $this->safeToolResult($res['result'] ?? null), 'elapsed_ms' => max(0, (int)round((microtime(true) - $startedAt) * 1000))], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+                if ($this->clientDisconnected()) {
+                    return;
+                }
+            }
 			$maxToolRounds = max((int)AppConfig::LIMITS['agent_max_tool_rounds'][0], min($this->config->getInt('agent_max_tool_rounds', self::MAX_TOOL_ROUNDS), (int)AppConfig::LIMITS['agent_max_tool_rounds'][1]));
 			for ($round = 0; $round < $maxToolRounds; $round++) {
 				if (microtime(true) >= $requestDeadline) {
@@ -262,7 +338,9 @@ $this->executor->setUserId($userId);
                     $evType = $ev['type'] ?? '';
                     if ($evType === 'content') {
                         $answer .= $ev['delta'] ?? '';
-                        yield json_encode(['type' => 'content', 'delta' => $ev['delta'] ?? '']) . "\n";
+                        if (!$holdText) {
+                            yield json_encode(['type' => 'content', 'delta' => $ev['delta'] ?? '']) . "\n";
+                        }
                     } elseif ($evType === 'thinking') {
                         yield json_encode(['type' => 'thinking', 'delta' => $ev['delta'] ?? '']) . "\n";
                     } elseif ($evType === 'tool_calls') {
@@ -276,7 +354,19 @@ $this->executor->setUserId($userId);
                 if ($this->clientDisconnected()) {
                     return;
                 }
+                if ($toolCalls === [] && ($recovered = $this->recoverTextToolCalls($answer, $tools, $messages)) !== null) {
+                    [$toolCalls, $rawToolCalls, $answer] = $recovered;
+                }
                 if ($toolCalls === []) {
+                    $nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($intent, $answer, $tools) : null;
+                    if ($nudge !== null) {
+                        // Not streamed (see $holdText): the browser never shows the invented text.
+                        $nudges++;
+                        $messages[] = ['role' => 'assistant', 'content' => $answer];
+                        $messages[] = ['role' => 'user', 'content' => $nudge];
+                        $answer = '';
+                        continue;
+                    }
                     break;
                 }
                 $messages[] = ['role' => 'assistant', 'content' => $answer, 'tool_calls' => $this->canonicalToolCalls($rawToolCalls)];
@@ -297,9 +387,11 @@ $this->executor->setUserId($userId);
                     $toolStartedAt = microtime(true);
                     $fingerprint = hash('sha256', $toolName . ':' . json_encode($toolArgs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
                     $seenToolCalls[$fingerprint] = ($seenToolCalls[$fingerprint] ?? 0) + 1;
-                    $res = $seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
+                    $overwrite = !empty($tc['recovered']) ? $this->recoveredOverwrite($userId, $tc) : null;
+                    $res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
                         ? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
-                        : $this->executor->run($userId, $toolName, $toolArgs);
+                        : $this->executor->run($userId, $toolName, $toolArgs));
+                    $res = $this->explainUnknownTool($res);
                     $this->collectToolSources($toolName, $res);
                     $toolFailure = $toolFailure || empty($res['ok']);
 					if (!empty($res['confirmation_required'])) {
@@ -349,7 +441,7 @@ $this->executor->setUserId($userId);
                 yield json_encode(['type' => 'error', 'message' => 'No text response received from Ollama.']) . "\n";
                 return;
             }
-            $answer = $this->appendFileLinks($this->appendImageMarkdown($answer));
+            $answer = $this->finishAnswer($userId, $intent, $answer, $messages);
             yield json_encode([
                 'type' => 'done',
                 'answer' => $answer,
@@ -378,6 +470,15 @@ $this->executor->setUserId($userId);
      * @param array<string,mixed> $res the tool result envelope
      */
     private function collectToolSources(string $toolName, array $res): void {
+        $this->calledTools[$toolName] = true;
+        // Any tool that writes to the user's files counts as an attempt; a successful one also cancels the
+        // "no file was created" notice (copy, move, restore… do not fill $createdFiles).
+        if (in_array($toolName, self::WRITE_TOOLS, true)) {
+            $this->fileToolAttempted = true;
+            if (!empty($res['ok'])) {
+                $this->writeToolSucceeded = true;
+            }
+        }
         // File writes carry their links in `file`, next to the unchanged
         // `result` text (see ActionExecutor::fileLinks()).
         if ($toolName === 'create_files' && is_array($res['result']['files'] ?? null)) {
@@ -521,6 +622,553 @@ $this->executor->setUserId($userId);
             $lines[] = '… +' . (count($this->createdFiles) - $max) . ' ' . $labels[2];
         }
         return $lines === [] ? $answer : rtrim($answer) . "\n\n" . implode("\n", $lines);
+    }
+
+    /*
+     * Anti-invention guards (28/09). With vLLM, the model regularly answers from
+     * memory instead of calling a tool: "latest version of X" without web_search,
+     * "I created the file" without create_file, with invented links. Prompt rules
+     * did not fix it (eva-corrections/PROBLEMES.md §4 bis), so these checks are
+     * done by code and do not depend on the model or on the provider.
+     * v2 after an adversarial review: the web detector is deliberately narrow
+     * (the question leaves the instance), and the file check reacts to an
+     * invented CLAIM, not to the request alone.
+     */
+
+    /**
+     * Final touches shared by every answer path: invented file links are struck
+     * out, a creation claim with no file behind it gets a warning, then images
+     * and the real file links are attached.
+     */
+    private function finishAnswer(string $userId, string $message, string $answer, array $messages): string {
+        $this->removedFileLinks = false;
+        // The history marker is internal: a model copying it (seen 28/09) must not show it to the user.
+        $answer = (string)preg_replace('~^[ \t]*\[EVA:\s*file\s+created[^\n]*\][ \t]*\R?|[ \t]*\[EVA:\s*file\s+created[^\n]*\]~imu', '', $answer);
+        $answer = rtrim(ltrim($answer, "\r\n"));
+        $answer = $this->removeUnbackedFileLinks($userId, $answer, $messages);
+        $lang = substr($this->uiLanguage(), 0, 2);
+        if ($this->removedFileLinks) {
+            $answer = trim(trim($answer) . "\n\n" . match ($lang) {
+                'fr' => '⚠️ Attention : aucun fichier correspondant n\'a été créé ni trouvé — le lien ci-dessus n\'était pas fiable. Redemandez si besoin.',
+                'ar' => '⚠️ تنبيه: لم يتم إنشاء أو العثور على أي ملف مطابق — الرابط أعلاه غير موثوق. أعد الطلب إذا لزم الأمر.',
+                'de' => '⚠️ Achtung: Es wurde keine passende Datei erstellt oder gefunden – der Link oben war nicht zuverlässig. Bitte erneut anfragen.',
+                default => '⚠️ Warning: no matching file was created or found — the link above was not reliable. Please ask again if needed.',
+            });
+        } elseif ($this->createdFiles === [] && !$this->writeToolSucceeded && $this->isFileCreationRequest($message)) {
+            // A file was asked for and none was written. Recognising every way a model can CLAIM a file is a
+            // losing game (second review, 28/09), so the fact is stated instead: always true in this case, also
+            // when the answer is a legitimate in-chat text.
+            $answer = trim(trim($answer) . "\n\n" . match ($lang) {
+                'fr' => 'ℹ️ Aucun fichier n\'a été créé pour cette demande : le contenu ci-dessus existe seulement dans la conversation.',
+                'ar' => 'ℹ️ لم يتم إنشاء أي ملف لهذا الطلب: المحتوى أعلاه موجود في المحادثة فقط.',
+                'de' => 'ℹ️ Für diese Anfrage wurde keine Datei erstellt: Der Inhalt oben existiert nur im Chat.',
+                default => 'ℹ️ No file was created for this request: the content above only exists in the conversation.',
+            });
+        }
+        return $this->appendFileLinks($this->appendImageMarkdown($answer));
+    }
+
+    /** @param list<array<string,mixed>> $tools */
+    private function hasTool(array $tools, string $name): bool {
+        foreach ($tools as $tool) {
+            if (is_array($tool) && (($tool['function']['name'] ?? $tool['name'] ?? '') === $name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Web search to run BEFORE the model answers, or null.
+     *  - Explicit request to search the web ("cherche sur internet …"): the
+     *    user's text is sent, the user asked for it.
+     *  - Otherwise the query is REBUILT from recognised public tokens only
+     *    ("php latest version", "gold price today"): the user's words never
+     *    leave the instance, even when the detector is wrong (second review,
+     *    28/09: every blocklist of "work words" could be walked around).
+     *    Only two such cases: latest version / release of a NAMED product, and
+     *    the price or rate of a market asset. News, office holders and weather
+     *    are left to the model (weather has its own tool).
+     * Always mode "web": "all"/"news" also query the Bing/Google News feeds
+     * whatever provider the admin chose.
+     *
+     * @return array{query:string,mode:string}|null
+     */
+    private function forcedWebSearch(string $message): ?array {
+        $text = trim((string)preg_replace('/\s+/u', ' ', $message));
+        if ($text === '' || mb_strlen($text) > 200) {
+            return null;
+        }
+        $m = mb_strtolower($text);
+        // Anything that looks like the user's own work: never sent, not even as an explicit request
+        // (« rédige un mail à Paul lui demandant de vérifier sur le web… » is text to write, not a search order).
+        $work = '~(?<!\p{L})(mes|mon|ma|my|mein\p{L}*|notre|nos|our|unser\p{L}*|son|sa|ses|votre|vos|your|leur|leurs|their|r[ée]dig\p{L}*|[ée]cri[srt]\p{L}*|write|draft|mail|e-?mail|courriel|devis|contrat|contract|client\p{L}*|customer|fournisseur\p{L}*|supplier|ticket|dossier|rapport|report|budget|rh|hr|soci[ée]t[ée]|entreprise|company|filiale|subsidiary|conseil|board|association|club|r[ée]sidence|syndic|[ée]quipe|team|projet|project|facture|invoice|paie|payroll|plainte|patient|rendez-vous|rdv|salari[ée]|employ[ée]|fichier|file|document|serveur|server|instance|interne|internal|chez\s+nous)(?!\p{L})~u';
+        if (preg_match($work, $m) === 1) {
+            return null;
+        }
+        // Explicit request: an imperative addressed to EVA at the START of the message (third review, 28/09:
+        // "…qu'il a trouvé sur internet" inside a text is not an order to search).
+        $lead = '^\s*(?:(?:eva|bonjour|salut|hello|hi|stp|svp|merci)[\s,:!]+)*(?:(?:peux|pourrais|pouvez|pourriez)-?(?:tu|vous)\s+|can\s+you\s+|could\s+you\s+|please\s+)?';
+        $explicit = [
+            '~' . $lead . '(cherche|recherche|regarde|trouve|v[ée]rifie|chercher|rechercher|regarder|trouver|v[ée]rifier)(?!\p{L})[^.?!\n]{0,40}(?<!\p{L})(sur|via)\s+(le\s+|l[\'’]\s*)?(net|web|internet|google)(?!\p{L})~u',
+            '~' . $lead . '(fais\s+une\s+)?(recherche|search)\s+(web|internet|en\s+ligne|online|sur\s+(le\s+)?(net|web|internet))(?!\p{L})~u',
+            '~' . $lead . '(search|look\s*up|google|check)(?!\p{L})[^.?!\n]{0,40}(?<!\p{L})(on|in)\s+(the\s+)?(web|internet)(?!\p{L})(?!\s+(folder|directory|drive|share))~u',
+            '~' . $lead . '(such|recherchier)\p{L}*[^.?!\n]{0,40}im\s+(web|internet|netz)(?!\p{L})~u',
+            '~^\s*(ابحث|ابحثي)[^.?!\n]{0,40}(الإنترنت|الانترنت|الويب|النت|جوجل)~u',
+        ];
+        foreach ($explicit as $re) {
+            if (preg_match($re, $m) === 1) {
+                return ['query' => $text, 'mode' => 'web'];
+            }
+        }
+        $product = '(nextcloud|php|python|node(?:\.?js)?|java|ubuntu|debian|fedora|rhel|linux|kernel|windows|macos|ios|ipados|android|iphone|ipad|pixel|galaxy|chrome|firefox|safari|docker|kubernetes|postgres(?:ql)?|mysql|mariadb|nginx|apache|wordpress|laravel|symfony|django|react|angular|typescript|rust|golang|dotnet|vmware|esxi|proxmox|truenas|synology|qnap|pfsense|openssl|libreoffice|onlyoffice|collabora|teams|zoom|whatsapp|telegram|qwen|llama|gemma|mistral|chatgpt|gpt|claude|gemini|vllm|ollama)';
+        $latest = '(derni[eè]re?s?|latest|newest|most\s+recent|plus\s+r[ée]cente?s?|r[ée]cente?s?|actuelle?s?|current|stable|neueste\p{L}*|aktuelle\p{L}*|أحدث|آخر)';
+        $release = '(version|release|mise\s+[àa]\s+jour|update|sortie|mod[eè]le|model|إصدار|اصدار|الإصدار|نسخة|تحديث)';
+        if (preg_match('~(?<![\p{L}.])' . $product . '(?!\p{L})~u', $m, $found) === 1 && (
+            preg_match('~(?<!\p{L})' . $latest . '(?!\p{L})[^.?!\n]{0,30}' . $release . '|' . $release . '[^.?!\n]{0,30}(?<!\p{L})' . $latest . '(?!\p{L})~u', $m) === 1
+            || preg_match('~(?<!\p{L})(sorti\p{L}*|sort|sortira|released?|release\s+date|date\s+de\s+sortie)(?!\p{L})~u', $m) === 1)) {
+            return ['query' => $found[1] . ' latest version', 'mode' => 'web'];
+        }
+        // Market assets, each mapped to a neutral token. French "or" only as "l'or / d'or / de l'or" (conjunction otherwise).
+        $assets = ['~(?<!\p{L})(?:l|d)[\'’]or(?!\p{L})|(?<!\p{L})gold(?!\p{L})|الذهب~u' => 'gold', '~(?<!\p{L})(p[ée]trole|oil|brent)(?!\p{L})~u' => 'oil',
+            '~(?<!\p{L})(bitcoin|btc)(?!\p{L})|بيتكوين~u' => 'bitcoin', '~(?<!\p{L})(ethereum|ether)(?!\p{L})~u' => 'ethereum',
+            '~(?<!\p{L})(dollars?|usd)(?!\p{L})|الدولار~u' => 'USD', '~(?<!\p{L})(euros?|eur)(?!\p{L})|اليورو~u' => 'EUR',
+            '~(?<!\p{L})(dirhams?|aed)(?!\p{L})|الدرهم~u' => 'AED', '~(?<!\p{L})(gbp|livres?\s+sterling|pounds?\s+sterling)(?!\p{L})~u' => 'GBP',
+            '~(?<!\p{L})(yen|jpy)(?!\p{L})~u' => 'JPY', '~(?<!\p{L})(riyals?|sar)(?!\p{L})~u' => 'SAR',
+            '~(?<!\p{L})(cac\s*40|nasdaq|dow\s+jones|s&p\s*500)(?!\p{L})~u' => 'stock index'];
+        $price = '~(?<!\p{L})(prix|price|cours|valeur|value|taux|rate|combien\s+vaut|how\s+much\s+is|سعر)(?!\p{L})~u';
+        if (preg_match($price, $m) === 1) {
+            $tokens = [];
+            foreach ($assets as $re => $token) {
+                if (preg_match($re, $m) === 1) {
+                    $tokens[$token] = true;
+                }
+            }
+            if ($tokens !== []) {
+                $rate = preg_match('~(?<!\p{L})(taux|change|exchange|rate|conversion)(?!\p{L})~u', $m) === 1 && count($tokens) > 1;
+                return ['query' => implode(' ', array_keys($tokens)) . ($rate ? ' exchange rate today' : ' price today'), 'mode' => 'web'];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Run the forced web search and add it to the conversation exactly like a
+     * tool call the model would have made, so the model answers from the
+     * results. A failed search is passed on too: the model then says the
+     * search failed instead of answering from memory. Never throws: any error
+     * leaves the conversation unchanged (the model decides as before).
+     *
+     * @param array{query:string,mode:string} $args
+     * @return array<string,mixed>|null the tool result, or null when nothing was injected
+     */
+    private function runForcedWebSearch(string $userId, array $args, array &$messages): ?array {
+        try {
+            $res = $this->executor->run($userId, 'web_search', $args);
+            if (!empty($res['confirmation_required'])) {
+                return null;
+            }
+            $this->collectToolSources('web_search', $res);
+            $call = ['id' => 'call_eva_' . bin2hex(random_bytes(4)), 'type' => 'function', 'function' => ['name' => 'web_search', 'arguments' => $args]];
+            $messages[] = ['role' => 'assistant', 'content' => '', 'tool_calls' => $this->canonicalToolCalls([$call])];
+            $messages[] = ['role' => 'tool', 'content' => json_encode($res, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)];
+            return $res;
+        } catch (\Throwable $e) {
+            $this->logger->warning('EVA forced web search failed: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * What the user is asking, for the intent checks (file request, weather). A short confirmation ("oui", "ok",
+     * "go", "vas-y", "yes", "نعم") answers EVA's previous question: it is read together with the previous user
+     * message (seen 28/09: "oui" after "créer un pdf…" was not seen as a file request, so no retry).
+     */
+    private function requestIntent(string $message, array $history): string {
+        if (preg_match('~^\s*(oui|ouais|ok|okay|go|vas-?y|allez|d[\'’]accord|daccord|yes|yep|sure|please|stp|svp|نعم|أجل)(?!\p{L})[\s!.,،؟?]*([\p{L}\'’-]{0,12}[\s!.,،؟?]*){0,2}$~iu', $message) !== 1
+            // "ok merci", "oui c'est bon": a closing, not a go (review of ae24527: it re-triggered a file already made).
+            || preg_match('~(?<!\p{L})(merci|thanks?|thx|شكرا|bon|parfait|super|cool|nickel|great|fine|good|perfect|top|danke)(?!\p{L})~iu', $message) === 1) {
+            return $message;
+        }
+        // Only an answer to a question EVA has just asked, and not after a file was already delivered.
+        $last = null;
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            if (($history[$i]['role'] ?? '') === 'assistant') { $last = trim((string)($history[$i]['content'] ?? '')); break; }
+            if (($history[$i]['role'] ?? '') === 'user') break;
+        }
+        if ($last === null || preg_match('~[?؟]~u', mb_substr($last, -300)) !== 1
+            || preg_match('~\[EVA:|📄|/f/\d+|/remote\.php/(dav/files|webdav)/~iu', $last) === 1) {
+            return $message;
+        }
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            if (($history[$i]['role'] ?? '') === 'user' && trim((string)($history[$i]['content'] ?? '')) !== '') {
+                return trim((string)$history[$i]['content']) . "\n" . $message;
+            }
+        }
+        return $message;
+    }
+
+    /** True when the user asks EVA to produce a file (not how to make one). */
+    private function isFileCreationRequest(string $message): bool {
+        $m = mb_strtolower(trim($message));
+        if ($m === '' || mb_strlen($m) > 2000) {
+            return false;
+        }
+        // "how do I create an Excel file?" asks for an explanation, not a file.
+        // But "un doc pour expliquer le fichier" / "a file to explain how…" is a file whose PURPOSE is explaining (test 28/09 04:54).
+        // Only when what comes BEFORE that clause is itself a file request ("Pour expliquer à mon équipe, comment créer… ?"
+        // and "le document qui décrit comment…" stay questions — review of 2195949).
+        if (preg_match('~(?<!\p{L})(pour|to|qui|that)\s+(expliqu\p{L}*|explain\p{L}*|d[ée]cri\p{L}*|describ\p{L}*)~u', $m, $clause, PREG_OFFSET_CAPTURE) === 1
+            && $clause[0][1] > 0 && $this->isFileCreationRequest(substr($m, 0, $clause[0][1]))) {
+            return true;
+        }
+        if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
+            return false;
+        }
+        $verb = '(cr[eé]+r?[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|convert\p{L}*|transform\p{L}*|umwandel\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل|حوّل|حول)';
+        // Not "tableau / table / markdown / note" alone: "fais un tableau comparatif" is an in-chat answer (second review, 28/09).
+        $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|datei|ملف|مستند|اكسل)';
+        // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
+        // not a file to create.
+        $existing = '(?<!ce )(?<!cet )(?<!cette )(?<!ces )(?<!le )(?<!la )(?<!les )(?<!mon )(?<!ma )(?<!mes )(?<!ton )(?<!ta )(?<!tes )(?<!son )(?<!sa )(?<!ses )(?<!this )(?<!that )(?<!these )(?<!those )(?<!the )(?<!my )(?<!your )(?<!du )(?<!dans )';
+        // The object must be introduced as a NEW thing: "un/une/a/an/en/as/new …" (third review: « un paragraphe sur
+        // les fichiers PDF » is text). Arabic has no such article: its objects stay direct.
+        $intro = '(?<!\p{L})(un|une|a|an|en|as|au\s+format|new|nouveau|nouvelle|neue?s?|ein|eine)\s+(\p{L}+\s+)?';
+        return preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})[^.?!\n]{0,60}' . $intro . $existing . $object . '(?!\p{L})~u', $m) === 1
+            // "crée pdf", "creat pdf", "export excel": a format right after the verb, no article needed.
+            || preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})\s+(moi\s+|me\s+|nous\s+|it\s+|this\s+|ça\s+|cela\s+|le\s+tout\s+)?(en\s+|as\s+|to\s+|au\s+format\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
+            // "convert this file to pdf": a conversion names its target format, no "new" article (test 28/09 ~07:15).
+            || preg_match('~(?<!\p{L})(convert\p{L}*|transform\p{L}*|umwandel\p{L}*|حوّل|حول)(?!\p{L})[^.?!\n]{0,60}(?<!\p{L})(en|to|into|in|as|vers|au\s+format|إلى|الى)\s+(\p{L}+\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
+            || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})[^.?!\n]{0,40}(ملف|مستند|اكسل)~u', $m) === 1;
+    }
+
+    /**
+     * Does the answer claim (or announce) a file it did not create? Used ONLY to
+     * decide the retry, which may write a file: a missed claim is covered by the
+     * notice of finishAnswer(), so this errs on the strict side — first person
+     * or "your file…" only: a passive in ordinary text ("votre facture a été
+     * générée" inside a mail to write) must not make EVA write a file. A past-tense
+     * claim or a file link counts even when the answer ends with a question
+     * ("I have created X. Anything else?"); an announced action ("je vais
+     * créer…") does not when it ends with a question (asking for details).
+     */
+    private function claimsCreation(string $answer): bool {
+        $a = mb_strtolower(trim($answer));
+        if ($a === '') {
+            return false;
+        }
+        if (preg_match('~/(?:index\.php/)?f/\d+|/remote\.php/(?:dav/files|webdav)/|\[eva:[^\]]*(created|cr[ée]{1,2})|\(file\s+created:~u', $a) === 1) {
+            return true;
+        }
+        $past = '~(j[\'’]ai\s+(bien\s+)?(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée]|pr[ée]par[ée]|export[ée]|sauvegard[ée]|r[ée]dig[ée]|converti)'
+            . '|je\s+(vous|t)[\'’]?\s*ai\s+(cr[ée]{1,2}|g[ée]n[ée]r[ée]|pr[ée]par[ée]|enregistr[ée])'
+            . '|(votre|ton|le)\s+(nouveau\s+)?(fichier|document|classeur|tableur)\s+(\S+\s+){0,2}(est|a\s+[ée]t[ée])\s+(bien\s+)?(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée]|pr[êe]t|converti)|(fichier|document)\s+cr[ée]{1,2}\s*:'
+            . '|(?<!\p{L})i(\s+have|[\'’]ve)?\s+(just\s+|successfully\s+)?(created|generated|saved|exported|prepared|converted)'
+            . '|(your|the)\s+(new\s+)?(file|document|spreadsheet|workbook)\s+(\S+\s+){0,2}(has|have)\s+been\s+(successfully\s+)?(created|generated|saved|converted)|here[\'’]?s?\s+(is\s+)?(your|the)\s+(new\s+)?(file|document|spreadsheet|workbook)'
+            . '|voici\s+(votre|ton|le)\s+(nouveau\s+)?(fichier|document|classeur)|أنشأت|(تم|قمت\s+ب)\s*(إنشاء|انشاء)\s+(ال)?(ملف|مستند)|habe\s+(\p{L}+\s+)?erstellt|(datei|dokument)\s+wurde\s+(\p{L}+\s+)?erstellt)~u';
+        if (preg_match($past, $a) === 1) {
+            return true;
+        }
+        $future = '~(je\s+vais|i\s+will|i[\'’]ll|let\s+me)\s+(cr[ée]er|g[ée]n[ée]rer|pr[ée]parer|create|generate|prepare|make)~u';
+        return preg_match($future, $a) === 1 && preg_match('~[?؟]\s*$~u', $a) !== 1;
+    }
+
+    /**
+     * Which retry, if any, this answer needs (null = none). Shared budget of two
+     * retries per answer. Each case reacts to a tool the model SHOULD have
+     * called and did not:
+     *  - a file claimed or announced without any write (CREATION_NUDGE);
+     *  - a web search offered ("voulez-vous que je cherche ?") or declared
+     *    impossible instead of being done (seen 28/09: "appel news ?"). The
+     *    model then writes its own query, as when it searches by itself;
+     *  - a weather question answered without the weather tool (seen 28/09:
+     *    "38 °C demain à Dubaï" invented).
+     */
+    private function nudgeFor(string $message, string $answer, array $tools): ?string {
+        if ($this->needsCreationNudge($message, $answer, $tools)
+            || ($this->createdFiles === [] && !$this->fileToolAttempted && $this->hasTool($tools, 'create_file')
+                && $this->isFileCreationRequest($message) && $this->offersCreationInstead($answer))) {
+            return self::CREATION_NUDGE;
+        }
+        if (!isset($this->calledTools['web_search']) && $this->hasTool($tools, 'web_search') && $this->offersSearchInstead($answer)) {
+            return self::SEARCH_NUDGE;
+        }
+        if (!isset($this->calledTools['weather']) && $this->hasTool($tools, 'weather') && $this->isWeatherQuestion($message)
+            && preg_match('~[?؟]\s*$~u', trim($answer)) !== 1) {
+            return self::WEATHER_NUDGE;
+        }
+        return null;
+    }
+
+    /**
+     * The user asked for a file and the answer OFFERS to make it ("Would you like me to create a new PDF?", seen
+     * 28/09) instead of making it: the request already is the answer to that question.
+     */
+    private function offersCreationInstead(string $answer): bool {
+        $a = mb_strtolower(trim($answer));
+        return $a !== '' && preg_match('~(would\s+you\s+like|do\s+you\s+want|shall\s+i|should\s+i|voulez-vous|souhaitez-vous|veux-tu|dois-je)'
+            . '(\s+(me|que\s+je|que\s+j[\'’]))?(\s+to)?\s+(create|cr[ée]e|g[ée]n[èe]re|generate|make|faire|fasse|produce|prepare|pr[ée]pare)~u', $a) === 1;
+    }
+
+    /**
+     * A tool call the model wrote as TEXT ("<tool_call>{json}</tool_call>", Hermes format) instead of a real call: seen
+     * 28/09 05:14, the JSON held a raw line break inside a string, so vLLM's parser gave it up and the user saw the call
+     * printed, with no file. The call then runs through the same path (policy, confirmation) as a real one.
+     * A QUOTED call must never run (security review of 652f592): the whole answer must be the call (no preamble, no code
+     * block), no "<tool_call>" may appear anywhere in what the model was given (a web page, mail or file echoing one),
+     * never in autonomous runs (caller), and only creation / search / read tools: never share, delete, send or update.
+     *
+     * @return null|array{0:list<array{name:string,arguments:array<string,mixed>}>,1:list<array<string,mixed>>,2:string}
+     */
+    private function recoverTextToolCalls(string $answer, array $tools, array $messages): ?array {
+        if ($tools === [] || preg_match('~^\s*<tool_call>~', $answer) !== 1 || str_contains($answer, '```')) {
+            return null;
+        }
+        foreach ($messages as $m) {
+            if (str_contains(is_string($m['content'] ?? null) ? $m['content'] : json_encode($m['content'] ?? '', JSON_UNESCAPED_UNICODE), '<tool_call>')) {
+                return null;
+            }
+        }
+        if (preg_match_all('~<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)~s', $answer, $found, PREG_SET_ORDER) < 1) {
+            return null;
+        }
+        $calls = [];
+        $raw = [];
+        foreach ($found as $f) {
+            $data = json_decode($f[1], true);
+            if (!is_array($data)) {
+                // Escape the control characters left raw INSIDE strings, then retry.
+                $fixed = '';
+                $inString = false;
+                $escaped = false;
+                foreach (preg_split('//u', $f[1], -1, PREG_SPLIT_NO_EMPTY) ?: [] as $ch) {
+                    if ($inString && !$escaped && ($ch === "\n" || $ch === "\r" || $ch === "\t")) {
+                        $fixed .= ["\n" => '\n', "\r" => '\r', "\t" => '\t'][$ch];
+                        continue;
+                    }
+                    if ($ch === '"' && !$escaped) {
+                        $inString = !$inString;
+                    }
+                    $escaped = $inString && $ch === '\\' && !$escaped;
+                    $fixed .= $ch;
+                }
+                $data = json_decode($fixed, true);
+            }
+            $name = is_array($data) ? (string)($data['name'] ?? '') : '';
+            $args = is_array($data) ? ($data['arguments'] ?? $data['parameters'] ?? []) : [];
+            if (is_string($args)) {
+                $args = json_decode($args, true);
+            }
+            if ($name === '' || !is_array($args) || !in_array($name, self::RECOVERABLE_TOOLS, true) || !$this->hasTool($tools, $name)) {
+                return null;
+            }
+            $calls[] = ['name' => $name, 'arguments' => $args, 'recovered' => true];
+            $raw[] = ['id' => 'call_' . bin2hex(random_bytes(4)), 'type' => 'function', 'function' => ['name' => $name, 'arguments' => json_encode($args, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)]];
+        }
+        $rest = trim((string)preg_replace('~<tool_call>.*?(?:</tool_call>|$)~s', '', $answer));
+        $this->logger->warning('EVA recovered ' . count($calls) . ' tool call(s) written as text by the model');
+        return [$calls, $raw, $rest];
+    }
+
+    /**
+     * A call recovered from text never overwrites an existing file (create_file overwrites silently): the error to give
+     * back, or null. Fails closed: if the check itself fails, nothing is written (security re-review of 0d1cf93).
+     */
+    private function recoveredOverwrite(string $userId, array $tc): ?string {
+        $args = is_array($tc['arguments'] ?? null) ? $tc['arguments'] : [];
+        $paths = match ((string)($tc['name'] ?? '')) {
+            'create_file' => [$args['path'] ?? ''],
+            'create_files' => array_map(static fn($f): string => is_array($f) ? (string)($f['path'] ?? '') : '', is_array($args['files'] ?? null) ? $args['files'] : []),
+            default => [],
+        };
+        try {
+            $home = $this->rootFolder->getUserFolder($userId);
+            foreach ($paths as $path) {
+                $path = trim((string)$path, "/ \t");
+                if ($path !== '' && $home->nodeExists($path)) {
+                    return 'A file named "' . $path . '" already exists and this call may not replace it. Nothing was written: choose a new file name.';
+                }
+            }
+        } catch (\Throwable $e) {
+            return 'Could not check whether the file already exists. Nothing was written.';
+        }
+        return null;
+    }
+
+    /**
+     * A call to a tool that does not exist (seen 28/09: the model invented "convert_file", failed twice, then gave
+     * up). The error now says what exists, so the next step is the real one instead of a retry or a surrender.
+     *
+     * @param array<string,mixed> $res
+     * @return array<string,mixed>
+     */
+    private function explainUnknownTool(array $res): array {
+        $error = (string)($res['error'] ?? $res['reason'] ?? '');
+        if (!empty($res['ok']) || !str_starts_with($error, 'Unknown tool')) {
+            return $res;
+        }
+        $res['error'] = $error . '. This tool does not exist: use only the tools you were given, never invent one. To turn an existing '
+            . 'file into a PDF, DOCX or XLSX: read it with extract_file_text (or read_file; use search_files first if you are not sure of '
+            . 'its folder), then call create_file with the new path (e.g. "Documents/name.pdf") and the content (a Markdown table for tabular data).';
+        return $res;
+    }
+
+    /** The answer offers a web search, or claims it cannot reach the web / real-time news, instead of searching. */
+    private function offersSearchInstead(string $answer): bool {
+        $a = mb_strtolower(trim($answer));
+        return $a !== '' && preg_match('~(voulez-vous|souhaitez-vous|veux-tu|voulez\s+vous|would\s+you\s+like|do\s+you\s+want|shall\s+i|should\s+i)[^?؟]{0,80}(recherch|cherch|search|look\s+up|actualit|news)'
+            . '|je\s+(peux|pourrais)\s+(vous\s+|t[\'’])?(aider\s+[àa]\s+)?(effectuer|faire|lancer|mener)\s+une\s+recherche'
+            . '|(je\s+ne\s+(peux|suis)\s+pas\s+(en\s+mesure\s+de\s+)?(acc[ée]der|consulter|naviguer|chercher))[^.]{0,60}(temps\s+r[ée]el|actualit|internet|web|en\s+ligne|sources?\s+externes?)'
+            . '|i\s+(can(no|[\'’])t|am\s+(not\s+able|unable)\s+to|do\s+not\s+have\s+access\s+to)\s+(access|browse|check|search|real[- ]time)[^.]{0,40}(real[- ]time|internet|web|news|online)?'
+            . '|لا\s+(يمكنني|أستطيع)\s+(الوصول|تصفح)~u', $a) === 1;
+    }
+
+    /** A question about the weather (forecast, rain, outside temperature), not "the oven temperature". */
+    private function isWeatherQuestion(string $message): bool {
+        $m = mb_strtolower(trim($message));
+        return $m !== '' && mb_strlen($m) <= 300 && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|wetter|pr[ée]visions?\s+m[ée]t[ée]o|pleuvoir|pleut|pluie|neige|rain|snow|الطقس)(?!\p{L})'
+            . '|temps\s+(qu[\'’]il\s+)?(fait|fera)|temp[ée]rature[^.?!\n]{0,30}(demain|demin|aujourd|ce\s+soir|cette\s+semaine|week-?end|dehors|ext[ée]rieur|tomorrow|today|tonight|outside)'
+            . '|temp[ée]rature[^.?!\n]{0,40}(?<!\p{L})(à|a|au|en|in|at)\s+\p{L}{3,}'
+            . '|درجة\s+الحرارة~u', $m) === 1;
+    }
+
+    /**
+     * Ask the model again (at most twice) when a file was requested, no file
+     * tool was even tried, and the answer claims or announces the file anyway.
+     * Reacting to the claim, not to the request, keeps a plain text answer
+     * ("here are 10 ideas, no file needed") or a clarification untouched: on the
+     * web surface create_file runs without a confirmation dialog.
+     */
+    private function needsCreationNudge(string $message, string $answer, array $tools): bool {
+        return $this->createdFiles === [] && !$this->fileToolAttempted
+            && $this->hasTool($tools, 'create_file') && $this->isFileCreationRequest($message)
+            && $this->claimsCreation($answer);
+    }
+
+    /**
+     * Links to this Nextcloud only: a /f/123 link on a real public site is none
+     * of our business. Invented hosts count as ours (localhost, names without a
+     * dot like "your-nextcloud", IP addresses, trusted_domains), since a model
+     * inventing a file link rarely gets the host right. Errors: treat as ours.
+     */
+    private function isOwnNextcloudUrl(string $url): bool {
+        try {
+            $host = strtolower((string)parse_url($url, PHP_URL_HOST));
+            if (self::isPrivateOrInventedHost($host)) {
+                return true;
+            }
+            $own = [strtolower((string)parse_url($this->urlGenerator->getAbsoluteURL('/'), PHP_URL_HOST))];
+            foreach ((array)\OCP\Server::get(\OCP\IConfig::class)->getSystemValue('trusted_domains', []) as $domain) {
+                $own[] = strtolower((string)preg_replace('~:\d+$~', '', (string)$domain));
+            }
+            return in_array($host, $own, true);
+        } catch (\Throwable $e) {
+            return true;
+        }
+    }
+
+    /** localhost, a name without a dot ("your-nextcloud"), an IP address or *.local: never a public site. */
+    private static function isPrivateOrInventedHost(string $host): bool {
+        return $host === '' || !str_contains($host, '.') || filter_var($host, FILTER_VALIDATE_IP) !== false
+            || preg_match('~(^|\.)(example\.(com|org|net)|[^.]+\.(local|example|test|invalid|localhost))$|your|votre~', $host) === 1;
+    }
+
+    /** $url cited in $text as a whole link (…/f/5 is not cited by …/f/55). */
+    private static function citesUrl(string $text, string $url): bool {
+        return preg_match('~' . preg_quote($url, '~') . '(?![0-9A-Za-z%._\~/-])~u', $text) === 1;
+    }
+
+    /**
+     * Strike out links to files of this Nextcloud that do not exist. A link is
+     * kept when it points to a file written in this answer, when it came from a
+     * tool result, the user or the file context (never from an earlier assistant
+     * answer, which may itself be invented), or when the file really exists in
+     * the user's home. Only the link is replaced (its label struck out), so a
+     * table row or a one-line answer keeps its content; a copied "📄" line is
+     * dropped whole. Sets $removedFileLinks so finishAnswer() adds one warning.
+     */
+    private function removeUnbackedFileLinks(string $userId, string $answer, array $messages): string {
+        if (preg_match_all('~https?://[^\s<>"\'()\[\]«»“”]+~u', $answer, $found) < 1) {
+            return $answer;
+        }
+        $trusted = [];
+        foreach ($this->createdFiles as $file) {
+            $trusted[$file['url']] = true;
+            $trusted[$file['download_url']] = true;
+        }
+        $bad = [];
+        foreach (array_unique($found[0]) as $url) {
+            // Punctuation glued to the link, including French and Arabic marks.
+            $url = (string)preg_replace('~[.,;:!?*_»”’“«،؟。]+$~u', '', $url);
+            $path = (string)parse_url($url, PHP_URL_PATH);
+            if (!preg_match('~/(?:index\.php/)?f/\d+/?$|/remote\.php/(?:dav/files|webdav)/~', $path) || isset($trusted[$url]) || !$this->isOwnNextcloudUrl($url)) {
+                continue;
+            }
+            $quoted = false;
+            foreach ($messages as $msg) {
+                if (($msg['role'] ?? '') !== 'assistant' && is_string($msg['content'] ?? null) && self::citesUrl($msg['content'], $url)) {
+                    $quoted = true;
+                    break;
+                }
+            }
+            if (!$quoted && !$this->linkedFileExists($userId, $url)) {
+                $bad[] = $url;
+            }
+        }
+        if ($bad === []) {
+            return $answer;
+        }
+        $this->removedFileLinks = true;
+        $lines = [];
+        foreach (preg_split('/\R/u', $answer) ?: [] as $line) {
+            $hit = false;
+            foreach ($bad as $url) {
+                if (self::citesUrl($line, $url)) {
+                    $hit = true;
+                    $q = preg_quote($url, '~');
+                    $line = (string)preg_replace('~\[([^\]]*)\]\(' . $q . '\)~u', '~~$1~~', $line);
+                    $line = (string)preg_replace('~' . $q . '(?![0-9A-Za-z%._\~/-])~u', '', $line);
+                }
+            }
+            if ($hit && str_starts_with(ltrim($line), '📄')) {
+                continue;   // imitation of the line appendFileLinks() adds: nothing left worth keeping
+            }
+            $lines[] = rtrim($line);
+        }
+        return trim(implode("\n", $lines));
+    }
+
+    /** Does a Nextcloud file link (/f/<id>, WebDAV path) point to a file of this user? Errors keep the link. */
+    private function linkedFileExists(string $userId, string $url): bool {
+        try {
+            $path = rawurldecode((string)parse_url($url, PHP_URL_PATH));
+            $home = $this->rootFolder->getUserFolder($userId);
+            if (preg_match('~/f/(\d+)/?$~', $path, $m)) {
+                return $home->getById((int)$m[1]) !== [];
+            }
+            if (preg_match('~/remote\.php/dav/files/([^/]+)/(.+)$~', $path, $m)) {
+                return $m[1] === $userId && $home->nodeExists(rtrim($m[2], '/'));
+            }
+            if (preg_match('~/remote\.php/webdav/(.+)$~', $path, $m)) {
+                return $home->nodeExists(rtrim($m[1], '/'));
+            }
+            return true;
+        } catch (\Throwable $e) {
+            return true;
+        }
+    }
+
+    /**
+     * The "📄 name — [Open](…) · [Download](…)" lines appended by appendFileLinks()
+     * are for the user only: sent back in the history, the model copied their
+     * format with invented file ids (28/09). In earlier answers they become a
+     * plain "[EVA: file created in an earlier turn: name]" (a model copying it is caught by claimsCreation()), so a follow-up ("add a line to that file")
+     * still knows which file it was.
+     */
+    private function stripFileLinkLines(string $content): string {
+        $out = preg_replace_callback('~^📄 \*\*(.+)\*\* — \[[^\]]+\]\(https?://[^)\s]+\) · \[[^\]]+\]\(https?://[^)\s]+\)[ \t]*$~mu',
+            static fn(array $m): string => '[EVA: file created in an earlier turn: ' . html_entity_decode((string)preg_replace('~\\\\(.)~u', '$1', $m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8') . ']', $content);
+        return is_string($out) ? rtrim($out) : $content;
     }
 
     /** @param array<string,mixed> $item */
@@ -1113,7 +1761,8 @@ $this->executor->setUserId($userId);
         $messages = [['role' => 'system', 'content' => $system]];
         foreach (array_slice($history, -12) as $h) {
             if (isset($h['role'], $h['content'])) {
-                $messages[] = ['role' => $h['role'] === 'user' ? 'user' : 'assistant', 'content' => (string)$h['content']];
+                $role = $h['role'] === 'user' ? 'user' : 'assistant';
+                $messages[] = ['role' => $role, 'content' => $role === 'assistant' ? $this->stripFileLinkLines((string)$h['content']) : (string)$h['content']];
             }
         }
         $messages[] = ['role' => 'user', 'content' => $userPrompt];
