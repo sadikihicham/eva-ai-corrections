@@ -2045,16 +2045,27 @@ class ActionExecutor {
         $esc = static fn(string $v): string => htmlspecialchars($v, ENT_XML1 | ENT_COMPAT, 'UTF-8');
         $rows = preg_split('/\R/u', trim($text)) ?: []; $sheet = ''; $r = 0;
         // Models often send a Markdown table ("| a | b |"), sometimes after an intro sentence (seen 28/09: every line
-        // landed in a single cell). When the text holds a table, its rows ARE the sheet; the prose around is dropped.
-        $table = array_values(array_filter($rows, static fn(string $l): bool => str_starts_with(ltrim($l), '|')));
-        $markdown = $table !== [];
-        if ($markdown) $rows = $table;
+        // landed in a single cell). Then the intro before the first table is dropped; later prose (notes, totals) is
+        // kept in column A, and a separator is only the 2nd line of a table (a data row "| - | - |" stays).
+        $first = null;
+        foreach ($rows as $k => $l) { if (str_starts_with(ltrim($l), '|')) { $first = $k; break; } }
+        $markdown = $first !== null;
+        if ($markdown) $rows = array_slice($rows, $first);
+        $blockRow = 0;
         foreach ($rows as $line) {
             if ($markdown) {
                 $inner = trim($line);
-                $inner = substr($inner, 1, str_ends_with($inner, '|') && !str_ends_with($inner, '\\|') && strlen($inner) > 1 ? -1 : null);
-                $cells = array_map(static fn(string $c): string => trim(str_replace(['**', '`', '\\|'], ['', '', '|'], $c)), preg_split('/(?<!\\\\)\|/', $inner) ?: [$inner]);
-                if (array_filter($cells, static fn(string $c): bool => !preg_match('/^:?-+:?$/', $c)) === []) continue;   // |---|:--:| separator
+                if (!str_starts_with($inner, '|')) {
+                    $blockRow = 0;
+                    if ($inner === '') continue;
+                    $cells = [$inner];
+                } else {
+                    $blockRow++;
+                    $inner = substr($inner, 1, str_ends_with($inner, '|') && !str_ends_with($inner, '\\|') && strlen($inner) > 1 ? -1 : null);
+                    $cells = array_map(static fn(string $c): string => (string)preg_replace(['/^\*\*(.*)\*\*$/s', '/^`(.*)`$/s'], '$1', trim(str_replace('\\|', '|', $c))), preg_split('/(?<!\\\\)\|/', $inner) ?: [$inner]);
+                    if ($blockRow === 2 && array_filter($cells, static fn(string $c): bool => !preg_match('/^:?-+:?$/', $c)) === []) continue;   // |---|:--:| separator
+                    if ($blockRow === 1 && $r > 0) $r++;   // an empty row between two tables
+                }
             }
             $r++; $cells = $markdown ? $cells : (str_contains($line, "\t") ? explode("\t", $line) : str_getcsv($line, ',', '"', '\\')); $c = 0; $sheet .= '<row r="' . $r . '">'; foreach ($cells as $value) { $c++; $col = ''; $n = $c; while ($n > 0) { $n--; $col = chr(65 + ($n % 26)) . $col; $n = intdiv($n, 26); } $sheet .= '<c r="' . $col . $r . '" t="inlineStr"><is><t>' . $esc((string)$value) . '</t></is></c>'; } $sheet .= '</row>'; }
         $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');

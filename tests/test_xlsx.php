@@ -34,5 +34,8 @@ verifie('tabulations inchangées', $l === [['a', 'b'], ['1', '2']], json_encode(
 // 4. ligne « | - | - | » gardée hors séparateur ? (ici : toute ligne 100 % tirets = séparateur, comportement voulu pour Excel)
 $l = lignes($g->x("| a | b |\n|:--|--:|\n| x \\| y | z |"));
 verifie('séparateur aligné :--/--: écarté, \\| dans une cellule gardé', $l === [['a', 'b'], ['x | y', 'z']], json_encode($l));
+// 5. revue adverse de ae24527 : rien de perdu sans prévenir
+$l = lignes($g->x("Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nTotal : 3\n\n| c | d |\n|---|---|\n| - | - |\n| 2**3 | **gras** |"));
+verifie('prose après le tableau gardée, 2 tableaux séparés, « | - | - | » gardé, ** seulement autour', $l === [['a', 'b'], ['1', '2'], ['Total : 3'], ['c', 'd'], ['-', '-'], ['2**3', 'gras']], json_encode($l, JSON_UNESCAPED_UNICODE));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

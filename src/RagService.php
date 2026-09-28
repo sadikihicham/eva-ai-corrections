@@ -632,7 +632,8 @@ $this->executor->setUserId($userId);
     private function finishAnswer(string $userId, string $message, string $answer, array $messages): string {
         $this->removedFileLinks = false;
         // The history marker is internal: a model copying it (seen 28/09) must not show it to the user.
-        $answer = trim((string)preg_replace('~^[ \t]*\[EVA: file created in an earlier turn:[^\]\n]*\][ \t]*\R?~mu', '', $answer));
+        $answer = (string)preg_replace('~^[ \t]*\[EVA:\s*file\s+created[^\n]*\][ \t]*\R?|[ \t]*\[EVA:\s*file\s+created[^\n]*\]~imu', '', $answer);
+        $answer = rtrim(ltrim($answer, "\r\n"));
         $answer = $this->removeUnbackedFileLinks($userId, $answer, $messages);
         $lang = substr($this->uiLanguage(), 0, 2);
         if ($this->removedFileLinks) {
@@ -773,7 +774,19 @@ $this->executor->setUserId($userId);
      * message (seen 28/09: "oui" after "créer un pdf…" was not seen as a file request, so no retry).
      */
     private function requestIntent(string $message, array $history): string {
-        if (preg_match('~^\s*(oui|ouais|ok|okay|go|vas-?y|allez|d[\'’]accord|daccord|yes|yep|sure|please|stp|svp|نعم|أجل|ja)(?!\p{L})[\s!.,]*([\p{L}\'’-]{0,12}[\s!.,]*){0,2}$~iu', $message) !== 1) {
+        if (preg_match('~^\s*(oui|ouais|ok|okay|go|vas-?y|allez|d[\'’]accord|daccord|yes|yep|sure|please|stp|svp|نعم|أجل)(?!\p{L})[\s!.,،؟?]*([\p{L}\'’-]{0,12}[\s!.,،؟?]*){0,2}$~iu', $message) !== 1
+            // "ok merci", "oui c'est bon": a closing, not a go (review of ae24527: it re-triggered a file already made).
+            || preg_match('~(?<!\p{L})(merci|thanks?|thx|شكرا|bon|parfait|super|cool|nickel|great|fine|good|perfect|top|danke)(?!\p{L})~iu', $message) === 1) {
+            return $message;
+        }
+        // Only an answer to a question EVA has just asked, and not after a file was already delivered.
+        $last = null;
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            if (($history[$i]['role'] ?? '') === 'assistant') { $last = trim((string)($history[$i]['content'] ?? '')); break; }
+            if (($history[$i]['role'] ?? '') === 'user') break;
+        }
+        if ($last === null || preg_match('~[?؟]~u', mb_substr($last, -300)) !== 1
+            || preg_match('~\[EVA:|📄|/f/\d+|/remote\.php/(dav/files|webdav)/~iu', $last) === 1) {
             return $message;
         }
         for ($i = count($history) - 1; $i >= 0; $i--) {
@@ -794,7 +807,7 @@ $this->executor->setUserId($userId);
         if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
             return false;
         }
-        $verb = '(cr[eé]+[rsz]?|creat\p{L}*|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
+        $verb = '(cr[eé]+[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
         // Not "tableau / table / markdown / note" alone: "fais un tableau comparatif" is an in-chat answer (second review, 28/09).
         $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|datei|ملف|مستند|اكسل)';
         // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
@@ -874,7 +887,7 @@ $this->executor->setUserId($userId);
     private function offersCreationInstead(string $answer): bool {
         $a = mb_strtolower(trim($answer));
         return $a !== '' && preg_match('~(would\s+you\s+like|do\s+you\s+want|shall\s+i|should\s+i|voulez-vous|souhaitez-vous|veux-tu|dois-je)'
-            . '(\s+(me|que\s+je|que\s+j[\'’]))?(\s+to)?\s+(create|cr[ée]e|g[ée]n[èe]re|generate|make|faire|fasse|proceed|proc[èe]de|produce|prepare|pr[ée]pare)~u', $a) === 1;
+            . '(\s+(me|que\s+je|que\s+j[\'’]))?(\s+to)?\s+(create|cr[ée]e|g[ée]n[èe]re|generate|make|faire|fasse|produce|prepare|pr[ée]pare)~u', $a) === 1;
     }
 
     /**

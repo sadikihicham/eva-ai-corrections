@@ -268,6 +268,25 @@ $h = [['role' => 'user', 'content' => 'creer un pdf a partir du fichier excel'],
 verifie('« oui » après une proposition → lu avec la demande précédente', $t->fichier($t->intention('oui', $h)), $t->intention('oui', $h));
 verifie('« go » / « ok vas-y » / « نعم » aussi', $t->fichier($t->intention('go', $h)) && $t->fichier($t->intention('ok vas-y', $h)) && $t->fichier($t->intention('نعم', $h)));
 verifie('message normal → inchangé', $t->intention('Quelle heure est-il ?', $h) === 'Quelle heure est-il ?');
+// Revue adverse de ae24527 (bloquant) : un « ok merci » après un fichier créé ne doit RIEN relancer.
+$hFait = [['role' => 'user', 'content' => 'crée un pdf du rapport'], ['role' => 'assistant', 'content' => "J'ai créé le fichier.\n\n📄 [rapport.pdf](https://192.168.1.99/f/42)\n\nAutre chose ?"]];
+foreach (['ok merci', "oui c'est bon", 'yes thanks', 'ok parfait', 'شكرا'] as $qm) {
+    verifie('clôture « ' . $qm . ' » → pas rattachée', $t->intention($qm, $h) === $qm, $t->intention($qm, $h));
+}
+verifie('« oui » après un fichier déjà livré → pas rattaché', $t->intention('oui', $hFait) === 'oui', $t->intention('oui', $hFait));
+verifie('« oui » sans question d\'eva juste avant → pas rattaché', $t->intention('oui', [['role' => 'user', 'content' => 'crée un pdf'], ['role' => 'assistant', 'content' => 'Voici le contenu.']]) === 'oui');
+verifie('« نعم، أنشئه » / « ok ؟ » reconnus (ponctuation arabe)', $t->fichier($t->intention('نعم، أنشئه', $h)) && $t->fichier($t->intention('ok ؟', $h)));
+verifie('« ja » n\'est plus une confirmation', $t->intention('ja', $h) === 'ja');
+verifie('« Shall I proceed? » → pas de relance création', $t->relanceGenerale('creer un pdf a partir du fichier excel', 'Which Excel file do you mean? Shall I proceed?', $tous) !== RagSousTest::CREATION_NUDGE);
+foreach (['I created a file yesterday, where is it?', 'give me a creative name for a file'] as $qc) {
+    verifie('pas une demande de création : ' . $qc, !$t->fichier($qc));
+}
+$r = $t->finir("Voici : [EVA: file created in an earlier turn: rapport [v2].pdf] et c'est tout.", [], 'bonjour');
+verifie('marqueur en milieu de ligne + « ] » dans le nom → entièrement retiré', !str_contains($r, 'EVA:') && !str_contains($r, '.pdf]') && str_contains($r, "c'est tout"), $r);
+$r = $t->finir("[eva: File Created in an earlier turn: x.pdf]\nSuite.", [], 'bonjour');
+verifie('marqueur en minuscules → retiré', $r === 'Suite.', $r);
+$r = $t->finir("    code indenté\nfin", [], 'bonjour');
+verifie('indentation de tête conservée', str_starts_with($r, '    code'), $r);
 foreach (["creat pdf", "creer pdf", "crée moi pdf", "exporte en pdf", "export excel", "creer un pdf a partir du fichier excel"] as $qc) {
     verifie('création demandée : ' . $qc, $t->fichier($qc));
 }
