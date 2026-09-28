@@ -954,7 +954,7 @@ $this->executor->setUserId($userId);
         }
         $verb = '(cr[eé]+r?[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|convert\p{L}*|transform\p{L}*|umwandel\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل|حوّل|حول)';
         // Not "tableau / table / markdown / note" alone: "fais un tableau comparatif" is an in-chat answer (second review, 28/09).
-        $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|datei|ملف|مستند|اكسل)';
+        $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|diaporama|slides|deck|datei|ملف|مستند|اكسل)';
         // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
         // not a file to create.
         $existing = '(?<!ce )(?<!cet )(?<!cette )(?<!ces )(?<!le )(?<!la )(?<!les )(?<!mon )(?<!ma )(?<!mes )(?<!ton )(?<!ta )(?<!tes )(?<!son )(?<!sa )(?<!ses )(?<!this )(?<!that )(?<!these )(?<!those )(?<!the )(?<!my )(?<!your )(?<!du )(?<!dans )';
@@ -963,9 +963,9 @@ $this->executor->setUserId($userId);
         $intro = '(?<!\p{L})(un|une|a|an|en|as|au\s+format|new|nouveau|nouvelle|neue?s?|ein|eine)\s+(\p{L}+\s+)?';
         $creation = preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,60}' . $intro . $existing . $object . '(?!\p{L})~u', $m) === 1
             // "crée pdf", "creat pdf", "export excel": a format right after the verb, no article needed.
-            || preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})\s+(moi\s+|me\s+|nous\s+|it\s+|this\s+|ça\s+|cela\s+|le\s+tout\s+)?(en\s+|as\s+|to\s+|au\s+format\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
+            || preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})\s+(moi\s+|me\s+|nous\s+|it\s+|this\s+|ça\s+|cela\s+|le\s+tout\s+)?(en\s+|as\s+|to\s+|au\s+format\s+)?(pdf|docx|word|excel|xlsx|csv|pptx|powerpoint)(?!\p{L})~u', $m) === 1
             // "convert this file to pdf": a conversion names its target format, no "new" article (test 28/09 ~07:15).
-            || preg_match('~(?<!\p{L})(convert\p{L}*|transform\p{L}*|umwandel\p{L}*|حوّل|حول)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,60}(?<!\p{L})(en|to|into|in|as|vers|au\s+format|إلى|الى)\s+(\p{L}+\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
+            || preg_match('~(?<!\p{L})(convert\p{L}*|transform\p{L}*|umwandel\p{L}*|حوّل|حول)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,60}(?<!\p{L})(en|to|into|in|as|vers|au\s+format|إلى|الى)\s+(\p{L}+\s+)?(pdf|docx|word|excel|xlsx|csv|pptx|powerpoint)(?!\p{L})~u', $m) === 1
             || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,40}(ملف|مستند|اكسل)~u', $m) === 1;
         if ($creation) {
             return true;
