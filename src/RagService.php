@@ -805,8 +805,13 @@ $this->executor->setUserId($userId);
         }
         // "how do I create an Excel file?" asks for an explanation, not a file.
         // But "un doc pour expliquer le fichier" / "a file to explain how…" is a file whose PURPOSE is explaining (test 28/09 04:54).
-        $asked = (string)preg_replace('~(?<!\p{L})(pour|to|qui|that)\s+(expliqu\p{L}*|explain\p{L}*|d[ée]cri\p{L}*|describ\p{L}*).*$~us', '', $m);
-        if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $asked) === 1) {
+        // Only when what comes BEFORE that clause is itself a file request ("Pour expliquer à mon équipe, comment créer… ?"
+        // and "le document qui décrit comment…" stay questions — review of 2195949).
+        if (preg_match('~(?<!\p{L})(pour|to|qui|that)\s+(expliqu\p{L}*|explain\p{L}*|d[ée]cri\p{L}*|describ\p{L}*)~u', $m, $clause, PREG_OFFSET_CAPTURE) === 1
+            && $clause[0][1] > 0 && $this->isFileCreationRequest(substr($m, 0, $clause[0][1]))) {
+            return true;
+        }
+        if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
             return false;
         }
         $verb = '(cr[eé]+r?[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';

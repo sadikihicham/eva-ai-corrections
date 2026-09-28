@@ -294,6 +294,9 @@ verifie('faute « crerr un fichier doc » (test admin 28/09 04:54) → demande d
 verifie('« crerr » + affirmation sans outil → relance création', $t->relance('crerr un fichier doc pour expliquer le fichier excel', 'I have created the Word document "Explication.docx" to explain the Excel file.', $tous));
 verifie('« explique comment créer un fichier excel » reste une question', !$t->fichier('explique comment créer un fichier excel'));
 verifie('« crée un document pour expliquer comment faire » = demande de fichier', $t->fichier('crée un document pour expliquer comment faire'));
+foreach (['I want you to explain how to export a csv file', 'Pour expliquer à mon équipe, comment créer un fichier excel ?', 'Quel est le document qui décrit comment créer un pdf ?', 'Is there a doc that describes how to create a pdf file?'] as $qc) {
+    verifie('question, pas une demande (revue 2195949) : ' . $qc, !$t->fichier($qc));
+}
 verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
 $r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
 verifie('« Would you like me to create a new PDF…? » en réponse à une demande de PDF → relance création', $r === RagSousTest::CREATION_NUDGE, (string)$r);

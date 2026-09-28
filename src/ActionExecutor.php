@@ -2052,8 +2052,10 @@ class ActionExecutor {
         $markdown = $first !== null;
         if ($markdown) $rows = array_slice($rows, $first);
         $blockRow = 0;
-        // French Excel writes "a;b;c" (seen 28/09: the whole row landed in column A). ";" wins when the text uses it more than ",".
-        $delim = substr_count($text, ';') > substr_count($text, ',') ? ';' : ',';
+        // French Excel writes "a;b;c" (seen 28/09: the whole row landed in column A). Decided on the header line, quoted
+        // text left out: ";" inside cells or French decimals "48,85" in the data must not choose (review of 2195949).
+        $header = (string)preg_replace('/"[^"]*"/', '', (string)(array_values(array_filter($rows, static fn(string $l): bool => trim($l) !== ''))[0] ?? ''));
+        $delim = substr_count($header, ';') > substr_count($header, ',') ? ';' : ',';
         foreach ($rows as $line) {
             if ($markdown) {
                 $inner = trim($line);
