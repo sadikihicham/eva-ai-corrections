@@ -2115,7 +2115,17 @@ class ActionExecutor {
         if ($tmp === false || $zip->open($tmp, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) throw new \RuntimeException('could not create archive');
         $esc = static fn(string $v): string => htmlspecialchars($v, ENT_XML1 | ENT_COMPAT, 'UTF-8');
         $lines = preg_split("/\\R/u", $text) ?: [];
-        $paras = ''; foreach ($lines as $line) $paras .= '<w:p><w:r><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
+        // Arabic-script lines (Arabic, Urdu, Persian) are right-to-left paragraphs with their language (Urdu 28/09: Word
+        // showed them left-aligned, punctuation on the wrong side). Urdu is told apart by letters Arabic does not have.
+        $paras = '';
+        foreach ($lines as $line) {
+            if (preg_match('/\p{Arabic}/u', $line) === 1) {
+                $lang = preg_match('/[ٹڈڑںےہھگچپژ]/u', $line) === 1 ? 'ur-PK' : 'ar-SA';
+                $paras .= '<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rFonts w:cs="Arial"/><w:rtl/><w:lang w:bidi="' . $lang . '"/></w:rPr><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
+            } else {
+                $paras .= '<w:p><w:r><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
+            }
+        }
         $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
         $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>');
         $zip->addFromString('word/document.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' . $paras . '<w:sectPr/></w:body></w:document>');
@@ -2204,7 +2214,7 @@ class ActionExecutor {
         $isRtl = static fn(string $v): bool => preg_match('/\p{Arabic}|\p{Hebrew}/u', $v) === 1;
         // One paragraph's runs, with **bold** kept.
         $runs = static function (string $v, int $size, bool $bold, string $color) use ($esc, $isRtl): string {
-            $out = ''; $lang = $isRtl($v) ? 'ar-AE' : 'fr-FR';
+            $out = ''; $lang = !$isRtl($v) ? 'fr-FR' : (preg_match('/[ٹڈڑںےہھگچپژ]/u', $v) === 1 ? 'ur-PK' : 'ar-AE');
             foreach (preg_split('/(\*\*[^*]+\*\*)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [$v] as $part) {
                 $b = $bold || (str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4);
                 $t = $b && str_starts_with($part, '**') ? substr($part, 2, -2) : $part;
