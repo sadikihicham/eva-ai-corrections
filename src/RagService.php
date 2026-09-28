@@ -706,13 +706,14 @@ $this->executor->setUserId($userId);
         $answer = $this->removeUnbackedFileLinks($userId, $answer, $messages);
         $lang = substr($this->uiLanguage(), 0, 2);
         if ($this->removedFileLinks && $this->createdFiles !== []) {
-            // The file WAS written; only the model's own link was wrong (prod 28/09 16:19: an Arabic PDF was created and
-            // the answer still said « no matching file was created »). The real links are appended just below.
+            // A file WAS written; a link the model wrote was not (prod 28/09 16:19: an Arabic PDF was created and the
+            // answer still said « no matching file was created »). Worded to stay true when the struck link named ANOTHER,
+            // never-created file, and when the real links were already cited above (review of 38a3756).
             $answer = trim(trim($answer) . "\n\n" . match ($lang) {
-                'fr' => '⚠️ Le lien écrit ci-dessus n\'était pas valide : utilisez les liens du fichier créé, ci-dessous.',
-                'ar' => '⚠️ الرابط المكتوب أعلاه غير صالح: استخدم روابط الملف الذي تم إنشاؤه أدناه.',
-                'de' => '⚠️ Der oben geschriebene Link war ungültig: Verwenden Sie die Links der erstellten Datei unten.',
-                default => '⚠️ The link written above was not valid: use the links of the created file below.',
+                'fr' => '⚠️ Un lien écrit ci-dessus n\'était pas valide et a été retiré. Seuls les fichiers dont le lien figure dans cette réponse ont réellement été créés.',
+                'ar' => '⚠️ رابط مكتوب أعلاه غير صالح وتمت إزالته. الملفات التي يظهر رابطها في هذه الإجابة هي وحدها التي تم إنشاؤها فعلاً.',
+                'de' => '⚠️ Ein oben geschriebener Link war ungültig und wurde entfernt. Nur die Dateien, deren Link in dieser Antwort steht, wurden tatsächlich erstellt.',
+                default => '⚠️ A link written above was not valid and was removed. Only the files whose link appears in this answer were actually created.',
             });
         } elseif ($this->removedFileLinks) {
             $answer = trim(trim($answer) . "\n\n" . match ($lang) {
