@@ -40,7 +40,8 @@ foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE', 'WRITE_AFTER_READ_NUDGE', 'PERSONAL_D
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
     'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
     'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool', 'recoverTextToolCalls', 'recoveredOverwrite',
-    'forcedCompetitionSearch', 'inventionGuard', 'personalDataKinds', 'unreadPersonalData', 'personalDataWriteGuard', 'personalDataNudge', 'weatherPlaceGuard', 'placeKey', 'asksForPlace', 'needsWriteAfterRead', 'urduHint'];
+    'forcedCompetitionSearch', 'inventionGuard', 'personalDataKinds', 'unreadPersonalData', 'personalDataWriteGuard', 'personalDataNudge', 'weatherPlaceGuard', 'placeKey', 'asksForPlace', 'needsWriteAfterRead', 'urduHint',
+    'deckRequest', 'deckUnavailableAnswer', 'conversationLanguage'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -85,6 +86,8 @@ eval('class RagSousTest {
     public function historique(string $c): string { return $this->stripFileLinkLines($c); }
     public function donneesPerso(string $q): array { return $this->personalDataKinds($q); }
     public function ourdou(string $q): string { return $this->urduHint($q); }
+    public function deck(string $q): bool { return $this->deckRequest($q); }
+    public function refusDeck(string $q): string { return $this->deckUnavailableAnswer($q); }
     public function gardeEcriture(string $intention, string $outil, array $outils): ?string { return $this->inventionGuard($intention, $outil, [], $outils, []); }
     public function gardeMeteo(array $args, array $msgs, string $outil = "weather"): ?string { return $this->inventionGuard("", $outil, $args, [], $msgs); }
     ' . $corps . '
@@ -722,6 +725,29 @@ foreach (["as-tu traduit le fichier ?", "traduis le document que je t'ai envoyé
 foreach (["traduis « bonjour » en urdu", "comment traduire un fichier en urdu ?", "translate hello into Urdu"] as $q) {
     verifie('pas une demande de fichier : « ' . $q . ' »', !$t->fichier($q));
 }
+
+// Deck (recette 28/09 09:45) : « crée une carte Deck pour la réunion de lundi » a produit Deck_Carte.md au contenu inventé, réponse
+// en anglais. L'app Deck n'est pas installée : refus honnête, sans modèle, dans la langue de la question.
+$t = new RagSousTest(); $t->langue = 'en';
+foreach (["crée une carte Deck pour la réunion de lundi", "ajoute une tâche dans Deck", "make a new Deck board", "create a Deck card for the sprint",
+    "montre mes cartes Deck", "déplace la carte Deck « budget » dans Terminé", "ajoute ça sur Deck", "crée un tableau Deck Projet X",
+    "أنشئ بطاقة Deck للاجتماع", "Deck کارڈ بنائیں", "put this in Deck", "liste Deck des tâches", "erstelle eine Deck-Karte"] as $q) {
+    verifie('demande Deck reconnue : « ' . $q . ' »', $t->deck($q));
+}
+foreach (["crée un slide deck sur la cybersécurité", "fais un deck de présentation", "crée un deck powerpoint", "un pitch deck pour les investisseurs",
+    "un deck de cartes Pokémon", "construire un deck en bois", "ajoute une slide dans le deck", "the deck of cards", "crée une carte de visite",
+    "crée une carte mentale", "c'est quoi un deck ?", "mets ça dans mon deck commercial", "on the deck of the ship", ""] as $q) {
+    verifie('pas une demande Deck : « ' . $q . ' »', !$t->deck($q));
+}
+$r = $t->refusDeck('crée une carte Deck pour la réunion de lundi');
+verifie('refus Deck en français (question en français, interface en anglais)', str_contains($r, "n'est pas installée") && str_contains($r, 'rien créé'), $r);
+verifie('refus Deck en arabe', str_contains($t->refusDeck('أنشئ بطاقة Deck للاجتماع'), 'غير مثبت'));
+verifie('refus Deck en ourdou (pas en arabe)', str_contains($t->refusDeck('Deck کارڈ بنائیں'), 'انسٹال نہیں'));
+verifie('refus Deck en anglais', str_contains($t->refusDeck('make a new Deck board'), 'is not installed'));
+verifie('refus Deck en allemand', str_contains($t->refusDeck('erstelle eine Deck-Karte'), 'nicht installiert'));
+verifie('refus Deck : aucun lien, aucun ancien nom, aucune promesse d\'action à la place', !str_contains($r, 'http') && !str_contains($r, 'EVA') && !preg_match('/je peux (ajouter|créer)/u', $r));
+verifie('refus Deck branché dans ask() et askStream()', substr_count($source, '$this->deckRefusal($message)') === 2);
+verifie('refus Deck seulement si Deck n\'est pas activé', str_contains($source, "isEnabledForUser('deck')"));
 
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

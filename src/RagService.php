@@ -160,6 +160,10 @@ class RagService {
         $this->personalWriteBlocked = [];
         $this->writeAttempts = 0;
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
+        $deck = $this->deckRefusal($message);
+        if ($deck !== null) {
+            return ['answer' => $deck, 'sources' => [], 'model' => $this->config->get('chat_model'), 'followups' => []];
+        }
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
 
@@ -324,6 +328,11 @@ class RagService {
             }
             if (trim($message) === '') {
                 yield json_encode(['type' => 'error', 'message' => 'Empty message']) . "\n";
+                return;
+            }
+            $deck = $this->deckRefusal($message);
+            if ($deck !== null) {
+                yield json_encode(['type' => 'done', 'answer' => $deck, 'model' => $this->config->get('chat_model'), 'sources' => [], 'followups' => []]) . "\n";
                 return;
             }
             $topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
@@ -956,6 +965,65 @@ $this->executor->setUserId($userId);
             // Prod 28/09 14:20: « میں انسائیکلوپیڈیا AI ہوں » and weather("دبئی") → « Place not found ».
             . 'Your name stays exactly "Infinity AI" in Latin letters (« میں Infinity AI ہوں »). '
             . 'Pass place names to tools in English Latin letters (دبئی → Dubai, کراچی → Karachi, لاہور → Lahore).';
+    }
+
+    /**
+     * The request is about the Deck app (a card, board or list in Deck), not a slide deck. Recette 28/09 09:45: with Deck
+     * not installed, « crée une carte Deck pour la réunion de lundi » produced Deck_Carte.md with invented content and an
+     * English answer. Only the current message counts: an earlier Deck question must not refuse the next request.
+     */
+    private function deckRequest(string $message): bool {
+        $m = mb_strtolower(trim((string)preg_replace('/\s+/u', ' ', $message)));
+        if ($m === '' || mb_strlen($m) > 2000) {
+            return false;
+        }
+        // « carte Deck », « deck card », « Deck-Karte », « Deck کارڈ », « بطاقة Deck », « dans Deck » / « in Deck » (no article:
+        // « dans le deck », « on the deck », « dans mon deck commercial » are slide decks or ships).
+        return preg_match('~(?<!\p{L})(cartes?|tableaux?|listes?|cards?|boards?|stacks?|karten?|brett|bretter|بطاقة|بطاقات|لوحة)\s+deck(?!\p{L})'
+            . '|(?<!\p{L})deck(?:-|\s+)(cards?|boards?|stacks?|karte\p{L}*|brett\p{L}*|کارڈ|بورڈ)(?!\p{L})'
+            . '|(?<!\p{L})(dans|sur|vers|in|into|to|onto|auf|في|إلى)\s+deck(?!\p{L})(?!\s*(de|of|en|powerpoint|slides?)(?!\p{L}))'
+            . '|(?<!\p{L})deck\s+(میں|پر)~u', $m) === 1;
+    }
+
+    /** The honest answer when the Deck app is missing, in the language of the request (not only the interface's). */
+    private function deckUnavailableAnswer(string $message): string {
+        $m = mb_strtolower($message);
+        if (preg_match('~\p{Arabic}~u', $m) === 1) {
+            $lang = preg_match('~[ٹڈڑںےہ]~u', $m) === 1 ? 'ur' : 'ar';
+        } elseif (preg_match('~(?<!\p{L})(karten?|brett|erstell\p{L}*|füg\p{L}*|zeig\p{L}*|verschieb\p{L}*|eine?)(?!\p{L})~u', $m) === 1) {
+            $lang = 'de';
+        } elseif (preg_match('~(?<!\p{L})(cartes?|tableaux?|listes?|dans|sur|cr[ée]+\p{L}*|ajout\p{L}*|montr\p{L}*|d[ée]plac\p{L}*|mets|mes|une?)(?!\p{L})~u', $m) === 1) {
+            $lang = 'fr';
+        } elseif (preg_match('~(?<!\p{L})(cards?|boards?|create|make|add|show|move|put|my|a|the|in|into)(?!\p{L})~u', $m) === 1) {
+            $lang = 'en';
+        } else {
+            $lang = substr($this->conversationLanguage($m, $this->uiLanguage()), 0, 2);
+        }
+        return match ($lang) {
+            'fr' => "L'application **Deck** n'est pas installée sur ce Nextcloud : je ne peux ni créer, ni lire, ni modifier de carte ou de tableau Deck, et je n'ai rien créé à la place. Votre administrateur peut l'installer. Dites-moi si vous voulez autre chose à la place.",
+            'ar' => 'تطبيق **Deck** غير مثبت على Nextcloud هذا، لذلك لا يمكنني إنشاء بطاقات أو لوحات Deck أو قراءتها أو تعديلها، ولم أنشئ أي شيء بديلاً عنها. يمكن لمسؤول النظام تثبيته. أخبرني إن كنت تريد شيئاً آخر بدلاً من ذلك.',
+            'ur' => '**Deck** ایپ اس Nextcloud پر انسٹال نہیں ہے، اس لیے میں Deck کارڈ یا بورڈ نہ بنا سکتا ہوں، نہ پڑھ سکتا ہوں اور نہ بدل سکتا ہوں، اور میں نے اس کی جگہ کچھ نہیں بنایا۔ آپ کا ایڈمنسٹریٹر اسے انسٹال کر سکتا ہے۔ اگر آپ اس کی جگہ کچھ اور چاہتے ہیں تو بتائیں۔',
+            'de' => 'Die App **Deck** ist auf dieser Nextcloud nicht installiert: Ich kann keine Deck-Karten oder -Boards erstellen, lesen oder ändern und habe stattdessen nichts angelegt. Ihr Administrator kann sie installieren. Sagen Sie mir, ob Sie stattdessen etwas anderes möchten.',
+            default => 'The **Deck** app is not installed on this Nextcloud, so I cannot create, read or change Deck cards or boards, and I have not created anything instead. Your administrator can install it. Tell me if you would like something else instead.',
+        };
+    }
+
+    /**
+     * Answer given without the model when the request needs the Deck app and Deck is not enabled for the user. With Deck
+     * enabled, the model keeps its generic confirmation-gated adapter (discover_app_api / call_app_api).
+     */
+    private function deckRefusal(string $message): ?string {
+        if (!$this->deckRequest($message)) {
+            return null;
+        }
+        try {
+            if (\OCP\Server::get(\OCP\App\IAppManager::class)->isEnabledForUser('deck')) {
+                return null;
+            }
+        } catch (\Throwable $e) {
+            // Unknown state: refusing is honest (nothing is created), inventing a file is not.
+        }
+        return $this->deckUnavailableAnswer($message);
     }
 
     /** True when the user asks EVA to produce a file (not how to make one). */
