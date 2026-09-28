@@ -1355,7 +1355,15 @@ $this->executor->setUserId($userId);
                 continue;
             }
             $content = is_string($msg['content'] ?? null) ? $msg['content'] : (string)json_encode($msg['content'] ?? '', JSON_UNESCAPED_UNICODE);
-            $said .= ' ' . $content;
+            // Not the file excerpts the RAG puts before "User question:" (prod 28/09 12:05, G.2: "Quel temps fera-t-il
+            // demain ?" ran weather("Abu Dhabi") because an indexed document named the city). The user's own
+            // KNOWLEDGE.md facts ("I live in Sharjah") still count.
+            if ($role === 'user' && ($q = mb_strrpos($content, 'User question: ')) !== false) {
+                $facts = preg_match('~<personal_knowledge>(.*?)</personal_knowledge>~s', $content, $k) === 1 ? $k[1] : '';
+                $said .= ' ' . $facts . ' ' . mb_substr($content, $q + 15);
+            } else {
+                $said .= ' ' . $content;
+            }
             if ($role === 'user' && !str_starts_with($content, '[Automatic check by EVA')) {
                 $current = $content;
             }
