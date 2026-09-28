@@ -705,7 +705,16 @@ $this->executor->setUserId($userId);
         $answer = rtrim(ltrim($answer, "\r\n"));
         $answer = $this->removeUnbackedFileLinks($userId, $answer, $messages);
         $lang = substr($this->uiLanguage(), 0, 2);
-        if ($this->removedFileLinks) {
+        if ($this->removedFileLinks && $this->createdFiles !== []) {
+            // The file WAS written; only the model's own link was wrong (prod 28/09 16:19: an Arabic PDF was created and
+            // the answer still said « no matching file was created »). The real links are appended just below.
+            $answer = trim(trim($answer) . "\n\n" . match ($lang) {
+                'fr' => '⚠️ Le lien écrit ci-dessus n\'était pas valide : utilisez les liens du fichier créé, ci-dessous.',
+                'ar' => '⚠️ الرابط المكتوب أعلاه غير صالح: استخدم روابط الملف الذي تم إنشاؤه أدناه.',
+                'de' => '⚠️ Der oben geschriebene Link war ungültig: Verwenden Sie die Links der erstellten Datei unten.',
+                default => '⚠️ The link written above was not valid: use the links of the created file below.',
+            });
+        } elseif ($this->removedFileLinks) {
             $answer = trim(trim($answer) . "\n\n" . match ($lang) {
                 'fr' => '⚠️ Attention : aucun fichier correspondant n\'a été créé ni trouvé — le lien ci-dessus n\'était pas fiable. Redemandez si besoin.',
                 'ar' => '⚠️ تنبيه: لم يتم إنشاء أو العثور على أي ملف مطابق — الرابط أعلاه غير موثوق. أعد الطلب إذا لزم الأمر.',
