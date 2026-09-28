@@ -198,11 +198,12 @@ class RagService {
                     : $tc['arguments'];
                 if ($onProgress !== null) $onProgress('tool', (string)($tc['name'] ?? ''), is_array($toolArgs) ? $toolArgs : []);
 				$toolStartedAt = microtime(true);
-				$res = $seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
+				$overwrite = !empty($tc['recovered']) ? $this->recoveredOverwrite($userId, $tc) : null;
+				$res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
 					? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
 						: ($autonomousActions
 							? $this->executor->runConfirmed($userId, $tc['name'], $toolArgs)
-							: $this->executor->run($userId, $tc['name'], $toolArgs));
+							: $this->executor->run($userId, $tc['name'], $toolArgs)));
 				if ($onProgress !== null) $onProgress('tool_result', (string)($tc['name'] ?? ''), [
 					'ok' => !empty($res['ok']),
 					'error' => mb_substr((string)($res['error'] ?? ''), 0, 300),
@@ -386,9 +387,10 @@ $this->executor->setUserId($userId);
                     $toolStartedAt = microtime(true);
                     $fingerprint = hash('sha256', $toolName . ':' . json_encode($toolArgs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
                     $seenToolCalls[$fingerprint] = ($seenToolCalls[$fingerprint] ?? 0) + 1;
-                    $res = $seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
+                    $overwrite = !empty($tc['recovered']) ? $this->recoveredOverwrite($userId, $tc) : null;
+                    $res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
                         ? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
-                        : $this->executor->run($userId, $toolName, $toolArgs);
+                        : $this->executor->run($userId, $toolName, $toolArgs));
                     $res = $this->explainUnknownTool($res);
                     $this->collectToolSources($toolName, $res);
                     $toolFailure = $toolFailure || empty($res['ok']);
@@ -958,12 +960,37 @@ $this->executor->setUserId($userId);
             if ($name === '' || !is_array($args) || !in_array($name, self::RECOVERABLE_TOOLS, true) || !$this->hasTool($tools, $name)) {
                 return null;
             }
-            $calls[] = ['name' => $name, 'arguments' => $args];
+            $calls[] = ['name' => $name, 'arguments' => $args, 'recovered' => true];
             $raw[] = ['id' => 'call_' . bin2hex(random_bytes(4)), 'type' => 'function', 'function' => ['name' => $name, 'arguments' => json_encode($args, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)]];
         }
         $rest = trim((string)preg_replace('~<tool_call>.*?(?:</tool_call>|$)~s', '', $answer));
         $this->logger->warning('EVA recovered ' . count($calls) . ' tool call(s) written as text by the model');
         return [$calls, $raw, $rest];
+    }
+
+    /**
+     * A call recovered from text never overwrites an existing file (create_file overwrites silently): the error to give
+     * back, or null. Fails closed: if the check itself fails, nothing is written (security re-review of 0d1cf93).
+     */
+    private function recoveredOverwrite(string $userId, array $tc): ?string {
+        $args = is_array($tc['arguments'] ?? null) ? $tc['arguments'] : [];
+        $paths = match ((string)($tc['name'] ?? '')) {
+            'create_file' => [$args['path'] ?? ''],
+            'create_files' => array_map(static fn($f): string => is_array($f) ? (string)($f['path'] ?? '') : '', is_array($args['files'] ?? null) ? $args['files'] : []),
+            default => [],
+        };
+        try {
+            $home = $this->rootFolder->getUserFolder($userId);
+            foreach ($paths as $path) {
+                $path = trim((string)$path, "/ \t");
+                if ($path !== '' && $home->nodeExists($path)) {
+                    return 'A file named "' . $path . '" already exists and this call may not replace it. Nothing was written: choose a new file name.';
+                }
+            }
+        } catch (\Throwable $e) {
+            return 'Could not check whether the file already exists. Nothing was written.';
+        }
+        return null;
     }
 
     /**

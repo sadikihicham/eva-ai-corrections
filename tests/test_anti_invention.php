@@ -39,7 +39,7 @@ foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE'] as $c) {
 // eval() ne charge que du code extrait de NOTRE fichier versionné src/RagService.php (voir test_liens_fichiers.php).
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
     'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
-    'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool', 'recoverTextToolCalls'];
+    'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool', 'recoverTextToolCalls', 'recoveredOverwrite'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -72,6 +72,8 @@ eval('class RagSousTest {
     public function meteo(string $q): bool { return $this->isWeatherQuestion($q); }
     public function intention(string $m, array $h): string { return $this->requestIntent($m, $h); }
     public function inconnu(array $r): array { return $this->explainUnknownTool($r); }
+    public object $rootFolder;
+    public function ecrase(array $tc): ?string { return $this->recoveredOverwrite("hicham", $tc); }
     public function recupere(string $a, array $outils, array $msgs = []): ?array { return $this->recoverTextToolCalls($a, $outils, $msgs); }
     public function fichier(string $q): bool { return $this->isFileCreationRequest($q); }
     public function relance(string $q, string $reponse, array $outils): bool { return $this->needsCreationNudge($q, $reponse, $outils); }
@@ -317,6 +319,16 @@ verifie('aucun outil (lecture seule) → PAS récupéré', $t->recupere($texte, 
 verifie('JSON illisible → PAS récupéré', $t->recupere('<tool_call>{"name": "create_file", "arguments": {"path": </tool_call>', $tous) === null);
 verifie('texte AVANT l\'appel (citation possible) → PAS exécuté', $t->recupere("Voici le format :\n<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"php\"}}</tool_call>", $tous) === null);
 verifie('balise non fermée en fin de réponse acceptée', ($r2 = $t->recupere("<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"php\"}}", $tous)) !== null && $r2[0][0]['arguments']['query'] === 'php', json_encode($r2, JSON_UNESCAPED_UNICODE));
+$t->rootFolder = new class { public bool $panne = false; public function getUserFolder(string $u): object { if ($this->panne) throw new RuntimeException('x'); return new class { public function nodeExists(string $p): bool { return in_array($p, ['Documents/Performance_semaine.xlsx', 'CR.docx'], true); } }; } };
+verifie('appel récupéré : create_file sur un fichier EXISTANT → refusé', $t->ecrase(['name' => 'create_file', 'arguments' => ['path' => '/Documents/Performance_semaine.xlsx']]) !== null);
+verifie('appel récupéré : create_files dont un chemin existe → refusé', $t->ecrase(['name' => 'create_files', 'arguments' => ['files' => [['path' => 'neuf.docx'], ['path' => 'CR.docx']]]]) !== null);
+verifie('appel récupéré : nouveau fichier → autorisé', $t->ecrase(['name' => 'create_file', 'arguments' => ['path' => 'Documents/Explication.docx']]) === null);
+verifie('appel récupéré : recherche web → non concerné', $t->ecrase(['name' => 'web_search', 'arguments' => ['query' => 'x']]) === null);
+$t->rootFolder->panne = true;
+verifie('vérification impossible → refusé (échec du côté sûr)', $t->ecrase(['name' => 'create_file', 'arguments' => ['path' => 'x.docx']]) !== null);
+verifie('les appels récupérés sont marqués « recovered »', ($t->recupere("<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"php\"}}</tool_call>", $tous)[0][0]['recovered'] ?? false) === true);
+verifie('garde du mode autonome présente dans ask() (contrôle de source)', preg_match('~!\$autonomousActions && \(\$recovered = \$this->recoverTextToolCalls\(~', $source) === 1);
+verifie('garde d\'écrasement branchée dans les DEUX boucles (contrôle de source)', substr_count($source, "!empty(\$tc['recovered']) ? \$this->recoveredOverwrite(") === 2);
 verifie('réponse normale → rien', $t->recupere('Bonjour, voici la réponse.', $tous) === null);
 verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
 $r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
