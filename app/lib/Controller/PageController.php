@@ -103,10 +103,11 @@ class PageController extends Controller {
             'content' => 'standalone-1',
         ]);
 
+        $dictation = $this->localDictationOrigin();
         $response = new TemplateResponse('eva_ai', 'standalone', [
             'version' => 'standalone-1',
         ]);
-        $this->allowWebImages($response);
+        $this->allowWebImages($response, $dictation);
         return $this->noCache($response);
     }
 
@@ -149,11 +150,55 @@ class PageController extends Controller {
                 'content' => 'shell-v2',
             ]);
         }
+        $dictation = $this->localDictationOrigin();
         $response = new TemplateResponse('eva_ai', $template, [
             'apiBase' => $this->urlGenerator->getAbsoluteURL('/ocs/v2.php/apps/eva_ai/api/'),
         ]);
-        $this->allowWebImages($response);
+        $this->allowWebImages($response, $dictation);
         return $this->noCache($response);
+    }
+
+    /**
+     * Dictation runs on the user's own computer: the page records, a local Whisper
+     * (on localhost) transcribes, and only the text reaches Nextcloud when the user
+     * sends it. The audio never leaves the machine.
+     *
+     * Enabled by the admin with `occ config:app:set eva_ai dictation_local_url
+     * --value=http://localhost:8178/v1`. The URL is accepted ONLY for the hosts
+     * localhost and 127.0.0.1: any other value keeps dictation off, so the page can
+     * never be told to send a recording to another machine. When accepted, the
+     * micro script is loaded, the URL is given to it in a meta tag, and the page's
+     * CSP allows connections to that local origin only.
+     *
+     * @return string|null the origin (scheme://host:port) to allow, or null when off
+     */
+    private function localDictationOrigin(): ?string {
+        $url = trim(\OCP\Server::get(\OCP\IAppConfig::class)->getValueString('eva_ai', 'dictation_local_url', ''));
+        $origin = self::localOrigin($url);
+        if ($origin === null) {
+            return null;
+        }
+        \OCP\Util::addScript('eva_ai', 'micro');
+        \OCP\Util::addHeader('meta', ['name' => 'eva-ai-dictation', 'content' => rtrim($url, '/')]);
+        return $origin;
+    }
+
+    /** scheme://host[:port] of a localhost/127.0.0.1 http(s) URL without credentials, else null. */
+    public static function localOrigin(string $url): ?string {
+        if ($url === '' || preg_match('/[\s"<>\\\\]/', $url) === 1) {
+            return null;
+        }
+        $parts = parse_url($url);
+        if (!is_array($parts) || isset($parts['user']) || isset($parts['pass']) || isset($parts['query']) || isset($parts['fragment'])) {
+            return null;
+        }
+        $scheme = strtolower((string)($parts['scheme'] ?? ''));
+        $host = strtolower((string)($parts['host'] ?? ''));
+        if (!in_array($scheme, ['http', 'https'], true) || !in_array($host, ['localhost', '127.0.0.1'], true)) {
+            return null;
+        }
+        $port = $parts['port'] ?? null;
+        return $scheme . '://' . $host . ($port !== null ? ':' . (int)$port : '');
     }
 
     /**
@@ -172,9 +217,12 @@ class PageController extends Controller {
      * reader, and they load lazily, so an image the user never scrolls to is
      * never fetched.
      */
-    private function allowWebImages(TemplateResponse $response): void {
+    private function allowWebImages(TemplateResponse $response, ?string $dictationOrigin = null): void {
         $policy = new ContentSecurityPolicy();
         $policy->addAllowedImageDomain('*');
+        if ($dictationOrigin !== null) {
+            $policy->addAllowedConnectDomain($dictationOrigin);
+        }
         $response->setContentSecurityPolicy($policy);
     }
 

@@ -1,72 +1,58 @@
-# Contrat de la dictée (bouton micro d'Infinity AI) — v1, 28/09/2026
+# Contrat de la dictée (bouton micro d'Infinity AI) — v2, 28/09/2026
 
-Figé AVANT le travail des agents. Toute modification = décision de l'intégrateur, jamais d'un agent seul.
+Remplace la v1 (route audio côté serveur, ABANDONNÉE). Toute modification = décision de l'intégrateur.
 
-## Décisions admin
-- Whisper tourne sur le Mac de l'admin (TEST : pas pour tous les employés tant que non décidé).
-- Enregistrement : **120 s maximum**. Langue : **détection automatique**.
-- Mesuré le 28/09 sur les vraies dictées de l'admin : la détection se trompe sur des phrases courtes
-  (« is » islandais p=0,58 ; « en » p=0,49 sur 1,5 s). Forcer une MAUVAISE langue produit du charabia
-  (arabe forcé en « fr » → texte français inventé). D'où la règle de repli ci-dessous.
+## Décisions admin (28/09)
+- **L'audio ne quitte JAMAIS l'ordinateur de l'utilisateur.** Seul le texte transcrit va à Infinity AI,
+  et seulement quand l'utilisateur l'envoie lui-même.
+- Transcription par Whisper installé **sur l'ordinateur de l'utilisateur** (test : le Mac de l'admin).
+  Les autres postes n'ont rien : le bouton n'apparaît simplement pas chez eux.
+- Langue de la voix : **« Automatique » par défaut + choix manuel** (fr / ar / en), mémorisé.
+- Le texte est inséré dans la **zone de saisie** ; l'utilisateur relit et envoie. Jamais d'envoi automatique.
+- Enregistrement : **120 s maximum**.
 
-## Service Whisper (déjà en place, ne pas modifier)
-- whisper.cpp `whisper-server` 1.9.4, modèle large-v3-turbo, `-l auto`, chemin OpenAI :
-  `POST {dictation_url}/audio/transcriptions` (multipart : `file`, `response_format`, `language` facultatif).
-- Test local : `dictation_url = http://127.0.0.1:8178/v1` (écoute 127.0.0.1 seulement).
-- `response_format=verbose_json` renvoie `{"text": "...", "language": "arabic"|"french"|"english"|...}`
-  (NOM ANGLAIS COMPLET, pas le code ISO). `json` renvoie `{"text": "..."}`.
-- Pas de clé d'API.
+## Chemin des données
+navigateur (page Infinity AI) → `http://localhost:8178/v1/audio/transcriptions` (Whisper local)
+→ texte → zone de saisie → (envoi manuel par l'utilisateur) → Nextcloud.
+Aucune route audio dans eva_ai. Le serveur ne reçoit que le message tapé/dicté, comme aujourd'hui.
 
-## Réglages (app config `eva_ai`, admin seulement, posés par `occ config:app:set eva_ai …`)
-| Clé | Exemple | Absent/vide ⇒ |
-|---|---|---|
-| `dictation_url` | `http://192.168.1.50:8178/v1` | dictée désactivée (`available:false`) |
-| `dictation_enabled` | `yes` / `no` | `no` (désactivée) |
-Indépendant du fournisseur de chat : ne JAMAIS réutiliser l'URL de `chat_provider` (vLLM).
+## Whisper local (déjà en place sur le Mac, ne pas modifier)
+- whisper.cpp `whisper-server` 1.9.4, large-v3-turbo, `-l auto`, écoute **127.0.0.1:8178** seulement.
+- `POST /v1/audio/transcriptions` multipart : `file` (WAV PCM 16 bits mono 16 kHz), `response_format`
+  (`json` → `{text}` ; `verbose_json` → `{text, language}` avec langue en NOM ANGLAIS COMPLET : "arabic"),
+  `language` facultatif (code ISO : `fr`, `ar`, `en` — vérifié : impose la langue).
+- CORS : répond `Access-Control-Allow-Origin: *` (vérifié). Pas d'en-tête Private-Network.
+- `GET /` → 200 (sert à tester la disponibilité).
 
-## Routes (ajoutées à `appinfo/routes.php`, contrôleur NEUF `DictationController`)
-Base : `/apps/eva_ai` (sous-chemin Nextcloud `/workspace` en production → `/workspace/apps/eva_ai/...`
-côté navigateur ; le front lit la base dans `<meta name="eva-ai-api">` ou via `OC.generateUrl`).
+## Règle de langue (faite dans le NAVIGATEUR)
+- Choix manuel fr/ar/en ⇒ envoyer `language=<code>` (un seul appel).
+- « Automatique » ⇒ appel en `verbose_json` sans `language` ; si la langue détectée ∉ {french, arabic,
+  english} ⇒ **UN SEUL** second appel avec `language=<langue de l'interface Nextcloud, 2 lettres>` si elle
+  est fr/ar/en, sinon `fr`. (Mesuré : la détection a rendu « islandais » sur une vraie dictée courte ;
+  imposer une MAUVAISE langue produit du charabia, d'où le choix manuel.)
+- Réponse `[BLANK_AUDIO]` / vide ⇒ message « rien d'audible », rien inséré.
 
-### `GET /api/dictation/status`
-- Utilisateur connecté (`#[NoAdminRequired]`), CSRF standard.
-- Réponse 200 : `{"available": bool, "maxSeconds": 120}`.
-- `available` = réglages présents ET `GET {dictation_url}/..` joignable (sonde HTTP, délai 3 s),
-  résultat mis en cache **30 s** (ICacheFactory, clé par instance, pas par utilisateur).
+## Serveur eva_ai (PageController seulement)
+- Réglage app `eva_ai` / `dictation_local_url` (ex. `http://localhost:8178/v1`), posé par
+  `occ config:app:set eva_ai dictation_local_url --value=…`. Vide/absent ⇒ fonction ÉTEINTE (rien chargé).
+- **Garde-fou** : l'URL n'est acceptée que si son hôte est exactement `localhost` ou `127.0.0.1`
+  (schéma http/https, port facultatif, pas d'utilisateur/mot de passe). Toute autre valeur ⇒ éteinte.
+  C'est ce qui garantit que la page ne peut pas envoyer l'audio ailleurs que sur la machine de l'utilisateur.
+- Si valide, sur les 2 pages (app et standalone) : `Util::addScript('eva_ai', 'micro')`,
+  meta `eva-ai-dictation` = l'URL, et CSP `addAllowedConnectDomain(<schéma://hôte:port>)`.
 
-### `POST /api/dictation`
-- Utilisateur connecté, **jeton CSRF obligatoire** (en-tête `requesttoken`), limite de fréquence
-  **20 requêtes / 10 min / utilisateur** (`#[UserRateLimit(limit: 20, period: 600)]`).
-- Corps multipart : `audio` = fichier WAV **PCM 16 bits, mono, 16 000 Hz** ; `lang` = langue de
-  l'interface (`fr|en|ar|de|ur`, facultatif, défaut `fr`).
-- Contrôles serveur AVANT tout envoi : en-tête RIFF/WAVE valide, format 1 (PCM), 1 canal, 16 000 Hz,
-  16 bits ; durée = octets de données / 32 000 ≤ **121 s** ; taille ≤ 4 000 000 octets.
-- Envoi à Whisper : `response_format=verbose_json`, sans `language`. Si la langue détectée n'est pas
-  dans {french, arabic, english, german, urdu} → **UN SEUL** nouvel essai avec `language=<lang>`.
-  Délai 60 s par appel. Client HTTP Nextcloud avec `['nextcloud' => ['allow_local_address' => true]]`
-  (**[non vérifié]** : à confirmer sur NC 34 ; sinon le réglage `allow_local_remote_servers`).
-- Réponse 200 : `{"text": "…", "language": "fr"|"ar"|"en"|"de"|"ur"}` (code ISO 639-1).
-  Texte vide ou `[BLANK_AUDIO]` → 200 avec `"text": ""`.
-- Erreurs (JSON `{"error": "<code>"}`) :
-  | HTTP | code | cas |
-  |---|---|---|
-  | 400 | `invalid_audio` | pas de fichier, pas un WAV PCM 16 k mono 16 bits |
-  | 413 | `too_long` | > 121 s ou > 4 000 000 octets |
-  | 429 | `rate_limited` | limite de fréquence (réponse Nextcloud standard acceptée) |
-  | 503 | `unavailable` | dictée désactivée / non configurée / Whisper injoignable |
-  | 502 | `failed` | Whisper a répondu une erreur ou une réponse illisible |
-- Confidentialité : l'audio n'est **jamais écrit sur disque** (mémoire seulement), le **texte n'est
-  jamais journalisé** ; le journal ne contient que : utilisateur, durée, langue, statut, temps.
+## Interface (`app/js/micro.js`, fichier NEUF)
+- Lit `<meta name="eva-ai-dictation">` ; absent ⇒ ne fait rien.
+- `disponible()` : `GET <origine>/` (délai 2 s) au chargement puis toutes les 60 s ; échec ⇒ **aucun bouton**
+  (poste sans Whisper) ; redevenu joignable ⇒ bouton affiché.
+- Bouton micro + menu langue (« Auto », FR, AR, EN) à côté du bouton d'envoi ; `MutationObserver`.
+- `transcrire(wav, langue)` : seule fonction qui parle à Whisper.
+- Insertion au curseur + événement `input` ; textes fr/en/ar/de/ur ; RTL ; accessibilité ; Échap = annuler ;
+  compteur 2 min. Jamais de texte dicté dans la console. Jamais d'appel à un autre hôte que celui de la meta.
 
-## Interface (`app/js/micro.js`, fichier NEUF, chargé par `PageController` après le bundle principal)
-- Repris du prototype `~/whisper-test/prototype/micro.js` (encodage WAV 16 kHz testé Chrome/Safari).
-- S'accroche à la zone de saisie du chat du bundle compilé (sélecteur trouvé en lisant le bundle ;
-  `MutationObserver` car Vue re-rend) ; aucun octet du bundle compilé n'est modifié.
-- Au chargement puis toutes les 60 s : `GET /api/dictation/status` ; `available:false` → bouton grisé
-  + info-bulle « Service de dictée hors ligne ». Aucune erreur visible si la route n'existe pas (404) :
-  le bouton n'apparaît simplement pas.
-- Envoi : `POST /api/dictation` avec `requesttoken` (meta `requesttoken` ou `OC.requestToken`),
-  `lang` = `document.documentElement.lang` réduit à 2 lettres.
-- Insertion au curseur + événement `input` (v-model de Vue). Textes fr/en/ar/de/ur, RTL par propriétés
-  logiques, bouton accessible (aria-label, aria-pressed, Échap = annuler), 2 min max avec compteur.
-- Messages pour 413/429/502/503 distincts ; jamais de texte de l'utilisateur dans la console.
+## Prérequis navigateur (hors code)
+- Micro = contexte sécurisé : **HTTPS obligatoire** pour la page Nextcloud (phase 1 HTTPS). Avant cela,
+  test possible sur le seul Mac de l'admin avec le drapeau Chrome
+  `chrome://flags/#unsafely-treat-insecure-origin-as-secure` = `http://192.168.1.99`.
+- **[non vérifié]** Page HTTPS → `http://localhost` : autorisé par Chrome/Firefox (localhost « de confiance ») ;
+  Safari à tester. Chrome récent peut demander l'autorisation « appareils du réseau local » : à tester.
