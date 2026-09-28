@@ -1143,7 +1143,7 @@ class ActionExecutor {
         // once, and create_file overwrites. The user confirms in the dialog, which runs the call again confirmed.
         if (!$confirmed && $home !== null && ($existing = $this->existingWriteTargets($home, $name, $args)) !== []) {
             return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
-                'risk' => ToolPolicy::RISK_MUTATING,
+                'risk' => ToolPolicy::RISK_MUTATING, 'existing' => $existing,
                 'error' => 'The file ' . implode(', ', $existing) . ' already exists and would be replaced: the user is asked to confirm. '
                     . 'If they would rather keep it, write to a new file name.'];
         }
@@ -2622,6 +2622,9 @@ class ActionExecutor {
             'create_file' => [(string)($args['path'] ?? '')],
             'create_files' => array_map(static fn($f): string => is_array($f) ? (string)($f['path'] ?? '') : '', is_array($args['files'] ?? null) ? $args['files'] : []),
             'convert_file' => [$this->convertTargetPath($args) ?? ''],
+            // Same path as createNote(): notes folder + title with ".md" (review of d889ebd: a note was replaced silently).
+            'create_note' => [trim((string)($args['title'] ?? '')) === '' ? '' : self::NOTES_FOLDER . '/'
+                . $this->cleanName(str_ends_with(strtolower(trim((string)$args['title'])), '.md') ? trim((string)$args['title']) : trim((string)$args['title']) . '.md')],
             default => [],
         };
         $existing = [];
@@ -2644,17 +2647,15 @@ class ActionExecutor {
         if (!in_array($format, self::CONVERT_TARGETS, true)) {
             return null;
         }
-        $target = trim((string)($args['target_path'] ?? ''));
+        // target_path, else the source path; its extension is always the requested format (review of d889ebd:
+        // target_format pdf + target_path "x.docx" wrote a DOCX).
+        $target = $this->cleanPath(trim((string)($args['target_path'] ?? '')) ?: (string)($args['path'] ?? ''));
         if ($target === '') {
-            $source = $this->cleanPath((string)($args['path'] ?? ''));
-            if ($source === '') {
-                return null;
-            }
-            $dot = strrpos($source, '.');
-            $slash = strrpos($source, '/');
-            $target = ($dot !== false && ($slash === false || $dot > $slash) ? substr($source, 0, $dot) : $source) . '.' . $format;
+            return null;
         }
-        return $this->cleanPath($target);
+        $dot = strrpos($target, '.');
+        $slash = strrpos($target, '/');
+        return ($dot !== false && ($slash === false || $dot > $slash) ? substr($target, 0, $dot) : $target) . '.' . $format;
     }
 
     /**
@@ -2686,7 +2687,9 @@ class ActionExecutor {
                 return $read;
             }
             $text = (string)($read['result']['content'] ?? '');
-            if (!empty($read['result']['has_more'])) {
+            // The indexer cuts the extracted text at 100 000 characters without saying so (Indexer::extractTextForAgent):
+            // at that length the source may be longer, and a truncated conversion must never be reported as done.
+            if (!empty($read['result']['has_more']) || (int)($read['result']['total_chars'] ?? 0) >= 100000) {
                 return ['ok' => false, 'error' => 'The source is too long to convert in one step (more than ' . self::MAX_READ_CHUNK_CHARS . ' characters). Nothing was written.'];
             }
         } else {
@@ -2698,8 +2701,9 @@ class ActionExecutor {
                 return ['ok' => false, 'error' => 'This file type cannot be converted (no readable text). Nothing was written.'];
             }
         }
-        // Page markers added by the PDF extraction ("[Page 1]", " 1/1") are not content.
-        $text = trim((string)preg_replace(['/^\[Page \d+\]\s*$/mu', '/^\s*\d+\s*\/\s*\d+\s*$/mu'], '', $text));
+        // Page markers of a PDF ("[Page 1]" from OCR, the " 1/1" footer of EVA's PDFs) are not content. PDF only: a line
+        // "12/20" in a Markdown or text file is content (review of d889ebd).
+        $text = trim($ext === 'pdf' ? (string)preg_replace(['/^\[Page \d+\]\s*$/mu', '/^\s*\d+\s*\/\s*\d+\s*$/mu'], '', $text) : $text);
         if ($text === '') {
             return ['ok' => false, 'error' => 'No text could be read from ' . $source . ' (a scanned PDF needs OCR, which is not enabled). Nothing was written.'];
         }

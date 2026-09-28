@@ -69,7 +69,7 @@ class RagService {
     private const CREATION_NUDGE = '[Automatic check by EVA, not written by the user] Nothing was done: you answered without calling any tool, so no file exists '
         . 'and any link you wrote is invalid. Do it now, in this order: (1) if the file must contain the user\'s own data (calendar events, '
         . 'mails, tasks, contacts, files), FIRST call the tool that reads that data (e.g. list_calendar_events for appointments) - never write '
-        . 'data you have not read with a tool; (2) then call create_file with that real content (to convert a file into another format, call convert_file; to change an existing file, read it, then write its full new content with create_file on the same path). Answer in the language of the user\'s request.';
+        . 'data you have not read with a tool; (2) then call create_file with that real content (to convert a file into another format, call convert_file; to change an existing file, read it, then write the changed version with create_file under a NEW name such as "Name (modifié).pdf" — never replace the original unless the user asked for it). Answer in the language of the user\'s request.';
 
     public function __construct(
         private AppConfig $config,
@@ -218,7 +218,7 @@ class RagService {
 				if (!empty($res['confirmation_required'])) {
 					$confirmationName = (string)($res['tool'] ?? $tc['name'] ?? '');
 					return [
-						'answer' => 'I need your confirmation before I can perform that action.',
+						'answer' => ($res['existing'] ?? []) !== [] ? $this->overwriteQuestion((array)$res['existing']) : 'I need your confirmation before I can perform that action.',
 						'sources' => $this->answerSources($byDoc),
 						'model' => $chat['model'] ?? $this->config->get('chat_model'),
 						'error' => null,
@@ -229,6 +229,7 @@ class RagService {
 							'risk' => $res['risk'] ?? ToolPolicy::RISK_MUTATING,
 							'reason' => ($res['missing'] ?? []) !== [] ? 'missing' : 'review',
 							'missing' => $res['missing'] ?? [],
+							'existing' => $res['existing'] ?? [],
 						],
 					];
 				}
@@ -396,6 +397,10 @@ $this->executor->setUserId($userId);
                     $toolFailure = $toolFailure || empty($res['ok']);
 					if (!empty($res['confirmation_required'])) {
 						$confirmationName = (string)($res['tool'] ?? $toolName ?? '');
+						if (($res['existing'] ?? []) !== []) {
+							// Say WHAT is confirmed: the dialog alone does not show that a file would be replaced.
+							yield json_encode(['type' => 'content', 'delta' => $this->overwriteQuestion((array)$res['existing'])], JSON_UNESCAPED_UNICODE) . "\n";
+						}
 						yield json_encode([
 							'type' => 'confirmation',
 							'name' => $confirmationName,
@@ -403,6 +408,7 @@ $this->executor->setUserId($userId);
                             'risk' => $res['risk'] ?? ToolPolicy::RISK_MUTATING,
                             'reason' => ($res['missing'] ?? []) !== [] ? 'missing' : 'review',
                             'missing' => $res['missing'] ?? [],
+                            'existing' => $res['existing'] ?? [],
                         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
                         return;
                     }
@@ -834,16 +840,25 @@ $this->executor->setUserId($userId);
         // The object must be introduced as a NEW thing: "un/une/a/an/en/as/new …" (third review: « un paragraphe sur
         // les fichiers PDF » is text). Arabic has no such article: its objects stay direct.
         $intro = '(?<!\p{L})(un|une|a|an|en|as|au\s+format|new|nouveau|nouvelle|neue?s?|ein|eine)\s+(\p{L}+\s+)?';
-        return preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,60}' . $intro . $existing . $object . '(?!\p{L})~u', $m) === 1
+        $creation = preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,60}' . $intro . $existing . $object . '(?!\p{L})~u', $m) === 1
             // "crée pdf", "creat pdf", "export excel": a format right after the verb, no article needed.
             || preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})\s+(moi\s+|me\s+|nous\s+|it\s+|this\s+|ça\s+|cela\s+|le\s+tout\s+)?(en\s+|as\s+|to\s+|au\s+format\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
             // "convert this file to pdf": a conversion names its target format, no "new" article (test 28/09 ~07:15).
             || preg_match('~(?<!\p{L})(convert\p{L}*|transform\p{L}*|umwandel\p{L}*|حوّل|حول)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,60}(?<!\p{L})(en|to|into|in|as|vers|au\s+format|إلى|الى)\s+(\p{L}+\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
-            || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,40}(ملف|مستند|اكسل)~u', $m) === 1
-            // Changing an EXISTING file is a write too (test 28/09 06:14: "ajoute la date dans le fichier X.pdf" was answered
-            // "le fichier a été mis à jour" with no tool, and no notice). Only with a file named as the place of the change.
-            || preg_match('~(?<!\p{L})(ajout\p{L}*|rajout\p{L}*|ins[ée]r\p{L}*|compl[èée]t\p{L}*|modifi\p{L}*|[ée]dit\p{L}*|corrig\p{L}*|remplac\p{L}*|mets?\s+[àa]\s+jour|mettre\s+[àa]\s+jour|add|append|insert|edit|update|modify|change|أضف|اضف|عدّل|عدل)(?!\p{L})[^?!\n]{0,80}(?<!\p{L})(dans|sur|au|à|a|to|in|into|on|في|إلى|الى)\s+(le|la|l[\'’]|ce|cet|cette|mon|ma|the|this|my|that)?\s*(ال)?(fichier|document|doc|docx|word|excel|xlsx|pdf|tableur|classeur|file|spreadsheet|ملف|مستند)(?!\p{L})~u', $m) === 1
-            || preg_match('~(?<!\p{L})(modifi\p{L}*|[ée]dit\p{L}*|corrig\p{L}*|mets?\s+[àa]\s+jour|mettre\s+[àa]\s+jour|edit|update|modify|عدّل|عدل)(?!\p{L})\s+(le|la|l[\'’]|ce|cet|cette|mon|ma|the|this|my|that)?\s*(fichier|document|doc|docx|pdf|excel|xlsx|file|spreadsheet|ملف|مستند)(?!\p{L})~u', $m) === 1;
+            || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})(?:[^.?!\n]|\.(?=\S)){0,40}(ملف|مستند|اكسل)~u', $m) === 1;
+        if ($creation) {
+            return true;
+        }
+        // Changing an EXISTING file is a write too (test 28/09 06:14: "ajoute la date dans le fichier X.pdf" was answered
+        // "le fichier a été mis à jour" with no tool, and no notice). Only with a file named as the place of the change,
+        // and only an imperative / infinitive ("ajoute", "modifier"), never a past participle ("j'ai modifié").
+        // A question about a change already made is no request ("qui a modifié le fichier ?", "did you update the file?").
+        if (preg_match('~^\s*(qui|quand|who|when|what|which|quel\p{L}*|est-ce\s+qu\p{L}*|did|has|have|as-tu|avez-vous)(?!\p{L})~u', $m) === 1) {
+            return false;
+        }
+        return false
+            || preg_match('~(?<!\p{L})(ajoute[rz]?|rajoute[rz]?|ins[èée]re[rz]?|compl[èée]te[rz]?|modifie[rz]?|[ée]dite[rz]?|corrige[rz]?|remplace[rz]?|mets\s+[àa]\s+jour|mettez\s+[àa]\s+jour|mettre\s+[àa]\s+jour|add|append|insert|edit|update|modify|change|أضف|اضف|عدّل|عدل)(?!\p{L})[^?!\n]{0,80}(?<!\p{L})(dans|au|à|a|to|in|into|في|إلى|الى)\s+(le|la|l[\'’]|ce|cet|cette|mon|ma|the|this|my|that)?\s*(ال)?(fichier|document|doc|docx|word|excel|xlsx|pdf|tableur|classeur|file|spreadsheet|ملف|مستند)(?!\p{L})~u', $m) === 1
+            || preg_match('~(?<!\p{L})(modifie[rz]?|[ée]dite[rz]?|corrige[rz]?|mets\s+[àa]\s+jour|mettez\s+[àa]\s+jour|mettre\s+[àa]\s+jour|edit|update|modify|عدّل|عدل)(?!\p{L})\s+(le|la|l[\'’]|ce|cet|cette|mon|ma|the|this|my|that)?\s*(fichier|document|doc|docx|pdf|excel|xlsx|file|spreadsheet|ملف|مستند)(?!\p{L})~u', $m) === 1;
     }
 
     /**
@@ -911,7 +926,7 @@ $this->executor->setUserId($userId);
     private function offersCreationInstead(string $answer): bool {
         $a = mb_strtolower(trim($answer));
         return $a !== '' && preg_match('~(would\s+you\s+like|do\s+you\s+want|shall\s+i|should\s+i|voulez-vous|souhaitez-vous|veux-tu|dois-je)'
-            . '(\s+(me|que\s+je|que\s+j[\'’]))?(\s+to)?\s+(create|cr[ée]e|g[ée]n[èe]re|generate|make|faire|fasse|produce|prepare|pr[ée]pare|convert\p{L}*|modifi\p{L}*|ajoute|proc[èe]de\s+[àa]\s+(l[a\'’]\s*|cette\s+)?(cr[ée]ation|conversion|extraction|modification)|proceed\s+with\s+(the\s+|this\s+)?(creation|conversion|extraction|update))~u', $a) === 1;
+            . '(\s+(me|que\s+je|que\s+j[\'’]))?(\s+to)?\s+(create|cr[ée]e|g[ée]n[èe]re|generate|make|faire|fasse|produce|prepare|pr[ée]pare|convert\p{L}*|modifi\p{L}*|ajoute(?!\p{L})|proc[èe]de\s+[àa]\s+(l[a\'’]\s*|cette\s+)?(cr[ée]ation|conversion|extraction|modification)|proceed\s+with\s+(the\s+|this\s+)?(creation|conversion|extraction|update))~u', $a) === 1;
     }
 
     /**
@@ -997,6 +1012,17 @@ $this->executor->setUserId($userId);
             return 'Could not check whether the file already exists. Nothing was written.';
         }
         return null;
+    }
+
+    /** The question shown before a write replaces existing files, in the interface language. */
+    private function overwriteQuestion(array $paths): string {
+        $list = implode(', ', array_map(static fn($p): string => '« ' . basename((string)$p) . ' »', $paths));
+        return match (substr($this->uiLanguage(), 0, 2)) {
+            'fr' => '⚠️ ' . $list . ' existe déjà et serait **remplacé**. Confirmez pour le remplacer, ou demandez-moi d\'utiliser un autre nom.',
+            'ar' => '⚠️ ' . $list . ' موجود بالفعل وسيتم **استبداله**. أكّد للاستبدال، أو اطلب مني استخدام اسم آخر.',
+            'de' => '⚠️ ' . $list . ' existiert bereits und würde **ersetzt**. Bestätigen Sie das Ersetzen oder bitten Sie mich um einen anderen Namen.',
+            default => '⚠️ ' . $list . ' already exists and would be **replaced**. Confirm to replace it, or ask me to use another name.',
+        };
     }
 
     /**

@@ -353,6 +353,11 @@ verifie('modification affirmée sans outil → relance', $t->relance('ajoute la 
 verifie('« Voulez-vous que je procède à cette extraction ? » → relance création', $t->relanceGenerale('convertir le fichier Taux_de_chômage.pdf en document doc', "Pour cela, nous devons d'abord extraire le texte du fichier PDF. Voulez-vous que je procède à cette extraction ?", $tous) === RagSousTest::CREATION_NUDGE);
 verifie('« Shall I proceed? » seul reste une clarification (pas de relance)', $t->relanceGenerale('creer un pdf a partir du fichier excel', 'Which Excel file do you mean? Shall I proceed?', $tous) !== RagSousTest::CREATION_NUDGE);
 verifie('outil inventé → l\'erreur oriente vers convert_file', str_contains((string)($t->inconnu(['ok' => false, 'error' => 'Unknown tool: transform_file'])['error'] ?? ''), 'convert_file'));
+foreach (['qui a modifié le fichier budget.xlsx ?', "j'ai édité le document hier, tu peux le relire", "résume ce que j'ai ajouté dans le fichier",
+          'update me on the file status', 'ajoute un commentaire sur le fichier', 'did you update the file?'] as $qc) {
+    verifie('pas une demande de modification (revue d889ebd) : ' . $qc, !$t->fichier($qc));
+}
+verifie('« Dois-je ajouter les annexes ? » n\'est pas pris pour « ajoute »', $t->relanceGenerale('ajoute la date dans le fichier notes.md', 'Dois-je ajouter les annexes ?', $tous) !== RagSousTest::CREATION_NUDGE);
 verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
 $r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
 verifie('« Would you like me to create a new PDF…? » en réponse à une demande de PDF → relance création', $r === RagSousTest::CREATION_NUDGE, (string)$r);

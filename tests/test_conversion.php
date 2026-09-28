@@ -27,13 +27,13 @@ class Folder {
     public function nodeExists(string $p): bool { return isset($this->fichiers[$p]); }
     public function get(string $p): File { if (!isset($this->fichiers[$p])) throw new RuntimeException('absent'); return $this->fichiers[$p]; }
 }
-$corps = implode("\n", array_map(fn($m) => extraire($source, $m), ['convertFile', 'convertTargetPath', 'existingWriteTargets', 'readFile', 'cleanPath']));
-$consts = implode('', array_map(fn($c) => constante($source, $c), ['EXTRACTED_FORMATS', 'CONVERT_TARGETS', 'MAX_READ_CHARS', 'MAX_READ_CHUNK_CHARS', 'MAX_READ_FILE_BYTES']));
+$corps = implode("\n", array_map(fn($m) => extraire($source, $m), ['convertFile', 'convertTargetPath', 'existingWriteTargets', 'readFile', 'cleanPath', 'cleanName']));
+$consts = implode('', array_map(fn($c) => constante($source, $c), ['EXTRACTED_FORMATS', 'CONVERT_TARGETS', 'MAX_READ_CHARS', 'MAX_READ_CHUNK_CHARS', 'MAX_READ_FILE_BYTES', 'NOTES_FOLDER']));
 eval('class ConvSousTest {
     ' . $consts . '
-    public array $ecrit = []; public array $extraits = []; public string $texte = "";  public bool $encore = false;
+    public array $ecrit = []; public array $extraits = []; public string $texte = "";  public bool $encore = false; public ?int $total = null;
     private function resolve(Folder $home, string $p) { return $home->get($p); }
-    private function extractFileText(Folder $home, array $args): array { $this->extraits[] = $args["path"]; return ["ok" => true, "result" => ["path" => $args["path"], "content" => $this->texte, "has_more" => $this->encore]]; }
+    private function extractFileText(Folder $home, array $args): array { $this->extraits[] = $args["path"]; return ["ok" => true, "result" => ["path" => $args["path"], "content" => $this->texte, "has_more" => $this->encore, "total_chars" => $this->total ?? mb_strlen($this->texte)]]; }
     private function createFile(Folder $home, array $args): array { $this->ecrit[] = $args; return ["ok" => true, "result" => "Created " . $args["path"]]; }
     public function conv(Folder $h, array $a): array { return $this->convertFile($h, $a); }
     public function cible(array $a): ?string { return $this->convertTargetPath($a); }
@@ -54,6 +54,7 @@ verifie('« doc » demandé → .docx (EVA ne sait pas écrire .doc)', $t->cible
 verifie('« word » / « excel » / « .PDF » acceptés', $t->cible(['path' => 'a.md', 'target_format' => 'word']) === 'a.docx' && $t->cible(['path' => 'a.pdf', 'target_format' => 'excel']) === 'a.xlsx' && $t->cible(['path' => 'a.md', 'target_format' => '.PDF']) === 'a.pdf');
 verifie('format inconnu → null', $t->cible(['path' => 'a.pdf', 'target_format' => 'png']) === null);
 verifie('target_path fourni → utilisé', $t->cible(['path' => 'a.pdf', 'target_format' => 'docx', 'target_path' => '/Documents/Nouveau.docx']) === 'Documents/Nouveau.docx');
+verifie('target_path d\'une autre extension → forcé au format demandé (revue d889ebd)', $t->cible(['path' => 'a.md', 'target_format' => 'pdf', 'target_path' => 'x.docx']) === 'x.pdf');
 verifie('dossier avec un point, fichier sans extension', $t->cible(['path' => 'v1.2/rapport', 'target_format' => 'pdf']) === 'v1.2/rapport.pdf');
 
 // 2. conversion
@@ -71,6 +72,13 @@ verifie('PDF scanné (aucun texte) → refus clair, RIEN écrit', empty($r['ok']
 $t = new ConvSousTest(); $t->texte = 'x'; $t->encore = true;
 $r = $t->conv($home, ['path' => 'Taux_de_chômage.pdf', 'target_format' => 'docx']);
 verifie('source trop longue → refus, rien écrit (jamais de conversion tronquée)', empty($r['ok']) && $t->ecrit === [], $j($r));
+$t = new ConvSousTest(); $t->texte = str_repeat('a', 50); $t->total = 100000;
+$r = $t->conv($home, ['path' => 'Taux_de_chômage.pdf', 'target_format' => 'docx']);
+verifie('texte extrait au plafond de l\'indexeur (100 000) → refus, rien écrit (revue d889ebd : conversion tronquée)', empty($r['ok']) && $t->ecrit === [], $j($r));
+$home3 = new Folder(['score.md' => new File("Résultat\n12/20\nFin")]);
+$t = new ConvSousTest();
+$t->conv($home3, ['path' => 'score.md', 'target_format' => 'pdf']);
+verifie('ligne « 12/20 » d\'un Markdown gardée (marqueurs retirés des PDF seulement)', ($t->ecrit[0]['content'] ?? '') === "Résultat\n12/20\nFin", $j($t->ecrit));
 $t = new ConvSousTest();
 verifie('même fichier en sortie → refus', empty($t->conv($home, ['path' => 'notes.md', 'target_format' => 'md'])['ok']) && $t->ecrit === []);
 verifie('format de sortie non géré → refus', empty($t->conv($home, ['path' => 'notes.md', 'target_format' => 'pptx'])['ok']));
@@ -82,6 +90,8 @@ verifie('create_file sur un fichier existant → détecté', $t->existants($home
 verifie('create_file nouveau fichier → rien', $t->existants($home, 'create_file', ['path' => 'Documents/Neuf.docx']) === []);
 verifie('create_files : seul le chemin existant est listé', $t->existants($home, 'create_files', ['files' => [['path' => 'neuf.txt'], ['path' => 'notes.md']]]) === ['notes.md']);
 verifie('convert_file vers un .docx qui existe déjà → détecté', $t->existants($home, 'convert_file', ['path' => 'Taux_de_chômage.pdf', 'target_format' => 'docx']) === ['Taux_de_chômage.docx']);
+$notes = new Folder(['Notes/Courses.md' => new File('x')]);
+verifie('create_note sur une note existante → détecté (revue d889ebd)', $t->existants($notes, 'create_note', ['title' => 'Courses']) === ['Notes/Courses.md'] && $t->existants($notes, 'create_note', ['title' => 'Nouvelle']) === [], $j($t->existants($notes, 'create_note', ['title' => 'Courses'])));
 verifie('autres outils → jamais concernés', $t->existants($home, 'delete_file', ['path' => 'notes.md']) === []);
 
 // 4. read_file sur un PDF → texte extrait, plus « %PDF-1.4 … »
