@@ -131,3 +131,15 @@ merge a été reverté n'apporte rien — il faut alors « revert du revert ».
   « mon email ne marche plus » ✅ sans lecture de la boîte.
 - Branches `recette-eva`, `conversion-et-ecrasement`, `fix-recette-*`, `corrections-recette` : gardées (suppression
   sur ordre nommé seulement).
+
+## 8. H.2 et G.2 (28/09, GO admin « merge et déploie après la revue »)
+
+| PR | Contenu | Déployé |
+|---|---|---|
+| #9 | H.2 : écrire le fichier après lecture de l'agenda ; G.2 : relance météo tant que la ville n'est pas demandée | d79e030 à 12:01 (sauvegarde `avant-eva-20260928-120114`) |
+| #10 | G.2 : une ville des extraits de fichiers du RAG ne vaut plus un lieu donné par l'utilisateur | 4fe6752 à 12:08 (sauvegarde `avant-eva-20260928-120741`) |
+
+- **Production = 4fe6752.** Retour arrière : `bash deploiement/retour-arriere-eva.sh /srv/sauvegarde-eva_ai/avant-eva-20260928-120741`.
+- Vérifié en production (vrai vLLM) : H.2 ✅ (garde → lecture de l'agenda → create_file avec les vrais rendez-vous ;
+  fichier existant → dialogue d'écrasement) · G.2 ✅ (demande la ville ; « Dubaï » → météo réelle) · G.1, H.1,
+  poème sur la pluie, dépannage mail : sans régression.
