@@ -1,0 +1,4590 @@
+<?php
+
+declare(strict_types=1);
+
+namespace OCA\EvaAi\Service;
+
+use OCP\Accounts\IAccountManager;
+use OCP\Contacts\IManager as IContactsManager;
+use OCP\Files\AppData\IAppDataFactory;
+use OCP\Files\File;
+use OCP\Files\Folder;
+use OCP\Files\IRootFolder;
+use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
+use OCP\IUserManager;
+use OCP\Server;
+use OCP\EventDispatcher\IEventDispatcher;
+use OCA\EvaAi\Event\ToolPluginRegisterEvent;
+
+/**
+ * Führt "AI Actions" auf dem gesamten Benutzer-Dateibereich aus.
+ *
+ * Anders als die frühere Sandbox-Variante darf das Modell Dateien im ganzen
+ * Home-Verzeichnis des eingeloggten Benutzers anlegen, umbenennen, lesen,
+ * durchsuchen und löschen - plus Notizen (Notes-Ordner) und Kontakte
+ * (CardDAV-Adressbuch des Benutzers).
+ */
+class ActionExecutor {
+    private const MAX_SEARCH_DEPTH = 5;
+    private const MAX_SEARCH_NODES = 2000;
+    private const MAX_SEARCH_FILE_BYTES = 1048576; // 1 MB per text file
+    /**
+     * Direct searches may inspect a bounded set of common document formats
+     * even when they have not made it into the vector index yet.  Keep this
+     * lower than the normal agent read limit: a search should stay responsive
+     * and must never turn into a full re-index.
+     */
+    private const MAX_SEARCH_DOCUMENT_BYTES = 8388608; // 8 MB per document
+    private const MAX_SEARCH_EXTRACT_FILES = 40;
+    private const MAX_SEARCH_RESULTS = 50;
+    private const MAX_SEARCH_DEPTH_CONFIG = 10;
+    private const MAX_SEARCH_NODES_CONFIG = 10000;
+    private const MAX_SEARCH_RESULTS_CONFIG = 100;
+    private const SEARCH_CACHE_TTL = 15;
+    private const MAX_LIST_DEPTH = 2;
+    private const MAX_LIST_ENTRIES = 300;
+    private const MAX_READ_CHARS = 20000;
+    private const MAX_READ_CHUNK_CHARS = 100000;
+    private const MAX_READ_FILE_BYTES = 8388608; // 8 MB safety limit
+    private const LEARNED_API_TTL = 2592000; // refresh route metadata monthly
+    private const APP_API_TIMEOUT = 30;
+    private const APP_API_BATCH_BUDGET = 20;
+    /** Keep remote connector outages from consuming the whole agent budget. */
+    private const CONNECTOR_TIMEOUT = 8;
+    private const CONNECTOR_CONNECT_TIMEOUT = 3;
+    private const CONNECTOR_GET_ATTEMPTS = 2;
+    /** Discovery may probe several standard/schema routes, but never pin a
+     * web/cron PHP worker for the sum of every per-request timeout. */
+    private const CONNECTOR_DISCOVERY_BUDGET = 20;
+    private const MAX_WRITE_CHARS = 100000;
+    private const KNOWLEDGE_MAX_CHARS = 60000;
+    private const KNOWLEDGE_TARGET_CHARS = 45000;
+    private const KNOWLEDGE_PROFILE_MARKER = '<!-- eva_ai:profile-initialized -->';
+    private const NOTES_FOLDER = 'Notes';
+    private bool $pluginsLoaded = false;
+
+    /**
+     * Arguments a tool call needs before it may run without asking the user.
+     *
+     * On the interactive WEB surface, complete and explicit requests execute
+     * immediately. The confirmation/completion dialog is only shown when one
+     * of these required arguments is missing or empty, so the user can fill
+     * it in. Other surfaces keep the strict confirmation gate.
+     */
+    private const REQUIRED_ARGS = [
+        // Files / notes
+        'create_file' => ['path', 'content'],
+        'create_files' => ['files'],
+        'create_note' => ['title', 'content'],
+        'create_folder' => ['path'],
+        'rename_file' => ['path', 'new_name'],
+        'move_file' => ['path', 'target_path'],
+        'copy_file' => ['path', 'target_path'],
+        'file_checksum' => ['path'],
+        'read_files' => ['files'],
+        'delete_file' => ['path'],
+        'inspect_file' => ['path'],
+        'extract_file_text' => ['path'],
+        'update_knowledge' => ['fact'],
+        // Profile (any field set is explicit; no single mandatory argument)
+        'update_profile' => [],
+        // Contacts
+        'create_contact' => ['name'],
+        'update_contact' => ['query'],
+        'delete_contact' => ['query'],
+        // Calendar
+        'create_calendar_event' => ['summary', 'start'],
+        'update_calendar_event' => ['event_id'],
+        'delete_calendar_event' => ['event_id'],
+        // Shares
+        'create_share' => ['path'],
+        'update_share' => ['share_id'],
+        'delete_share' => ['share_id'],
+        // Talk
+        'send_talk_message' => ['room', 'message'],
+        // Tasks
+        'create_task' => ['title'],
+        'update_task' => ['task_id'],
+        'complete_task' => ['task_id'],
+        'delete_task' => ['task_id'],
+        'add_comment' => ['object_type', 'object_id', 'message'],
+        'delete_comment' => ['comment_id'],
+        'tag_file' => ['file_id', 'tag'],
+        'untag_file' => ['file_id', 'tag'],
+        'restore_file_version' => ['file_id', 'version_id'],
+        'call_app_api' => ['app_id', 'path', 'method'],
+        'call_app_api_batch' => ['calls'],
+        'run_safe_command' => ['command'],
+        'run_terminal_command' => ['command'],
+        'run_terminal_sequence' => ['commands'],
+        'configure_external_connector' => ['id', 'base_url'],
+        'diagnose_external_connector' => ['id'],
+        'call_external_connector' => ['id', 'path', 'method'],
+        'call_external_connector_batch' => ['calls'],
+        'create_scheduled_briefing' => ['prompt', 'time', 'days'],
+        'update_scheduled_briefing' => ['briefing_id'],
+        'delete_scheduled_briefing' => ['briefing_id'],
+        'create_sticker' => ['prompt'],
+    ];
+
+    /**
+     * Return the keys of required arguments that are missing or empty.
+     *
+     * @return string[]
+     */
+    private function missingRequiredArgs(string $name, array $args): array {
+        $required = self::REQUIRED_ARGS[$name] ?? [];
+        // Sharing with a user/group additionally needs the concrete recipient.
+        if ($name === 'create_share' && in_array((string)($args['type'] ?? 'link'), ['user', 'group'], true)) {
+            $required[] = 'target';
+        }
+        $missing = [];
+        foreach ($required as $key) {
+            $value = $args[$key] ?? null;
+            if ($value === null || (is_string($value) && trim($value) === '') || (is_array($value) && $value === [])) {
+                $missing[] = $key;
+            }
+        }
+        return array_values(array_unique($missing));
+    }
+
+    public function __construct(
+        private IRootFolder $rootFolder,
+        private IContactsManager $contacts,
+        private AppConfig $config,
+        private IAccountManager $accounts,
+        private IUserManager $userManager,
+        private CalendarService $calendar,
+        private EmailService $email,
+        private SharesService $shares,
+        private ActivityService $activity,
+        private ToolPolicy $toolPolicy,
+        private WebSearchService $webSearch,
+        private TalkChatService $talkChat,
+        private \OCP\Lock\ILockingProvider $lockingProvider,
+        private ?Indexer $indexer = null,
+        private ?\OCP\Comments\ICommentsManagerFactory $commentsFactory = null,
+        private ?\OCP\SystemTag\ISystemTagManagerFactory $systemTagFactory = null,
+        private ?UsageMetrics $usageMetrics = null,
+        private ?ToolPluginRegistry $pluginRegistry = null,
+        private ?IEventDispatcher $eventDispatcher = null,
+        private ?OpenAICompatible $imageProvider = null,
+        private ?Ollama $ollama = null
+    ) {
+    }
+
+    /**
+     * Set the user context on both the internal AppConfig and ToolPolicy
+     * so per-user settings (e.g. web_search_enabled) are resolved correctly.
+     * Must be called before tools() and run().
+     */
+    public function setUserId(?string $userId): void {
+        $this->config->setUserId($userId);
+        $this->toolPolicy->setUserId($userId);
+        $this->webSearch->setUserId($userId);
+    }
+
+    /**
+     * Set the execution surface for tool permission checks.
+     */
+    public function setSurface(string $surface): void {
+        $this->toolPolicy->setSurface($surface);
+    }
+
+    /**
+     * Get the ToolPolicy instance for external surface configuration.
+     */
+    public function getToolPolicy(): ToolPolicy {
+        return $this->toolPolicy;
+    }
+
+    /** @return array<int,array{type:string,function:array}> */
+    public function tools(): array {
+        $output = [
+            ['type' => 'function', 'function' => [
+                'name' => 'list_files',
+                'description' => 'List files and folders inside the logged-in user\'s Nextcloud home. Use it to find out what the user has stored.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Optional folder, e.g. "Documents". Empty means the home root.'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_file',
+                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Use content for text; use content_base64 for validated binary/ZIP-based files such as generated Office documents.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative path from the home folder, e.g. "Documents/Plan.md" or "Report.txt".'],
+                    'content' => ['type' => 'string', 'description' => 'Full UTF-8 text content.'],
+                    'content_base64' => ['type' => 'string', 'description' => 'Optional strict base64-encoded binary content (mutually exclusive with content).'],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_files',
+                'description' => 'Create or update up to 20 related plain-text files in one agent step. Each file is validated with the same allowed-type and size limits as create_file; failures are returned per file so successful files are not lost.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'files' => ['type' => 'array', 'maxItems' => 20, 'items' => ['type' => 'object', 'properties' => [
+                        'path' => ['type' => 'string'], 'content' => ['type' => 'string'], 'content_base64' => ['type' => 'string'],
+                    ], 'required' => ['path', 'content']]],
+                ], 'required' => ['files']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_note',
+                'description' => 'Create a Markdown note in the standard Notes folder of the user (visible in the Nextcloud Notes app). Perfect for quick notes, meeting minutes or todos.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'title' => ['type' => 'string', 'description' => 'Title of the note without extension, e.g. "Meeting minutes".'],
+                    'content' => ['type' => 'string', 'description' => 'The Markdown body of the note.'],
+                ], 'required' => ['title', 'content']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_folder',
+                'description' => 'Create a new folder anywhere in the user\'s Nextcloud home.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative folder path, e.g. "Projekte/2026".'],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'rename_file',
+                'description' => 'Rename a file or folder in the user\'s home. The new name must stay in the same directory.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Current relative path, e.g. "Drafts/old.md".'],
+                    'new_name' => ['type' => 'string', 'description' => 'New file or folder name including extension, e.g. "final.md".'],
+                ], 'required' => ['path', 'new_name']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'move_file',
+                'description' => 'Move a file or folder to another directory in the user\'s home. target_path is the final relative path including the new name; destination folders are created when needed.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Current relative path.'],
+                    'target_path' => ['type' => 'string', 'description' => 'Final relative path including the name.'],
+                ], 'required' => ['path', 'target_path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'copy_file',
+                'description' => 'Copy a file or folder to another directory in the user\'s home. target_path is the final relative path including the new name; destination folders are created when needed.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Source relative path.'],
+                    'target_path' => ['type' => 'string', 'description' => 'Final destination path including the name.'],
+                ], 'required' => ['path', 'target_path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'file_checksum',
+                'description' => 'Calculate a SHA-256 checksum for a file so complex operations can be validated without exposing its contents.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative file path.'],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'delete_file',
+                'description' => 'Delete a file or an empty folder in the user\'s home. Use only when the user explicitly asks to delete something. Depending on the app settings you may only delete files EVA created itself.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative path of the file or folder to delete.'],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'read_file',
+                'description' => 'Read a text file in the user\'s home in pages. The default page is 20k characters; when has_more is true, call again with next_offset until the requested file is fully read.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative path, e.g. "Documents/Notes.md".'],
+                    'offset' => ['type' => 'integer', 'minimum' => 0, 'description' => 'Character offset for the page, normally the previous response\'s next_offset.'],
+                    'max_chars' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100000, 'description' => 'Characters to return (default 20000, maximum 100000).'],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'extract_file_text',
+                'description' => 'Extract text from Office documents, PDFs, e-books and other indexed formats. Use this for complex files that read_file cannot decode; results are paginated.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative path, e.g. "Documents/report.xlsx".'],
+                    'offset' => ['type' => 'integer', 'minimum' => 0],
+                    'max_chars' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100000],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'read_files',
+                'description' => 'Read up to 20 bounded text files in one agent step. Each result is paginated and errors are isolated per file.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'files' => ['type' => 'array', 'maxItems' => 20, 'items' => ['type' => 'object', 'properties' => [
+                        'path' => ['type' => 'string'], 'offset' => ['type' => 'integer', 'minimum' => 0], 'max_chars' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100000],
+                    ], 'required' => ['path']]],
+                ], 'required' => ['files']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'inspect_file',
+                'description' => 'Inspect a file or folder after a complex operation without reading its content. Returns path, type, size, MIME type and modification time.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative path, e.g. "Documents/report.xlsx".'],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'search_files',
+                'description' => 'Search the user\'s Nextcloud files by name or content keywords, including readable text and common unindexed PDF, DOCX, XLSX, PPTX, ODF and EPUB files. Narrow the bounded scan with an optional folder path and file extension for faster results; use force_refresh when a file was just uploaded or changed. This never starts a full indexing run.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'query' => ['type' => 'string', 'description' => 'Keyword to look for in file and folder names and in bounded text-file content (case-insensitive).'],
+                    'path' => ['type' => 'string', 'description' => 'Optional folder to search below, e.g. "Documents/2026".'],
+                    'extension' => ['type' => 'string', 'description' => 'Optional file extension filter, e.g. "pdf" or ".docx".'],
+                    'force_refresh' => ['type' => 'boolean', 'description' => 'Skip the short-lived search cache and inspect the current filesystem immediately.'],
+                    'max_depth' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 10, 'description' => 'Optional scan depth (default 5). Increase this for deeply nested folders; the hard maximum is 10.'],
+                    'max_nodes' => ['type' => 'integer', 'minimum' => 100, 'maximum' => 10000, 'description' => 'Optional maximum filesystem nodes to inspect (default 2000).'],
+                    'max_results' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 100, 'description' => 'Optional maximum matches to return (default 50).'],
+                ], 'required' => ['query']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'update_knowledge',
+                'description' => 'Append personal facts about the user to the knowledge file KNOWLEDGE.md in the home folder (e.g. name, family, work, preferences, allergies, plans). Call it whenever the user shares such information explicitly. The file is read before every answer, so the fact will be considered in all future chats. Facts are appended as one bullet per entry, never overwrite old entries.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'fact' => ['type' => 'string', 'description' => 'Short, factual sentence about the user, e.g. "Likes green tea, no milk".'],
+                ], 'required' => ['fact']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_contacts',
+                'description' => 'List all contacts in the user\'s address books (name, e-mail, phone, organisation). Use this when the user asks which contacts they have or wants to see all contacts without a specific search term.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'find_contact',
+                'description' => 'Search the user\'s contacts (address books) by name, e-mail or organisation. Returns matching contact details. If the query is empty, all contacts are returned.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'query' => ['type' => 'string', 'description' => 'Name, e-mail or organisation to search for. Leave empty to list all contacts.'],
+                ], 'required' => ['query']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_contact',
+                'description' => 'Add a new contact to the user\'s personal address book (CardDAV).',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'name' => ['type' => 'string', 'description' => 'Full display name of the contact.'],
+                    'email' => ['type' => 'string', 'description' => 'Optional e-mail address.'],
+                    'phone' => ['type' => 'string', 'description' => 'Optional phone number.'],
+                    'org' => ['type' => 'string', 'description' => 'Optional organisation.'],
+                ], 'required' => ['name']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'read_profile',
+                'description' => 'Read the logged-in user\'s own Nextcloud profile (display name, e-mail, phone, website, address, organisation, role, headline, biography, pronouns).',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'update_profile',
+                'description' => 'Update the logged-in user\'s own Nextcloud profile. Only pass the fields that should change. Use empty string to clear a field.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'display_name' => ['type' => 'string', 'description' => 'New display name.'],
+                    'email' => ['type' => 'string', 'description' => 'New primary e-mail address.'],
+                    'phone' => ['type' => 'string', 'description' => 'Phone number.'],
+                    'website' => ['type' => 'string', 'description' => 'Website URL.'],
+                    'address' => ['type' => 'string', 'description' => 'Postal address.'],
+                    'organisation' => ['type' => 'string', 'description' => 'Organisation / company.'],
+                    'role' => ['type' => 'string', 'description' => 'Job title / role.'],
+                    'headline' => ['type' => 'string', 'description' => 'Short headline or tagline.'],
+                    'biography' => ['type' => 'string', 'description' => 'About / biography text.'],
+                    'pronouns' => ['type' => 'string', 'description' => 'Pronouns, e.g. "he/him".'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'update_contact',
+                'description' => 'Update an existing contact of the user (address book). Identify it with query (name, e-mail or organisation).',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'query' => ['type' => 'string', 'description' => 'Contact name, e-mail or organisation of the existing contact.'],
+                    'name' => ['type' => 'string', 'description' => 'Optional new full display name.'],
+                    'email' => ['type' => 'string', 'description' => 'Optional new e-mail address (empty to remove).'],
+                    'phone' => ['type' => 'string', 'description' => 'Optional new phone number (empty to remove).'],
+                    'org' => ['type' => 'string', 'description' => 'Optional new organisation (empty to remove).'],
+                ], 'required' => ['query']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'delete_contact',
+                'description' => 'Delete a contact from the user\'s address book. Use only when the user explicitly asks to delete it.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'query' => ['type' => 'string', 'description' => 'Contact name, e-mail or organisation to delete.'],
+                ], 'required' => ['query']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_calendars',
+                'description' => 'List all Nextcloud calendars of the user with their ids.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_calendar_events',
+                'description' => 'List calendar events across ALL calendars the user can see (including shared/read-only calendars). Default: today up to the next 60 days. Pass calendar only when the user names a specific calendar.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'days' => ['type' => 'integer', 'description' => 'Convenience: include the next N days starting today (1-60). Equivalent to end_date = today+N.'],
+                    'past_days' => ['type' => 'integer', 'description' => 'Convenience: include the past N days (0-30). Default 0.'],
+                    'start_date' => ['type' => 'string', 'description' => 'Optional start of the window, ISO-8601 like "2026-08-09".'],
+                    'end_date' => ['type' => 'string', 'description' => 'Optional end of the window, ISO-8601.'],
+                    'calendar' => ['type' => 'string', 'description' => 'Optional calendar name to limit the search.'],
+                    'categories' => ['type' => 'string', 'description' => 'Optional comma-separated category filter, e.g. "arbeit,privat".'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_calendar_event',
+                'description' => 'Create a new calendar event (meetings, appointments, reminders). Times WITHOUT a "Z" suffix are interpreted in the USER timezone (Europe/Berlin) - so write local times like "2026-08-20 16:00" or "20.08.2026 16:00" or "morgen 10:00", never append Z. Append "Z" only if the user explicitly talks about UTC. A plain date creates an all-day event. Before calculating dates, call current_time to get the actual date.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'summary' => ['type' => 'string', 'description' => 'Event title, e.g. "Team meeting".'],
+                    'start' => ['type' => 'string', 'description' => 'Start time in any supported format.'],
+                    'end' => ['type' => 'string', 'description' => 'Optional end time. Default: 1 hour later (all-day: next day).'],
+                    'duration_minutes' => ['type' => 'integer', 'description' => 'Optional duration in minutes. Default 60 (or 1 day for all-day). Ignored if end is set.'],
+                    'location' => ['type' => 'string', 'description' => 'Optional location / place.'],
+                    'description' => ['type' => 'string', 'description' => 'Optional description or agenda.'],
+                    'reminder_minutes' => ['type' => 'integer', 'description' => 'Optional reminder X minutes before the event, e.g. 15 or 60.'],
+                    'categories' => ['type' => 'string', 'description' => 'Optional comma-separated categories/tags, e.g. "arbeit,privat".'],
+                    'calendar' => ['type' => 'string', 'description' => 'Optional calendar name or id; default is the first calendar.'],
+                ], 'required' => ['summary', 'start']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'update_calendar_event',
+                'description' => 'Update an existing calendar event (title, times, location, description, categories, reminder). Use the event id from list_calendar_events.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'event_id' => ['type' => 'string', 'description' => 'id like "personal/event.ics" as returned by list_calendar_events.'],
+                    'summary' => ['type' => 'string', 'description' => 'New title.'],
+                    'start' => ['type' => 'string', 'description' => 'New start, ISO-8601 UTC or plain date.'],
+                    'end' => ['type' => 'string', 'description' => 'New end.'],
+                    'location' => ['type' => 'string', 'description' => 'New location (empty string removes it).'],
+                    'description' => ['type' => 'string', 'description' => 'New description (empty string removes it).'],
+                    'categories' => ['type' => 'string', 'description' => 'New categories (comma separated). Empty string removes them.'],
+                    'reminder_minutes' => ['type' => 'integer', 'description' => 'Replace reminder with a single VALARM that fires X minutes before the event. 0 removes the reminder.'],
+                ], 'required' => ['event_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'delete_calendar_event',
+                'description' => 'Delete a calendar event. Use only when the user explicitly asks to delete it.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'event_id' => ['type' => 'string', 'description' => 'id like "personal/event.ics" as returned by list_calendar_events.'],
+                ], 'required' => ['event_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'find_free_slots',
+                'description' => 'Find free time slots in the user\'s calendar within the next N days, respecting the configured working hours (default 09:00-18:00 in the user\'s timezone). Returns at most 10 slots with length >= min_minutes. Useful before scheduling a meeting.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'days' => ['type' => 'integer', 'description' => 'How many days to look ahead (1-30). Default 7.'],
+                    'min_minutes' => ['type' => 'integer', 'description' => 'Minimum slot length in minutes (5-480). Default 30.'],
+                    'workday_start' => ['type' => 'string', 'description' => 'Working day start "HH:MM". Default 09:00.'],
+                    'workday_end' => ['type' => 'string', 'description' => 'Working day end "HH:MM". Default 18:00.'],
+                    'calendar' => ['type' => 'string', 'description' => 'Optional calendar name or id; default = all user calendars.'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'search_mails',
+                'description' => 'Search emails of the user\'s mail account (subject, sender, preview). Typical use: "find the mail about X" or "show my latest mails".',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'query' => ['type' => 'string', 'description' => 'Search text, e.g. "Rechnung" or "alice@example.com".'],
+                    'limit' => ['type' => 'integer', 'description' => 'Optional max results (default 10).'],
+                ], 'required' => ['query']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_mails',
+                'description' => 'List the most recent emails of the user (latest first). Use when the user asks about their mail without a concrete topic.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'limit' => ['type' => 'integer', 'description' => 'Optional max mails (default 15).'],
+                    'unread_only' => ['type' => 'boolean', 'description' => 'Optional: only unread mails.'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'read_mail',
+                'description' => 'Read the full content of a single email by its id (ids come from list_mails / search_mails).',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'message_id' => ['type' => 'integer', 'description' => 'Id of the email.'],
+                ], 'required' => ['message_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'unread_mail_count',
+                'description' => 'Get how many unread emails the user currently has.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'summarize_emails',
+                'description' => 'Summarize recent or matching emails from the Nextcloud Mail app. Includes key points, action items and deadlines without inventing details.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'limit' => ['type' => 'integer', 'description' => 'Maximum emails to include (1-20, default 8).'],
+                    'unread_only' => ['type' => 'boolean', 'description' => 'Only include unread emails.'],
+                    'query' => ['type' => 'string', 'description' => 'Optional subject/sender/body search text.'],
+                    'focus' => ['type' => 'string', 'description' => 'Optional focus such as action items, deadlines or decisions.'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_shares',
+                'description' => 'List all file/folder shares of the user: outgoing (link + user/group shares) and incoming shares from others, with expiry, note and link.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'limit' => ['type' => 'integer', 'description' => 'Optional max entries (default 100).'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_share',
+                'description' => 'Create a new share for a file or folder in the user\'s Nextcloud (public link or share with a user/group). Use for "share this file with X" or "make a download link".',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'Relative path of the file/folder, e.g. "Documents/Plan.pdf".'],
+                    'type' => ['type' => 'string', 'description' => 'Share type: "link" (default, public link), "user" or "group".'],
+                    'target' => ['type' => 'string', 'description' => 'For user/group shares: the user id or group id to share with.'],
+                    'write' => ['type' => 'boolean', 'description' => 'Optional: allow editing (default read-only).'],
+                    'share' => ['type' => 'boolean', 'description' => 'Optional: allow recipients to reshare (default false).'],
+                    'password' => ['type' => 'string', 'description' => 'Optional password for link shares.'],
+                    'expiration' => ['type' => 'string', 'description' => 'Optional expiration date, ISO like "2026-12-31".'],
+                    'note' => ['type' => 'string', 'description' => 'Optional note / message for the share.'],
+                ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'update_share',
+                'description' => 'Update an existing share (note, expiration date, permissions). Use share ids from list_shares.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'share_id' => ['type' => 'string', 'description' => 'Id from list_shares.'],
+                    'note' => ['type' => 'string', 'description' => 'New note (empty removes it).'],
+                    'expiration' => ['type' => 'string', 'description' => 'Optional expiration date ISO, empty removes it.'],
+                    'permissions' => ['type' => 'string', 'description' => 'Comma list: read,write,create,delete,share.'],
+                ], 'required' => ['share_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'delete_share',
+                'description' => 'Delete an existing share. Use only when the user explicitly asks to remove a share or link.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'share_id' => ['type' => 'string', 'description' => 'Id from list_shares.'],
+                ], 'required' => ['share_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_tasks',
+                'description' => 'List to-do items / tasks of the user. Open tasks first, then by due date. Filters: status (comma separated iCalendar statuses e.g. "NEEDS-ACTION,IN-PROCESS"), category, overdue_only (boolean).',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'status' => ['type' => 'string', 'description' => 'Optional filter by status, e.g. "NEEDS-ACTION" or "NEEDS-ACTION,IN-PROCESS".'],
+                    'category' => ['type' => 'string', 'description' => 'Optional filter by category/tag.'],
+                    'overdue_only' => ['type' => 'boolean', 'description' => 'If true, return only tasks with due date in the past that are not completed.'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_task',
+                'description' => 'Create a new to-do item / task for the user in their default task list.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'title' => ['type' => 'string', 'description' => 'Task title.'],
+                    'due' => ['type' => 'string', 'description' => 'Optional due date, any supported format, e.g. "2026-08-20 16:00" or "morgen".'],
+                    'description' => ['type' => 'string', 'description' => 'Optional longer description / notes.'],
+                    'priority' => ['type' => 'integer', 'description' => 'Optional priority 1-9 (1 highest).'],
+                    'categories' => ['type' => 'string', 'description' => 'Optional comma separated categories/tags.'],
+                ], 'required' => ['title']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'update_task',
+                'description' => 'Update a task (title, status, due date, description, categories, priority). Use task ids from list_tasks.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'task_id' => ['type' => 'string', 'description' => 'Id like "personal/task.ics" from list_tasks.'],
+                    'title' => ['type' => 'string', 'description' => 'New title.'],
+                    'status' => ['type' => 'string', 'description' => 'New status: NEEDS-ACTION, IN-PROCESS, COMPLETED, CANCELLED.'],
+                    'due' => ['type' => 'string', 'description' => 'New due date, ISO or relative.'],
+                    'description' => ['type' => 'string', 'description' => 'New description (empty removes it).'],
+                    'categories' => ['type' => 'string', 'description' => 'New categories (comma separated). Empty removes them.'],
+                    'priority' => ['type' => 'integer', 'description' => 'New priority 1-9 (1 highest). 0 removes the priority.'],
+                ], 'required' => ['task_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'complete_task',
+                'description' => 'Mark a task as completed. Use when the user says a task is done.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'task_id' => ['type' => 'string', 'description' => 'Task id from list_tasks.'],
+                ], 'required' => ['task_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'delete_task',
+                'description' => 'Delete a task permanently. Use only when the user explicitly asks to delete it.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'task_id' => ['type' => 'string', 'description' => 'Task id from list_tasks.'],
+                ], 'required' => ['task_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'recent_activity',
+                'description' => 'List the recent Nextcloud activity feed of the user (files changed, shares, events) across all apps.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'limit' => ['type' => 'integer', 'description' => 'Optional max entries (default 25).'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_comments',
+                'description' => 'Read comments attached to a Nextcloud object, usually a file. Use object_type "files" and the numeric file id. Only comments visible to the current user are returned.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'object_type' => ['type' => 'string', 'description' => 'Nextcloud object type, normally files.'],
+                    'object_id' => ['type' => 'string', 'description' => 'Object id, normally the file id.'],
+                    'limit' => ['type' => 'integer', 'description' => 'Maximum comments, 1-100.'],
+                ], 'required' => ['object_type', 'object_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'add_comment',
+                'description' => 'Add a comment to a Nextcloud object after the user explicitly asks to comment, annotate or reply. This requires confirmation before posting.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'object_type' => ['type' => 'string', 'description' => 'Nextcloud object type, normally files.'],
+                    'object_id' => ['type' => 'string', 'description' => 'Object id, normally the file id.'],
+                    'message' => ['type' => 'string', 'description' => 'Exact comment text to post.'],
+                    'parent_id' => ['type' => 'string', 'description' => 'Optional parent comment id for a reply.'],
+                ], 'required' => ['object_type', 'object_id', 'message']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'delete_comment',
+                'description' => 'Delete a comment by id after explicit user confirmation.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'comment_id' => ['type' => 'string', 'description' => 'Comment id returned by list_comments.'],
+                ], 'required' => ['comment_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_system_tags',
+                'description' => 'List visible Nextcloud system tags. Use this before tagging files so you reuse the exact existing tag name.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'search' => ['type' => 'string', 'description' => 'Optional name fragment.'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'tag_file',
+                'description' => 'Assign an existing or user-assignable system tag to a file. This changes file metadata and requires confirmation.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'file_id' => ['type' => 'string', 'description' => 'Numeric Nextcloud file id.'],
+                    'tag' => ['type' => 'string', 'description' => 'Exact system tag name.'],
+                ], 'required' => ['file_id', 'tag']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'untag_file',
+                'description' => 'Remove a system tag from a file. This changes file metadata and requires confirmation.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'file_id' => ['type' => 'string', 'description' => 'Numeric Nextcloud file id.'],
+                    'tag' => ['type' => 'string', 'description' => 'Exact system tag name.'],
+                ], 'required' => ['file_id', 'tag']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_file_versions',
+                'description' => 'List available versions of a file. Use the numeric file id from list_files/search_files.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'file_id' => ['type' => 'string', 'description' => 'Numeric Nextcloud file id.'],
+                ], 'required' => ['file_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'restore_file_version',
+                'description' => 'Restore a selected file version. This replaces the current file and always requires confirmation.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'file_id' => ['type' => 'string', 'description' => 'Numeric Nextcloud file id.'],
+                    'version_id' => ['type' => 'string', 'description' => 'Version/revision id returned by list_file_versions.'],
+                ], 'required' => ['file_id', 'version_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'server_status',
+                'description' => 'Get technical status info of the Nextcloud server (version, PHP, database, app version, Ollama connectivity, user). Use when the user asks about the system, server or setup.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'run_safe_command',
+                'description' => 'Run one allowlisted read-only local diagnostic command. Requires the user setting and explicit confirmation. Never accepts shell syntax, scripts, pipes or redirects.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'command' => ['type' => 'string', 'enum' => ['date', 'uptime', 'php_version', 'node_version', 'disk_free', 'memory_free', 'eva_git_status']],
+                ], 'required' => ['command']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'run_terminal_command',
+                'description' => 'Run one explicitly confirmed terminal command on the Nextcloud host. The command is parsed without a shell; its executable must be in the user-configured allowlist unless the user explicitly enables custom-executable mode. Optional stdin can answer a bounded interactive prompt. Output and time are bounded. Disabled by default.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'command' => ['type' => 'string', 'description' => 'Executable plus arguments, for example "git status --short". Shell operators, pipes, redirects, substitutions and newlines are rejected.'],
+                    'stdin' => ['type' => 'string', 'maxLength' => 4000, 'description' => 'Optional bounded input for a program prompt. It is sent through a pipe, never interpreted by a shell and redacted from persisted traces.'],
+                    'timeout_seconds' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 30, 'description' => 'Optional hard timeout, default 10 seconds.'],
+                ], 'required' => ['command']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'run_terminal_sequence',
+                'description' => 'Run up to five explicitly confirmed terminal commands sequentially on the Nextcloud host. Each command is parsed without a shell, uses the same allowlist/custom-executable setting, and stops after the first failure or timeout. Useful for a short diagnostic workflow; shell operators, pipes and redirects are never accepted.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'commands' => ['type' => 'array', 'minItems' => 1, 'maxItems' => 5, 'items' => ['type' => 'string', 'minLength' => 1, 'maxLength' => 1000]],
+                    'stdin' => ['type' => 'array', 'maxItems' => 5, 'items' => ['type' => 'string', 'maxLength' => 4000], 'description' => 'Optional input per command, matched by index. Each value is bounded, sent without shell interpretation and followed by EOF.'],
+                    'timeout_seconds' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 30, 'description' => 'Optional hard timeout per command, default 10 seconds.'],
+                ], 'required' => ['commands']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_nextcloud_capabilities',
+                'description' => 'Discover which Nextcloud apps are enabled and which EVA integrations are available before planning a task. This is read-only and never exposes secrets. Use it when the user asks EVA to work with a Nextcloud feature you have not used before.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'discover_app_api',
+                'description' => 'Discover the installed Nextcloud API routes of an enabled app so you can plan a supported action. Set include_internal=true to learn non-OCS app routes as well. This is read-only and never executes a route.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'app_id' => ['type' => 'string', 'description' => 'Optional Nextcloud app id, e.g. deck, bookmarks, forms. Omit to summarize all enabled app routes.'],
+                    'include_internal' => ['type' => 'boolean', 'description' => 'Include internal non-OCS routes (default false). Required before calling a non-OCS route.'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_learned_app_apis',
+                'description' => 'List sanitized Nextcloud app API routes EVA learned earlier for this user. Read-only; use discover_app_api to refresh an app.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_learned_file_locations',
+                'description' => 'List bounded file and folder paths EVA learned from earlier Nextcloud searches and listings. Use this to navigate directly before doing another broad search.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'call_app_api',
+                'description' => 'Call a discovered endpoint of an enabled Nextcloud app in the current user session. OCS and other same-origin app routes are supported when discovered first. Do not use this tool for configured external connectors such as TrueNAS or Home Assistant; use call_external_connector for those. Read methods are allowed; POST, PUT, PATCH and DELETE always require explicit confirmation.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'app_id' => ['type' => 'string', 'description' => 'Enabled Nextcloud app id, e.g. deck or bookmarks.'],
+                    'path' => ['type' => 'string', 'description' => 'Same-origin route path returned by discover_app_api. OCS paths begin with /ocs/v1.php/apps/{app_id}/ or /ocs/v2.php/apps/{app_id}/; internal app routes must have been discovered with include_internal=true.'],
+                    'method' => ['type' => 'string', 'enum' => ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']],
+                    'params' => ['type' => 'object', 'description' => 'Query/body parameters for the OCS endpoint. Never include credentials.'],
+                ], 'required' => ['app_id', 'path', 'method']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'call_app_api_batch',
+                'description' => 'Call up to 10 previously discovered, read-only Nextcloud app API routes in one agent step. Only GET requests are accepted; use this to gather related data efficiently before planning a change.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'calls' => ['type' => 'array', 'maxItems' => 10, 'items' => ['type' => 'object', 'properties' => [
+                        'app_id' => ['type' => 'string'], 'path' => ['type' => 'string'], 'params' => ['type' => 'object'],
+                    ], 'required' => ['app_id', 'path']]],
+                ], 'required' => ['calls']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_scheduled_briefings',
+                'description' => 'List the current user\'s EVA scheduled briefings and their action permissions.',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_scheduled_briefing',
+                'description' => 'Create a recurring EVA briefing. Use days 1-7 for Monday-Sunday. Read-only is the default; allow_actions must be explicitly true to permit autonomous changes.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'prompt' => ['type' => 'string', 'description' => 'What EVA should do at the scheduled time.'],
+                    'time' => ['type' => 'string', 'description' => 'Local time in HH:MM format.'],
+                    'days' => ['type' => 'array', 'items' => ['type' => 'integer'], 'description' => 'Weekdays 1 (Monday) through 7 (Sunday).'],
+                    'allow_actions' => ['type' => 'boolean', 'description' => 'Optional explicit opt-in for autonomous tool actions. Defaults to false.'],
+                ], 'required' => ['prompt', 'time', 'days']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'update_scheduled_briefing',
+                'description' => 'Update an existing EVA briefing by id. Only supplied fields change.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'briefing_id' => ['type' => 'string', 'description' => 'Id returned by list_scheduled_briefings.'],
+                    'prompt' => ['type' => 'string'], 'time' => ['type' => 'string'],
+                    'days' => ['type' => 'array', 'items' => ['type' => 'integer']],
+                    'enabled' => ['type' => 'boolean'], 'allow_actions' => ['type' => 'boolean'],
+                ], 'required' => ['briefing_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'delete_scheduled_briefing',
+                'description' => 'Delete an EVA scheduled briefing by id.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'briefing_id' => ['type' => 'string', 'description' => 'Id returned by list_scheduled_briefings.'],
+                ], 'required' => ['briefing_id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'current_time',
+                'description' => 'Get the current date and time in the user\'s timezone. IMPORTANT: as an AI model you do not know today\'s date - always call this tool before computing dates, deadlines, appointments or relative times.',
+                'parameters' => ['type' => 'object', 'properties' => []],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'weather',
+                'description' => 'Get the weather forecast (today + 2 days) for a place. Useful for planning outdoor appointments.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'location' => ['type' => 'string', 'description' => 'City or place, e.g. "Berlin" or "München".'],
+                ], 'required' => ['location']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'web_search',
+                'description' => 'Search the public web and the news for information that is not in the indexed files (news, releases, prices, documentation, current events). Use this whenever you need up-to-date information your indexed files do not contain. '
+                    . 'Each hit has a `title`, `url`, `snippet` and `content` (the readable text of the page itself - prefer it over the snippet, it is the source). `highlights` holds the passages of that page which actually mention the query: quote from them when they answer the question. `images` lists pictures from the page (the page\'s own preview image first) - when a picture helps the answer, embed it with markdown image syntax using its `url`; do this for the picture that illustrates your answer. `published` is the publication date when the source states one, and `source` names the outlet. '
+                    . 'Set `mode` to "news" for anything current (this week, latest, released, announced, price now) and to "all" when you want both background and the newest coverage; the default "web" is a plain web search. '
+                    . 'The results are already ordered with the best and most recent first, so prefer the earlier entries, and NEVER prefer your own memory over them: your training data is older than these results, so if they contradict what you remember, the results are right. If the results do not answer the question, search AGAIN with a different, better query (shorter, different words, the product or event name) - you may run several searches for one question - and use `open_website` to read a promising page in full before giving up. '
+                    . 'Cite the URLs you actually used as markdown links, state how recent your sources are, and say so when the pages do not answer the question. '
+                    . 'When the topic is something you can see - a product, device, vehicle, place, building, event, artwork, animal, dish or logo - also call `search_images` for it and embed two to four of the pictures, even when the user only asked for information: a picture of the thing being described is part of a good answer, and it costs the user nothing.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'query' => ['type' => 'string', 'description' => 'The search query, in the user\'s language. Keep it short and specific - it is sent to an external search engine.'],
+                    'mode' => ['type' => 'string', 'enum' => WebSearchService::MODES, 'description' => 'Which index to search: "web" (default), "news" for recent articles with dates, or "all" to merge both.'],
+                ], 'required' => ['query']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'search_images',
+                'description' => 'Find pictures of a subject on the web and show them to the user. You CAN display pictures: whenever the user asks to see images, photos, pictures or a logo of something ("show me pictures of X", "zeig mir Bilder von X", "wie sieht X aus", "what does X look like"), call this tool. NEVER reply that you are unable to show images. '
+                    . 'Every hit carries `url` (the picture itself - embed it with markdown image syntax `![title](url)`), `title` (a caption, use it as the alt text), `page` (the page the picture was found on - link it) and `preview` (a thumbnail that always loads). '
+                    . 'Embed two to four pictures with `![title](url)` so they appear in the answer, then one short sentence about them. '
+                    . 'You do not need to be asked: for anything visual - a product, device, vehicle, place, building, event, artwork, animal, dish or logo - show the pictures alongside your answer, including when the user asked a factual question about it. '
+                    . 'When the user asks for a picture together with facts (e.g. "show me pictures of the Eiffel Tower and tell me when it was built"), also run a web_search for the facts and mention the source. '
+                    . 'Use the words the user used as the query; do not send personal or confidential details.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'query' => ['type' => 'string', 'description' => 'What the pictures should show, e.g. "golden retriever puppy" or "Nextcloud Hub logo".'],
+                    'count' => ['type' => 'integer', 'description' => 'Optional number of pictures (1-12, default 6).'],
+                ], 'required' => ['query']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'create_sticker',
+                'description' => 'Generate a sticker image from a prompt and save it in the user\'s EVA folder. Requires explicit confirmation and a configured OpenAI-compatible image provider.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'prompt' => ['type' => 'string', 'description' => 'What the sticker should depict. Avoid private or identifying personal details.'],
+                ], 'required' => ['prompt']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_talk_rooms',
+                'description' => 'List the Nextcloud Talk conversations the user is a member of, most recently active first. Each entry carries `name`, `token`, `id`, `type` (one-to-one, group, public) and `lastActivity`. Use it first when the user refers to a chat by name ("the project room", "mein Chat mit Anna") instead of naming a token, and before read_talk_chat or send_talk_message. Only the user\'s own rooms are ever returned.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'limit' => ['type' => 'integer', 'description' => 'Optional maximum number of rooms (default 25).'],
+                ]],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'read_talk_chat',
+                'description' => 'Read the recent messages of one Nextcloud Talk conversation, oldest first, each dated and attributed to its author. Use this whenever the user asks about the content of a chat ("what did we agree in X?", "was hat Anna im Projekt-Chat geschrieben?", "worum ging es heute in Y?") - the indexed chat history may be older than the conversation, so the current messages come from here. `room` takes the name, token or id from `list_talk_rooms`. Only rooms the user is a member of can be read; a room they left answers as if it did not exist.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'room' => ['type' => 'string', 'description' => 'The room to read: its name, token or numeric id (see list_talk_rooms).'],
+                    'limit' => ['type' => 'integer', 'description' => 'Optional number of recent messages to read (5-200, default 50).'],
+                    'unread_only' => ['type' => 'boolean', 'description' => 'Optional: return only messages newer than the user\'s Talk read marker.'],
+                ], 'required' => ['room']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'send_talk_message',
+                'description' => 'Post a message into a Nextcloud Talk conversation as the user who is asking. It appears under their name, exactly as if they had typed it - there is no bot label, so only do this when the user explicitly asks you to write, send, answer, announce or forward something in a chat ("schreib in den Projekt-Chat, dass ...", "tell the team in X that ...", "antworten im Chat Y: ..."). `room` takes the name, token or id from `list_talk_rooms`. Use the user\'s own wording for the message and do not add anything to it; afterwards state which room you posted in. Posting is only possible when the user has enabled it in the EVA AI settings.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'room' => ['type' => 'string', 'description' => 'The room to post into: its name, token or numeric id (see list_talk_rooms).'],
+                    'message' => ['type' => 'string', 'description' => 'The exact message to post.'],
+                ], 'required' => ['room', 'message']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'open_website',
+                'description' => 'Open one web page and read its text in pages. Use it after web_search when a result looks relevant or you need a detail. When has_more=true, call again with next_offset until has_more=false to fully read a long source. Returns readable text, matching passages, images and publication date. Only http(s) pages can be opened.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'url' => ['type' => 'string', 'description' => 'The full http(s) URL of the page, usually taken from a previous web_search result.'],
+                    'query' => ['type' => 'string', 'description' => 'Optional: what you are looking for on that page. The most relevant passages are returned first.'],
+                    'offset' => ['type' => 'integer', 'minimum' => 0, 'description' => 'Character offset from a previous response next_offset (default 0).'],
+                    'max_chars' => ['type' => 'integer', 'minimum' => 1000, 'maximum' => 2000000, 'description' => 'Characters to return in this page (default 2,000,000).'],
+                ], 'required' => ['url']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'list_external_connectors',
+                'description' => 'List the user-configured external HTTPS connectors (names, hosts and capabilities; never secrets).',
+                'parameters' => ['type' => 'object', 'properties' => new \stdClass()],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'discover_external_connector',
+                'description' => 'Read a configured connector OpenAPI or Swagger description and return a bounded list of available paths, methods and sanitized parameter requirements. Safe, read-only discovery; use it before calling an unfamiliar service.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'id' => ['type' => 'string', 'description' => 'Configured connector id.'],
+                ], 'required' => ['id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'diagnose_external_connector',
+                'description' => 'Check connectivity from the Nextcloud server to a configured connector. Reports DNS/HTTP status, resolved address, latency and a safe error category without revealing credentials. Use this when a Mac, NAS or other host may not be reachable from the server.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'id' => ['type' => 'string', 'description' => 'Configured connector id.'],
+                ], 'required' => ['id']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'configure_external_connector',
+                'description' => 'Create or update a named external connector. Public HTTPS and explicitly local HTTP(S) services are supported. Choose no auth, bearer token, basic username/password or API key; all secrets are encrypted and never shown to EVA.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'id' => ['type' => 'string', 'description' => 'Stable connector id, lowercase letters, numbers, underscore or hyphen (max 40).'],
+                    'name' => ['type' => 'string', 'description' => 'Human-readable connector name.'],
+                    'base_url' => ['type' => 'string', 'description' => 'Base URL. Public services must use HTTPS; local private/loopback hosts may use HTTP or HTTPS, e.g. http://homeassistant.local:8123 or https://192.168.1.20.'],
+                    'openapi_url' => ['type' => 'string', 'description' => 'Optional same-host OpenAPI/Swagger JSON URL when the service publishes its schema at a custom path.'],
+                    'token' => ['type' => 'string', 'description' => 'Optional bearer token; encrypted at rest and never returned.'],
+                    'auth_type' => ['type' => 'string', 'enum' => ['none', 'bearer', 'basic', 'api_key'], 'description' => 'Authentication scheme.'],
+                    'username' => ['type' => 'string', 'description' => 'Optional username for basic authentication; encrypted at rest.'],
+                    'password' => ['type' => 'string', 'description' => 'Optional password for basic authentication; encrypted at rest.'],
+                    'api_key' => ['type' => 'string', 'description' => 'Optional API key; encrypted at rest.'],
+                    'api_key_header' => ['type' => 'string', 'description' => 'Header for API keys, for example X-API-Key (default).'],
+                ], 'required' => ['id', 'base_url']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'call_external_connector',
+                'description' => 'Call a configured external connector. Requests are host-pinned, bounded and always require user confirmation; public services require HTTPS while local services may use HTTP; response values are returned for this run only.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'id' => ['type' => 'string'],
+                    'path' => ['type' => 'string', 'description' => 'Relative path below the connector base URL, e.g. /api/status.'],
+                    'method' => ['type' => 'string', 'enum' => ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']],
+                    'params' => ['type' => 'object', 'description' => 'Query parameters for GET or JSON body fields for other methods.'],
+                ], 'required' => ['id', 'path', 'method']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'call_external_connector_batch',
+                'description' => 'Call up to 8 discovered external connector GET endpoints in one step. Use this to gather related data efficiently; write methods remain confirmation-gated through call_external_connector.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'calls' => ['type' => 'array', 'maxItems' => 8, 'items' => ['type' => 'object', 'properties' => [
+                        'id' => ['type' => 'string'], 'path' => ['type' => 'string'], 'params' => ['type' => 'object'],
+                    ], 'required' => ['id', 'path']]],
+                ], 'required' => ['calls']],
+            ]],
+        ];
+        // Ollama akzeptiert leere "properties" nur als leeres OBJEKT {}
+        foreach ($output as &$t) {
+            $t['function']['parameters']['properties'] = (array)$t['function']['parameters']['properties'] === []
+                ? (object)[]
+                : $t['function']['parameters']['properties'];
+        }
+        unset($t);
+
+        // Third-party apps can extend EVA without patching this class. Plugin
+        // tools are appended after built-ins and still pass the normal surface
+        // and confirmation checks in run().
+        $output = array_merge($output, $this->pluginDefinitions());
+
+        // Tool definitions are filtered at the same policy boundary as
+        // execution. This is important for callers such as Talk and
+        // TaskProcessing: a provider must never expose a tool merely because
+        // a caller supplied or requested its name.
+        $output = array_values(array_filter($output, function (array $tool): bool {
+            $name = (string)($tool['function']['name'] ?? '');
+            return $name !== '' && (($this->toolPolicy->check($name)['allowed'] ?? false)
+                || $this->pluginRegistryOrNull()?->get($name) !== null);
+        }));
+
+        return $output;
+    }
+
+    /** @return list<array{type:string,function:array<string,mixed>}> */
+    private function pluginDefinitions(): array {
+        $this->loadPlugins();
+        return $this->pluginRegistryOrNull()?->definitionsForSurface($this->toolPolicy->getSurface()) ?? [];
+    }
+
+    private function pluginRegistryOrNull(): ?ToolPluginRegistry {
+        return isset($this->pluginRegistry) ? $this->pluginRegistry : null;
+    }
+
+    private function eventDispatcherOrNull(): ?IEventDispatcher {
+        return isset($this->eventDispatcher) ? $this->eventDispatcher : null;
+    }
+
+    private function loadPlugins(): void {
+        $registry = $this->pluginRegistryOrNull();
+        $dispatcher = $this->eventDispatcherOrNull();
+        if ($this->pluginsLoaded || $registry === null || $dispatcher === null) return;
+        $this->pluginsLoaded = true;
+        try {
+            $dispatcher->dispatchTyped(new ToolPluginRegisterEvent($registry));
+        } catch (\Throwable $e) {
+            // A broken optional plugin must never remove EVA's built-in tools.
+        }
+    }
+
+    /**
+     * Build tool definitions for a specific execution surface without
+     * changing the caller's current surface. This is used by the agent's
+     * proposal phase: mutation tools may be shown to the model as candidates,
+     * but they are never executed until an explicit confirmation switches to
+     * the confirmed TaskProcessing surface.
+     *
+     * @return array<int,array{type:string,function:array}>
+     */
+    public function toolsForSurface(string $surface): array {
+        $previous = $this->toolPolicy->getSurface();
+        $this->toolPolicy->setSurface($surface);
+        try {
+            return $this->tools();
+        } finally {
+            $this->toolPolicy->setSurface($previous);
+        }
+    }
+
+    /** Safe catalog for the settings UI; schemas contain no credentials. */
+    public function pluginCatalog(): array {
+        $registry = $this->pluginRegistryOrNull();
+        return array_map(function (array $tool) use ($registry): array {
+            $fn = $tool['function'] ?? [];
+            $entry = $registry?->get((string)($fn['name'] ?? ''));
+            $definition = is_array($entry['definition'] ?? null) ? $entry['definition'] : [];
+            return [
+                'name' => (string)($fn['name'] ?? ''),
+                'description' => (string)($fn['description'] ?? ''),
+                'parameters' => $fn['parameters'] ?? ['type' => 'object', 'properties' => new \stdClass()],
+                'risk' => (string)($definition['risk'] ?? ToolPolicy::RISK_READONLY),
+                'surfaces' => array_values(array_map('strval', (array)($definition['surfaces'] ?? []))),
+                'requiresConfirmation' => (bool)($definition['requiresConfirmation'] ?? false),
+            ];
+        }, $this->toolsForSurface(ToolPolicy::SURFACE_WEB));
+    }
+
+    /**
+     * Execute a tool after the caller has explicitly confirmed it.
+     *
+     * This is intentionally a separate method so ordinary model-generated
+     * calls cannot accidentally opt into the confirmation bypass.
+     *
+     * @return array{ok:bool,result?:mixed,error?:string}
+     */
+    public function runConfirmed(string $userId, string $name, array $args): array {
+        return $this->run($userId, $name, $args, true);
+    }
+
+    /**
+     * Führt einen Tool-Aufruf aus. Wirft nie - liefert immer {ok, result|error}.
+     * @return array{ok:bool,result?:mixed,error?:string,confirmation_required?:bool,tool?:string,risk?:string}
+     */
+    public function run(string $userId, string $name, array $args, bool $confirmed = false): array {
+        $startedAt = microtime(true);
+        $this->setUserId($userId);
+        // Normalize a common model mistake before policy/confirmation is
+        // evaluated. Connected external services are not Nextcloud apps;
+        // presenting call_app_api here used to show the wrong confirmation
+        // dialog and then fail with a confusing OCS 400 response. Resolve the
+        // connector alias centrally so both the dialog and execution use the
+        // external-connector policy and authentication path.
+        if ($name === 'call_app_api') {
+            $alias = strtolower(trim((string)($args['app_id'] ?? '')));
+            if ($alias !== '' && array_key_exists($alias, $this->connectorRows())) {
+                $name = 'call_external_connector';
+                $args['id'] = $alias;
+                unset($args['app_id']);
+            }
+        }
+        if ($name === 'call_app_api_batch' && is_array($args['calls'] ?? null)) {
+            $calls = $args['calls'];
+            $connectorCalls = [];
+            $hasAppCall = false;
+            foreach ($calls as $call) {
+                $alias = is_array($call) ? strtolower(trim((string)($call['app_id'] ?? ''))) : '';
+                if ($alias !== '' && array_key_exists($alias, $this->connectorRows())) {
+                    $connectorCalls[] = ['id' => $alias, 'path' => $call['path'] ?? '', 'params' => $call['params'] ?? []];
+                } else {
+                    $hasAppCall = true;
+                }
+            }
+            if ($connectorCalls !== [] && $hasAppCall) {
+                return ['ok' => false, 'error' => 'Do not mix Nextcloud app routes and external connector routes in one batch. Use call_external_connector_batch for connector calls.'];
+            }
+            if ($connectorCalls !== []) {
+                $name = 'call_external_connector_batch';
+                $args = ['calls' => $connectorCalls];
+            }
+        }
+        // Centralized tool permission check
+        $this->loadPlugins();
+        $registry = $this->pluginRegistryOrNull();
+        $plugin = $registry?->get($name);
+        if ($plugin !== null) {
+            $definition = $plugin['definition'];
+            if (!in_array($this->toolPolicy->getSurface(), $definition['surfaces'], true)) {
+                return ['ok' => false, 'error' => 'Plugin tool is not available on this execution surface.'];
+            }
+            if (!empty($definition['requiresConfirmation']) && !$confirmed) {
+                return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
+                    'risk' => $definition['risk'], 'error' => 'This plugin action requires explicit confirmation before it can be executed.'];
+            }
+            $result = $registry->execute($userId, $name, $args);
+            $this->recordToolMetric($userId, $name, $startedAt, (bool)($result['ok'] ?? false));
+            return $result;
+        }
+        $policy = $this->toolPolicy->check($name);
+        if (!$policy['allowed']) {
+            return ['ok' => false, 'error' => $policy['reason'] ?? 'Tool not allowed'];
+        }
+        if (($policy['requiresConfirmation'] ?? false) && !$confirmed) {
+            // Generic app API calls are never auto-approved, even when the
+            // web surface has complete arguments: the model may have learned
+            // an unfamiliar endpoint and the user must review its exact
+            // method, path and parameters first.
+            if ($name === 'call_app_api' || $name === 'run_safe_command' || $name === 'run_terminal_command' || $name === 'run_terminal_sequence') {
+                return [
+                    'ok' => false,
+                    'confirmation_required' => true,
+                    'tool' => $name,
+                    'arguments' => $args,
+                    'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),
+                    'error' => $name === 'call_app_api'
+                        ? 'Generic app API calls always require explicit user confirmation.'
+                        : 'Terminal commands always require explicit user confirmation.',
+                ];
+            }
+            // Interactive web chat: an explicit, complete request runs
+            // immediately. The dialog is only shown when required data is
+            // still missing (e.g. an event without a name) or no concrete
+            // target was resolved, so the user can complete it there.
+            if ($this->toolPolicy->getSurface() === ToolPolicy::SURFACE_WEB) {
+                $missing = $this->missingRequiredArgs($name, $args);
+                if ($missing === []) {
+                    // Complete and explicit -> execute directly below.
+                } else {
+                    return [
+                        'ok' => false,
+                        'confirmation_required' => true,
+                        'tool' => $name,
+                        'arguments' => $args,
+                        'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),
+                        'missing' => $missing,
+                        'error' => 'This action needs more information before it can run: ' . implode(', ', $missing),
+                    ];
+                }
+            } else {
+                // Non-interactive surfaces keep the strict confirmation gate.
+                return [
+                    'ok' => false,
+                    'confirmation_required' => true,
+                    'tool' => $name,
+                    'arguments' => $args,
+                    'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),
+                    'error' => 'This action requires explicit user confirmation before it can be executed.',
+                ];
+            }
+        }
+
+        // File tools must work consistently in TaskProcessing workers
+        // (occ taskprocessing:worker runs in CLI). The user filesystem is not
+        // mounted by default in CLI, so we initialize it with the supported
+        // Nextcloud API before resolving the user folder (Issue #10). If the
+        // mount still cannot be set up, file tools degrade gracefully while
+        // non-file tools keep working.
+        $home = null;
+        try {
+            if (PHP_SAPI === 'cli') {
+                \OC_Util::setupFS($userId);
+            }
+            $home = $this->rootFolder->getUserFolder($userId);
+        } catch (\Throwable $e) {
+            $home = null;
+        }
+
+        $fileTools = [
+            'list_files', 'create_file', 'create_files', 'create_note', 'create_folder',
+            'rename_file', 'move_file', 'copy_file', 'file_checksum', 'delete_file', 'read_file', 'read_files', 'inspect_file', 'search_files',
+            'extract_file_text', 'create_sticker',
+            'update_knowledge',
+        ];
+        if (in_array($name, $fileTools, true) && $home === null) {
+            return ['ok' => false, 'error' => 'File tools are not available in the background worker (CLI). Ask in the web chat instead.'];
+        }
+
+        try {
+            $result = match ($name) {
+                'list_files' => $this->listFiles($home, $args),
+                'create_file' => $this->createFile($home, $args),
+                'create_files' => $this->createFiles($home, $args),
+                'create_note' => $this->createNote($home, $args),
+                'create_folder' => $this->createFolder($home, $args),
+                'rename_file' => $this->renameFile($home, $args),
+                'move_file' => $this->moveFile($home, $args),
+                'copy_file' => $this->copyFile($home, $args),
+                'file_checksum' => $this->fileChecksum($home, $args),
+                'delete_file' => $this->deleteFile($home, $args),
+                'read_file' => $this->readFile($home, $args),
+                'read_files' => $this->readFiles($home, $args),
+                'extract_file_text' => $this->extractFileText($home, $args),
+                'inspect_file' => $this->inspectFile($home, $args),
+                'search_files' => $this->searchFiles($home, $args),
+                'list_contacts' => $this->listContacts($userId),
+                'find_contact' => $this->findContact($userId, $args),
+                'create_contact' => $this->createContact($userId, $args),
+                'update_contact' => $this->updateContact($userId, $args),
+                'delete_contact' => $this->deleteContact($userId, $args),
+                'read_profile' => $this->readProfile($userId),
+                'update_profile' => $this->updateProfile($userId, $args),
+                'list_calendars' => ['ok' => true, 'result' => $this->calendar->calendars($userId)],
+                'list_calendar_events' => $this->calendar->listEvents($userId, $args),
+                'create_calendar_event' => $this->calendar->createEvent($userId, $args),
+                'update_calendar_event' => $this->calendar->updateEvent($userId, $args),
+                'delete_calendar_event' => $this->calendar->deleteEvent($userId, $args),
+                'find_free_slots' => $this->calendar->findFreeSlots($userId, $args),
+                'current_time' => $this->currentTime($userId),
+                'weather' => $this->weather($args),
+                'web_search' => $this->runWebSearch($args),
+                'search_images' => $this->runImageSearch($args),
+                'create_sticker' => $this->createSticker($home, $args),
+                'open_website' => $this->openWebsite($args),
+                'list_external_connectors' => $this->listExternalConnectors(),
+                'discover_external_connector' => $this->discoverExternalConnector($args),
+                'configure_external_connector' => $this->configureExternalConnector($args),
+                'diagnose_external_connector' => $this->diagnoseExternalConnector($args),
+                'call_external_connector' => $this->callExternalConnector($args),
+                'call_external_connector_batch' => $this->callExternalConnectorBatch($args),
+                'list_talk_rooms' => $this->listTalkRooms($userId, $args),
+                'read_talk_chat' => $this->readTalkChat($userId, $args),
+                'send_talk_message' => $this->sendTalkMessage($userId, $args),
+                'search_mails' => $this->searchMails($userId, $args),
+                'list_mails' => $this->listMails($userId, $args),
+                'read_mail' => $this->readMail($userId, $args),
+                'unread_mail_count' => $this->unreadMailCount($userId),
+                'summarize_emails' => $this->summarizeEmails($userId, $args),
+                'list_shares' => $this->shares->list($userId, $args),
+                'create_share' => $this->shares->create($userId, $args),
+                'update_share' => $this->shares->update($userId, $args),
+                'delete_share' => $this->shares->delete($userId, $args),
+                'list_tasks' => $this->calendar->listTasks($userId, $args),
+                'create_task' => $this->calendar->createTask($userId, $args),
+                'update_task' => $this->calendar->updateTask($userId, $args),
+                'complete_task' => $this->calendar->completeTask($userId, $args),
+                'delete_task' => $this->calendar->deleteTask($userId, $args),
+                'recent_activity' => $this->activity->recent($userId, $args),
+                'list_comments' => $this->listComments($args),
+                'add_comment' => $this->addComment($userId, $args),
+                'delete_comment' => $this->deleteComment($args),
+                'list_system_tags' => $this->listSystemTags($args),
+                'tag_file' => $this->tagFile($userId, $args, false),
+                'untag_file' => $this->tagFile($userId, $args, true),
+                'list_file_versions' => $this->listFileVersions($home, $args),
+                'restore_file_version' => $this->restoreFileVersion($home, $args),
+                'server_status' => $this->serverStatus($userId),
+                'run_safe_command' => $this->runSafeCommand($args),
+                'run_terminal_command' => $this->runTerminalCommand($args),
+                'run_terminal_sequence' => $this->runTerminalSequence($args),
+                'list_nextcloud_capabilities' => $this->listNextcloudCapabilities(),
+                'discover_app_api' => $this->discoverAppApi($args),
+                'list_learned_app_apis' => $this->listLearnedAppApis(),
+                'list_learned_file_locations' => $this->listLearnedFileLocations(),
+                'call_app_api' => $this->callAppApi($args),
+                'call_app_api_batch' => $this->callAppApiBatch($args),
+                'list_scheduled_briefings' => $this->listScheduledBriefings(),
+                'create_scheduled_briefing' => $this->createScheduledBriefing($args),
+                'update_scheduled_briefing' => $this->updateScheduledBriefing($args),
+                'delete_scheduled_briefing' => $this->deleteScheduledBriefing($args),
+                'update_knowledge' => $this->updateKnowledge($home, $args),
+                default => ['ok' => false, 'error' => 'Unknown tool: ' . $name],
+            };
+        } catch (\Throwable $e) {
+            $this->recordToolMetric($userId, $name, $startedAt, false);
+            return ['ok' => false, 'error' => $e->getMessage()];
+        }
+        $this->recordToolMetric($userId, $name, $startedAt, (bool)($result['ok'] ?? false));
+        return $result;
+    }
+
+    private function recordToolMetric(string $userId, string $name, float $startedAt, bool $ok): void {
+        if ($this->usageMetrics === null) return;
+        try { $this->usageMetrics->recordTool($userId, $name, (int)round((microtime(true) - $startedAt) * 1000), $ok); } catch (\Throwable) { }
+    }
+
+    private function commentsManager(): ?\OCP\Comments\ICommentsManager {
+        try {
+            $factory = $this->commentsFactory ?? Server::get(\OCP\Comments\ICommentsManagerFactory::class);
+            return $factory->getManager();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function systemTagServices(): ?array {
+        try {
+            $factory = $this->systemTagFactory ?? Server::get(\OCP\SystemTag\ISystemTagManagerFactory::class);
+            return ['manager' => $factory->getManager(), 'mapper' => $factory->getObjectMapper()];
+        } catch (\Throwable) { return null; }
+    }
+
+    private function listSystemTags(array $args): array {
+        $services = $this->systemTagServices();
+        if ($services === null) return ['ok' => false, 'error' => 'Nextcloud system tags are not available.'];
+        try {
+            $search = trim((string)($args['search'] ?? ''));
+            $user = $this->userManager->get($this->config->userId() ?? '');
+            $tags = $services['manager']->getAllTags(true, $search !== '' ? '%' . $search . '%' : null);
+            $out = [];
+            foreach ($tags as $tag) {
+                if ($user !== null && !$services['manager']->canUserSeeTag($tag, $user)) continue;
+                $out[] = ['id' => (string)$tag->getId(), 'name' => (string)$tag->getName(), 'user_visible' => (bool)$tag->isUserVisible(), 'user_assignable' => (bool)$tag->isUserAssignable(), 'color' => method_exists($tag, 'getColor') ? (string)$tag->getColor() : null];
+            }
+            return ['ok' => true, 'result' => ['tags' => $out]];
+        } catch (\Throwable) { return ['ok' => false, 'error' => 'System tags could not be read.']; }
+    }
+
+    private function tagFile(string $userId, array $args, bool $remove): array {
+        $services = $this->systemTagServices();
+        $fileId = trim((string)($args['file_id'] ?? '')); $name = trim((string)($args['tag'] ?? ''));
+        if ($services === null) return ['ok' => false, 'error' => 'Nextcloud system tags are not available.'];
+        if (!ctype_digit($fileId) || (int)$fileId < 1 || $name === '') return ['ok' => false, 'error' => 'A numeric file_id and non-empty tag are required'];
+        try {
+            $user = $this->userManager->get($userId);
+            if ($user === null) return ['ok' => false, 'error' => 'User not found'];
+            $tag = $services['manager']->getTag($name, true, true);
+            if (!$services['manager']->canUserAssignTag($tag, $user)) return ['ok' => false, 'error' => 'The user may not assign this system tag.'];
+            if ($remove) $services['mapper']->unassignTags($fileId, 'files', (string)$tag->getId());
+            else $services['mapper']->assignTags($fileId, 'files', (string)$tag->getId());
+            return ['ok' => true, 'result' => ['file_id' => (int)$fileId, 'tag' => (string)$tag->getName(), 'removed' => $remove]];
+        } catch (\Throwable) { return ['ok' => false, 'error' => 'The system tag could not be changed. Check file access and tag permissions.']; }
+    }
+
+    private function versionManager(): ?object {
+        $class = '\\OCA\\Files_Versions\\Versions\\IVersionManager';
+        if (!interface_exists($class)) return null;
+        try { return Server::get($class); } catch (\Throwable) { return null; }
+    }
+
+    private function fileById(?Folder $home, array $args): ?File {
+        $id = trim((string)($args['file_id'] ?? ''));
+        if ($home === null || !ctype_digit($id) || (int)$id < 1) return null;
+        try {
+            foreach ($home->getById((int)$id) as $node) if ($node instanceof File) return $node;
+        } catch (\Throwable) { }
+        return null;
+    }
+
+    private function listFileVersions(?Folder $home, array $args): array {
+        $manager = $this->versionManager();
+        $file = $this->fileById($home, $args);
+        if ($manager === null) return ['ok' => false, 'error' => 'The Nextcloud files versions app is not available.'];
+        if ($file === null) return ['ok' => false, 'error' => 'File not found or not accessible.'];
+        try {
+            $user = $this->userManager->get($this->config->userId() ?? '');
+            if ($user === null) return ['ok' => false, 'error' => 'User not found.'];
+            $versions = $manager->getVersionsForFile($user, $file);
+            $out = [];
+            foreach ($versions as $version) {
+                $out[] = [
+                    'version_id' => (string)$version->getRevisionId(),
+                    'timestamp' => $version->getTimestamp(),
+                    'date' => gmdate(DATE_ATOM, $version->getTimestamp()),
+                    'size' => $version->getSize(),
+                    'name' => $version->getSourceFileName(),
+                    'mime_type' => $version->getMimeType(),
+                ];
+            }
+            return ['ok' => true, 'result' => ['file_id' => (int)$file->getId(), 'path' => $file->getPath(), 'versions' => $out]];
+        } catch (\Throwable) { return ['ok' => false, 'error' => 'File versions could not be read.']; }
+    }
+
+    private function restoreFileVersion(?Folder $home, array $args): array {
+        $manager = $this->versionManager();
+        $file = $this->fileById($home, $args);
+        $revision = trim((string)($args['version_id'] ?? ''));
+        if ($manager === null) return ['ok' => false, 'error' => 'The Nextcloud files versions app is not available.'];
+        if ($file === null || $revision === '') return ['ok' => false, 'error' => 'A valid file_id and version_id are required.'];
+        try {
+            $user = $this->userManager->get($this->config->userId() ?? '');
+            if ($user === null) return ['ok' => false, 'error' => 'User not found.'];
+            $version = null;
+            foreach ($manager->getVersionsForFile($user, $file) as $candidate) {
+                if ((string)$candidate->getRevisionId() === $revision) { $version = $candidate; break; }
+            }
+            if ($version === null) return ['ok' => false, 'error' => 'That version does not belong to this file or is no longer available.'];
+            $manager->rollback($version);
+            return ['ok' => true, 'result' => ['file_id' => (int)$file->getId(), 'version_id' => $revision, 'restored' => true]];
+        } catch (\Throwable) { return ['ok' => false, 'error' => 'The file version could not be restored. Check locks and permissions.']; }
+    }
+
+    private function commentData(\OCP\Comments\IComment $comment): array {
+        return [
+            'id' => (string)$comment->getId(),
+            'parent_id' => (string)$comment->getParentId(),
+            'object_type' => (string)$comment->getObjectType(),
+            'object_id' => (string)$comment->getObjectId(),
+            'actor_type' => (string)$comment->getActorType(),
+            'actor_id' => (string)$comment->getActorId(),
+            'message' => (string)$comment->getMessage(),
+            'created' => $comment->getCreationDateTime()?->format(DATE_ATOM),
+        ];
+    }
+
+    private function listComments(array $args): array {
+        $manager = $this->commentsManager();
+        if ($manager === null) return ['ok' => false, 'error' => 'The Nextcloud comments app/service is not available.'];
+        $type = trim((string)($args['object_type'] ?? 'files'));
+        $id = trim((string)($args['object_id'] ?? ''));
+        if ($type === '' || $id === '') return ['ok' => false, 'error' => 'object_type and object_id are required'];
+        $limit = max(1, min(100, (int)($args['limit'] ?? 50)));
+        try {
+            $comments = $manager->getForObject($type, $id, $limit, 0);
+            return ['ok' => true, 'result' => ['comments' => array_map(fn($comment): array => $this->commentData($comment), $comments), 'object_type' => $type, 'object_id' => $id]];
+        } catch (\Throwable $e) { return ['ok' => false, 'error' => 'Comments could not be read.']; }
+    }
+
+    private function addComment(string $userId, array $args): array {
+        $manager = $this->commentsManager();
+        if ($manager === null) return ['ok' => false, 'error' => 'The Nextcloud comments app/service is not available.'];
+        $type = trim((string)($args['object_type'] ?? 'files')); $id = trim((string)($args['object_id'] ?? '')); $message = trim((string)($args['message'] ?? ''));
+        if ($type === '' || $id === '' || $message === '') return ['ok' => false, 'error' => 'object_type, object_id and message are required'];
+        try {
+            $comment = $manager->create('users', $userId, $type, $id);
+            $comment->setMessage(mb_substr($message, 0, \OCP\Comments\IComment::MAX_MESSAGE_LENGTH));
+            if (trim((string)($args['parent_id'] ?? '')) !== '') $comment->setParentId(trim((string)$args['parent_id']));
+            $saved = $manager->save($comment);
+            return ['ok' => true, 'result' => $this->commentData($saved)];
+        } catch (\Throwable) { return ['ok' => false, 'error' => 'Comment could not be added. Check object access and comment length.']; }
+    }
+
+    private function deleteComment(array $args): array {
+        $manager = $this->commentsManager(); $id = trim((string)($args['comment_id'] ?? ''));
+        if ($manager === null) return ['ok' => false, 'error' => 'The Nextcloud comments app/service is not available.'];
+        if ($id === '') return ['ok' => false, 'error' => 'comment_id is required'];
+        try { $manager->delete($id); return ['ok' => true, 'result' => ['comment_id' => $id, 'deleted' => true]]; }
+        catch (\Throwable) { return ['ok' => false, 'error' => 'Comment could not be deleted. Check ownership and permissions.']; }
+    }
+
+    /** Read-only capability discovery for agent planning; never returns secrets. */
+    private function listNextcloudCapabilities(): array {
+        try {
+            $manager = Server::get(\OCP\App\IAppManager::class);
+            $apps = array_values(array_unique(array_map('strval', $manager->getEnabledApps())));
+            sort($apps, SORT_STRING);
+            $apiCatalog = [
+                'files' => ['protocols' => ['WebDAV', 'OCS'], 'eva_tools' => ['list_files', 'read_file', 'search_files', 'create_file', 'rename_file', 'delete_file']],
+                'calendar' => ['protocols' => ['CalDAV', 'OCS'], 'eva_tools' => ['list_calendars', 'list_calendar_events', 'find_free_slots', 'create_calendar_event', 'update_calendar_event', 'delete_calendar_event']],
+                'contacts' => ['protocols' => ['CardDAV', 'OCS'], 'eva_tools' => ['list_contacts', 'find_contact', 'create_contact', 'update_contact', 'delete_contact']],
+                'mail' => ['protocols' => ['IMAP/Nextcloud Mail service'], 'eva_tools' => ['search_mails', 'list_mails', 'read_mail', 'unread_mail_count']],
+                'spreed' => ['protocols' => ['OCS Talk API'], 'eva_tools' => ['list_talk_rooms', 'read_talk_chat', 'send_talk_message']],
+                'notes' => ['protocols' => ['Nextcloud Notes service/WebDAV'], 'eva_tools' => ['create_note', 'read_file', 'search_files']],
+                'activity' => ['protocols' => ['OCS Activity API'], 'eva_tools' => ['recent_activity']],
+                'files_sharing' => ['protocols' => ['OCS Sharing API'], 'eva_tools' => ['list_shares', 'create_share', 'update_share', 'delete_share']],
+                'deck' => ['protocols' => ['Deck OCS API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated EVA adapter installed'],
+                'bookmarks' => ['protocols' => ['Bookmarks REST API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated EVA adapter installed'],
+                'forms' => ['protocols' => ['Forms OCS API'], 'eva_tools' => [], 'status' => 'discovery only; no dedicated EVA adapter installed'],
+                'comments' => ['protocols' => ['OCS Comments API', 'server-side ICommentsManager'], 'eva_tools' => ['list_comments', 'add_comment', 'delete_comment']],
+                'systemtags' => ['protocols' => ['server-side ISystemTagManager/ISystemTagObjectMapper', 'OCS Files Tags API'], 'eva_tools' => ['list_system_tags', 'tag_file', 'untag_file']],
+                'files_versions' => ['protocols' => ['server-side IVersionManager'], 'eva_tools' => ['list_file_versions', 'restore_file_version']],
+                '_generic' => ['protocols' => ['Nextcloud route metadata, OCS and app-specific routes'], 'eva_tools' => ['discover_app_api', 'call_app_api'], 'status' => 'unknown app routes can be learned and invoked through the confirmation-gated generic adapter'],
+            ];
+            $availableApis = [];
+            foreach ($apiCatalog as $app => $metadata) if (in_array($app, $apps, true)) $availableApis[$app] = $metadata;
+            $availableApis['_generic'] = $apiCatalog['_generic'];
+            $appMetadata = [];
+            try {
+                $manager = Server::get(\OCP\App\IAppManager::class);
+                foreach ($apps as $app) {
+                    $info = method_exists($manager, 'getAppInfo') ? $manager->getAppInfo($app) : [];
+                    if (!is_array($info)) $info = [];
+                    $appMetadata[$app] = [
+                        'name' => (string)($info['name'] ?? $app),
+                        'version' => (string)($info['version'] ?? ''),
+                        'description' => mb_strimwidth((string)($info['description'] ?? ''), 0, 240, '…'),
+                    ];
+                }
+            } catch (\Throwable) { /* metadata is optional on older NC versions */ }
+            return [
+                'ok' => true,
+                'enabled_apps' => $apps,
+                'app_metadata' => $appMetadata,
+                'eva_integrations' => [
+                    'files' => in_array('files', $apps, true),
+                    'calendar' => in_array('calendar', $apps, true),
+                    'contacts' => in_array('contacts', $apps, true),
+                    'mail' => in_array('mail', $apps, true),
+                    'spreed' => in_array('spreed', $apps, true),
+                    'notes' => in_array('notes', $apps, true),
+                ],
+                'api_catalog' => $availableApis,
+                'next_step' => 'Plan with the protocols and EVA tools listed above. Prefer a dedicated EVA adapter; for an enabled app without one, call list_learned_app_apis or discover_app_api first (include_internal=true when needed), then use the exact same-origin discovered route with call_app_api. Generic calls are always confirmation-gated interactively and require the encrypted app token in background runs.',
+            ];
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Nextcloud capability discovery is unavailable.'];
+        }
+    }
+
+    /**
+     * Read route metadata from Nextcloud's router without invoking controllers.
+     * This gives the agent a safe way to learn an installed app's API surface;
+     * execution still goes through a same-origin app path and its normal
+     * Nextcloud authentication/permission checks.
+     */
+    private function discoverAppApi(array $args): array {
+        $appId = strtolower(trim((string)($args['app_id'] ?? '')));
+        if ($appId !== '' && !preg_match('/^[a-z0-9_]+$/', $appId)) {
+            return ['ok' => false, 'error' => 'app_id must contain only lowercase letters, numbers and underscores.'];
+        }
+        try {
+            $appManager = Server::get(\OCP\App\IAppManager::class);
+            $enabled = array_values(array_unique(array_map('strval', $appManager->getEnabledApps())));
+            if ($appId !== '' && !in_array($appId, $enabled, true)) {
+                return ['ok' => false, 'error' => 'That app is not enabled or is not available to this instance.'];
+            }
+            $router = Server::get(\OCP\Route\IRouter::class);
+            if (method_exists($router, 'loadRoutes')) $router->loadRoutes($appId !== '' ? $appId : null);
+            if (!method_exists($router, 'getRouteCollection')) {
+                return ['ok' => false, 'error' => 'This Nextcloud version does not expose route discovery.'];
+            }
+            $collection = $router->getRouteCollection();
+            $includeInternal = (bool)($args['include_internal'] ?? false);
+            $routes = [];
+            foreach ($collection->all() as $name => $route) {
+                $defaults = $route->getDefaults();
+                $controller = (string)($defaults['_controller'] ?? '');
+                $routeApp = strtolower((string)($defaults['_app'] ?? ''));
+                if ($routeApp === '' && is_string($name) && str_contains($name, '#')) {
+                    $routeApp = strtolower((string)strtok($name, '#'));
+                }
+                if ($appId !== '' && $routeApp !== $appId && !str_starts_with(strtolower((string)$name), $appId . '.')) continue;
+                $path = method_exists($route, 'getPath') ? (string)$route->getPath() : '';
+                $isOcs = str_starts_with($path, '/ocs/') || str_starts_with($path, '/ocsapp/');
+                if (!$includeInternal && !$isOcs) continue;
+                $methods = method_exists($route, 'getMethods') ? array_values(array_map('strval', $route->getMethods())) : [];
+                $variables = method_exists($route, 'getVariableNames') ? array_values(array_map('strval', $route->getVariableNames())) : [];
+                $requirements = method_exists($route, 'getRequirements') ? array_map('strval', $route->getRequirements()) : [];
+                $routes[] = [
+                    'name' => (string)$name,
+                    'app_id' => $routeApp,
+                    'methods' => $methods,
+                    'path' => $path,
+                    'controller' => $controller,
+                    'ocs' => $isOcs,
+                    'variables' => $variables,
+                    'requirements' => $requirements,
+                ];
+            }
+            usort($routes, static fn (array $a, array $b): int => strcmp($a['name'], $b['name']));
+            if (count($routes) > 300) $routes = array_slice($routes, 0, 300);
+            $this->rememberAppApi($appId, $routes);
+            return ['ok' => true, 'result' => ['app_id' => $appId !== '' ? $appId : null, 'route_count' => count($routes), 'routes' => $routes, 'execution_policy' => 'Discovery never executes a route. Use the exact same-origin path with call_app_api; route variables and requirements describe the path placeholders. Non-OCS routes must be discovered with include_internal=true. Interactive calls require confirmation and background calls require the encrypted app token.']];
+        } catch (\Throwable) {
+            return ['ok' => false, 'error' => 'Nextcloud app API discovery is unavailable.'];
+        }
+    }
+
+    private function rememberAppApi(string $appId, array $routes): void {
+        if ($appId === '') return;
+        try {
+            $known = json_decode($this->config->get('learned_app_apis'), true);
+            $known = is_array($known) ? $known : [];
+            $sanitized = [];
+            foreach (array_slice($routes, 0, 300) as $route) {
+                if (!is_array($route)) continue;
+                $sanitized[] = [
+                    'name' => (string)($route['name'] ?? ''),
+                    'methods' => array_values(array_map('strval', is_array($route['methods'] ?? null) ? $route['methods'] : [])),
+                    'path' => (string)($route['path'] ?? ''),
+                    'ocs' => (bool)($route['ocs'] ?? false),
+                    'variables' => array_values(array_map('strval', is_array($route['variables'] ?? null) ? $route['variables'] : [])),
+                    'requirements' => array_map('strval', is_array($route['requirements'] ?? null) ? $route['requirements'] : []),
+                ];
+            }
+            $known[$appId] = ['updated' => time(), 'routes' => $sanitized];
+            if (count($known) > 30) {
+                uasort($known, static fn (array $a, array $b): int => ((int)($b['updated'] ?? 0)) <=> ((int)($a['updated'] ?? 0)));
+                $known = array_slice($known, 0, 30, true);
+            }
+            $this->config->set('learned_app_apis', json_encode($known, JSON_UNESCAPED_SLASHES) ?: '{}');
+        } catch (\Throwable) { /* Learning is best effort. */ }
+    }
+
+    private function listLearnedAppApis(): array {
+        try {
+            $known = json_decode($this->config->get('learned_app_apis'), true);
+            return ['ok' => true, 'result' => ['apps' => is_array($known) ? $known : [], 'note' => 'Route metadata is cached per user and may be stale; refresh with discover_app_api before acting.']];
+        } catch (\Throwable) { return ['ok' => true, 'result' => ['apps' => []]]; }
+    }
+
+    private function callAppApi(array $args): array {
+        $appId = strtolower(trim((string)($args['app_id'] ?? '')));
+        $method = strtoupper(trim((string)($args['method'] ?? '')));
+        $path = trim((string)($args['path'] ?? ''));
+        $params = $args['params'] ?? [];
+        // Models sometimes classify an explicitly connected appliance as an
+        // "app" because its API is app-shaped. Route that alias through the
+        // connector implementation so host allow-listing, discovered-route
+        // checks, bearer-token handling and GET retries remain enforced.
+        if ($appId !== '' && array_key_exists($appId, $this->connectorRows())) {
+            return $this->callExternalConnector(['id' => $appId, 'method' => $method, 'path' => $path, 'params' => $params]);
+        }
+        if (!preg_match('/^[a-z0-9_]+$/', $appId) || !in_array($method, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+            return ['ok' => false, 'error' => 'A valid app_id and HTTP method are required.'];
+        }
+        if (!is_array($params) || count($params) > 50) return ['ok' => false, 'error' => 'params must be an object with at most 50 fields.'];
+        $split = $this->splitRequestPath($path, $params);
+        if ($split === null) return ['ok' => false, 'error' => 'The app API path or query string is invalid.'];
+        [$path, $params] = $split;
+        $ocsPrefixes = ['/ocs/v1.php/apps/' . $appId . '/', '/ocs/v2.php/apps/' . $appId . '/'];
+        $isOcsPath = false;
+        foreach ($ocsPrefixes as $prefix) if (str_starts_with($path, $prefix)) $isOcsPath = true;
+        if (str_contains($path, '..') || preg_match('/[\r\n]/', $path) || !str_starts_with($path, '/')) {
+            return ['ok' => false, 'error' => 'Only same-origin app paths without traversal are allowed.'];
+        }
+        // Nextcloud app routes are exposed externally below
+        // /apps/{app_id}/..., while models naturally return the app-relative
+        // route (/api/v1/people). Match and execute both forms consistently.
+        $absolutePath = $path;
+        if (!$isOcsPath && str_starts_with($path, '/api/')) {
+            $absolutePath = '/apps/' . $appId . $path;
+        }
+        // Every generic route must be present in the user's recent discovery
+        // snapshot.  Prefix-only checks are not sufficient: an enabled app can
+        // expose administrative or destructive endpoints under the same OCS
+        // prefix.  Requiring an exact discovered route keeps the learning
+        // loop useful while preventing arbitrary app API probing.
+        $knownRoute = false;
+        try {
+            $learned = json_decode($this->config->get('learned_app_apis'), true);
+            $learnedAt = (int)($learned[$appId]['updated'] ?? 0);
+            $routes = ($learnedAt > 0 && $learnedAt >= time() - self::LEARNED_API_TTL && is_array($learned[$appId]['routes'] ?? null)) ? $learned[$appId]['routes'] : [];
+            foreach ($routes as $route) {
+                if (!is_array($route)) continue;
+                $routePath = (string)($route['path'] ?? '');
+                $methods = is_array($route['methods'] ?? null) ? array_map('strtoupper', $route['methods']) : [];
+                $routeComparable = str_starts_with($routePath, '/apps/' . $appId . '/')
+                    ? substr($routePath, strlen('/apps/' . $appId)) : $routePath;
+                if ($routePath !== '' && ($this->matchesDiscoveredRoute($routeComparable, $path) || $this->matchesDiscoveredRoute($routePath, $absolutePath)) && ($methods === [] || in_array($method, $methods, true))) {
+                    $knownRoute = true;
+                    break;
+                }
+            }
+        } catch (\Throwable) { /* treat malformed learning cache as empty */ }
+        if (!$knownRoute) {
+            // Discovery is read-only and safe. Perform it transparently on
+            // the first confirmed call so app integrations (for example
+            // integration_immich) do not require the model to know an
+            // internal discover-then-call dance.
+            if (($args['_auto_discover'] ?? true) === true) {
+                $discovered = $this->discoverAppApi(['app_id' => $appId, 'include_internal' => true]);
+                if (($discovered['ok'] ?? false) === true) {
+                    $args['_auto_discover'] = false;
+                    return $this->callAppApi($args);
+                }
+            }
+            return ['ok' => false, 'error' => $isOcsPath
+                ? 'This OCS route has not been discovered recently. Call discover_app_api first.'
+                : 'This non-OCS route has not been discovered yet. Call discover_app_api with include_internal=true first.'];
+        }
+        // Replace discovered {path} placeholders from the supplied parameter
+        // object before constructing the same-origin URL. Path parameters are
+        // never forwarded as query/body values and must be scalar to avoid
+        // ambiguous or unsafe route expansion.
+        $pathTemplate = $path;
+        $path = $this->expandConnectorPath($pathTemplate, $params);
+        if ($path === null) return ['ok' => false, 'error' => 'A required path parameter is missing or invalid.'];
+        $params = $this->removePathParameters($pathTemplate, $params);
+        if (!$isOcsPath && str_starts_with($path, '/api/')) $absolutePath = '/apps/' . $appId . $path;
+        try {
+            $appManager = Server::get(\OCP\App\IAppManager::class);
+            if (!in_array($appId, array_map('strval', $appManager->getEnabledApps()), true) || !$appManager->isEnabledForUser($appId)) {
+                return ['ok' => false, 'error' => 'That app is not enabled for the current user.'];
+            }
+            $request = Server::get(\OCP\IRequest::class);
+            $client = Server::get(\OCP\Http\Client\IClientService::class)->newClient();
+            $url = Server::get(\OCP\IURLGenerator::class)->getAbsoluteURL($absolutePath);
+            $headers = ['Accept' => 'application/json', 'OCS-APIRequest' => 'true'];
+            foreach (['Authorization', 'Cookie'] as $header) {
+                $value = trim((string)$request->getHeader($header));
+                if ($value !== '') $headers[$header] = $value;
+            }
+            // Background workers have no browser cookie. A user may opt in to
+            // an encrypted Nextcloud app-password; it is used only for this
+            // same-origin request and is never exposed to the model.
+            if (!isset($headers['Authorization']) && !isset($headers['Cookie'])) {
+                try {
+                    $token = Server::get(\OCA\EvaAi\Service\ProviderCredentials::class)->getNextcloudToken($this->config->userId() ?? '');
+                    $headers['Authorization'] = 'Basic ' . base64_encode(($this->config->userId() ?? '') . ':' . $token);
+                } catch (\Throwable) {
+                    return ['ok' => false, 'error' => 'No browser session or encrypted Nextcloud app token is available for this API action.'];
+                }
+            }
+            $options = ['headers' => $headers, 'timeout' => self::APP_API_TIMEOUT, 'allow_redirects' => ['max' => 0, 'protocols' => ['https', 'http']]];
+            if ($method === 'GET') $options['query'] = $params;
+            elseif ($params !== []) {
+                if ($isOcsPath) {
+                    // OCS endpoints conventionally consume form-style fields.
+                    $options['body'] = $params;
+                } else {
+                    // Internal app REST routes are commonly JSON APIs. Using
+                    // an explicit JSON string avoids client-dependent array
+                    // coercion and matches the generic connector adapter.
+                    try {
+                        $options['body'] = json_encode($params, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+                        $options['headers']['Content-Type'] = 'application/json';
+                    } catch (\Throwable) {
+                        return ['ok' => false, 'error' => 'App API parameters could not be encoded as JSON.'];
+                    }
+                }
+            }
+            $response = match ($method) {
+                'GET' => $client->get($url, $options),
+                'POST' => $client->post($url, $options),
+                'PUT' => $client->put($url, $options),
+                'PATCH' => $client->patch($url, $options),
+                'DELETE' => $client->delete($url, $options),
+            };
+            $body = $response->getBody();
+            if (is_resource($body)) $body = stream_get_contents($body);
+            $body = mb_substr((string)$body, 0, 50000);
+            $decoded = json_decode($body, true);
+            // Generic app APIs may return credentials or session material even
+            // on an otherwise harmless GET. Keep the adapter useful while
+            // ensuring obvious secret-shaped fields never reach the model.
+            $safeData = is_array($decoded) ? $this->redactApiPayload($decoded) : $body;
+            $status = $response->getStatusCode();
+            $ok = $status >= 200 && $status < 300;
+            if ($ok) $this->rememberAppApiPattern($appId, $method, $path, array_keys($params), is_array($safeData) ? $this->shapeOf($safeData) : ['type' => 'string']);
+            return ['ok' => $ok, 'result' => ['status' => $status, 'data' => $safeData, 'path' => $path, 'method' => $method]];
+        } catch (\Throwable $e) {
+            $detail = trim(preg_replace('/\s+/', ' ', $e->getMessage()));
+            return ['ok' => false, 'error' => 'The app API request failed in the current user context.' . ($detail !== '' ? ' ' . mb_substr($detail, 0, 220) : '')];
+        }
+    }
+
+    /** Execute bounded GET calls while reusing the same discovery/security path. */
+    private function callAppApiBatch(array $args): array {
+        $calls = $args['calls'] ?? null;
+        if (!is_array($calls) || $calls === [] || count($calls) > 10) {
+            return ['ok' => false, 'error' => 'calls must contain between 1 and 10 requests.'];
+        }
+        $results = [];
+        $batchDeadline = microtime(true) + self::APP_API_BATCH_BUDGET;
+        foreach ($calls as $call) {
+            if (!is_array($call)) {
+                $results[] = ['ok' => false, 'error' => 'Each batch item must be an object.'];
+                continue;
+            }
+            if (microtime(true) >= $batchDeadline) {
+                $results[] = ['ok' => false, 'error' => 'App API batch time budget reached; retry the remaining read requests separately.'];
+                break;
+            }
+            $results[] = $this->callAppApi([
+                'app_id' => $call['app_id'] ?? '',
+                'path' => $call['path'] ?? '',
+                'method' => 'GET',
+                'params' => is_array($call['params'] ?? null) ? $call['params'] : [],
+            ]);
+        }
+        return ['ok' => !in_array(false, array_map(static fn(array $row): bool => (bool)($row['ok'] ?? false), $results), true), 'result' => ['calls' => $results, 'count' => count($results)]];
+    }
+
+    /** Execute bounded read-only calls against one or more configured connectors. */
+    private function callExternalConnectorBatch(array $args): array {
+        $calls = $args['calls'] ?? null;
+        if (!is_array($calls) || $calls === [] || count($calls) > 8) return ['ok' => false, 'error' => 'calls must contain between 1 and 8 requests.'];
+        $results = [];
+        $batchDeadline = microtime(true) + self::CONNECTOR_DISCOVERY_BUDGET;
+        foreach ($calls as $call) {
+            if (!is_array($call)) { $results[] = ['ok' => false, 'error' => 'Each batch item must be an object.']; continue; }
+            if (microtime(true) >= $batchDeadline) {
+                $results[] = ['ok' => false, 'error' => 'Connector batch time budget reached; retry the remaining read requests separately.'];
+                break;
+            }
+            $results[] = $this->callExternalConnector([
+                'id' => $call['id'] ?? '', 'path' => $call['path'] ?? '', 'method' => 'GET',
+                'params' => is_array($call['params'] ?? null) ? $call['params'] : [],
+            ]);
+        }
+        return ['ok' => !in_array(false, array_map(static fn(array $row): bool => (bool)($row['ok'] ?? false), $results), true), 'result' => ['calls' => $results, 'count' => count($results)]];
+    }
+
+    /** Remember only reusable call shape, never parameter values or response data. */
+    private function rememberAppApiPattern(string $appId, string $method, string $path, array $paramKeys, array $responseShape = []): void {
+        if ($appId === '' || $path === '') return;
+        try {
+            $known = json_decode($this->config->get('learned_app_apis'), true);
+            $known = is_array($known) ? $known : [];
+            if (!is_array($known[$appId] ?? null)) $known[$appId] = ['updated' => time(), 'routes' => []];
+            $patterns = is_array($known[$appId]['patterns'] ?? null) ? $known[$appId]['patterns'] : [];
+            $keys = array_values(array_unique(array_filter(array_map('strval', $paramKeys), static fn(string $key): bool => preg_match('/^[A-Za-z0-9_.-]{1,80}$/', $key) === 1)));
+            $entry = ['method' => $method, 'path' => $path, 'params' => $keys, 'response_shape' => $responseShape, 'last_used' => time()];
+            $fingerprint = $method . ' ' . $path;
+            $patterns = array_values(array_filter($patterns, static fn($row): bool => is_array($row) && (($row['method'] ?? '') . ' ' . ($row['path'] ?? '')) !== $fingerprint));
+            array_unshift($patterns, $entry);
+            $known[$appId]['patterns'] = array_slice($patterns, 0, 50);
+            $known[$appId]['updated'] = time();
+            if (count($known) > 30) {
+                uasort($known, static fn (array $a, array $b): int => ((int)($b['updated'] ?? 0)) <=> ((int)($a['updated'] ?? 0)));
+                $known = array_slice($known, 0, 30, true);
+            }
+            $this->config->set('learned_app_apis', json_encode($known, JSON_UNESCAPED_SLASHES) ?: '{}');
+        } catch (\Throwable) { /* Learning is best effort and must not break the action. */ }
+    }
+
+    /** Return only JSON shape metadata; never retain response values. */
+    private function shapeOf(mixed $value, int $depth = 0): array {
+        if ($depth >= 3) return ['type' => is_array($value) ? 'object' : gettype($value)];
+        if (!is_array($value)) return ['type' => gettype($value)];
+        $keys = [];
+        foreach (array_slice($value, 0, 40, true) as $key => $child) {
+            $name = (string)$key;
+            if (preg_match('/^[A-Za-z0-9_.-]{1,80}$/', $name) !== 1) continue;
+            $keys[$name] = $this->shapeOf($child, $depth + 1);
+        }
+        return ['type' => array_is_list($value) ? 'array' : 'object', 'keys' => $keys];
+    }
+
+    /** Remove credential-like fields from arbitrary JSON returned by an app. */
+    private function redactApiPayload(mixed $value, int $depth = 0): mixed {
+        if ($depth > 8) return '[redacted depth]';
+        if (!is_array($value)) return $value;
+        $out = [];
+        foreach ($value as $key => $child) {
+            $name = strtolower((string)$key);
+            if (preg_match('/(?:pass(word)?|token|secret|api[_-]?key|authorization|cookie|private[_-]?key)/i', $name) === 1) {
+                $out[$key] = '[redacted]';
+            } else {
+                $out[$key] = $this->redactApiPayload($child, $depth + 1);
+            }
+        }
+        return $out;
+    }
+
+    /** Match a concrete request path against a Nextcloud route template. */
+    private function matchesDiscoveredRoute(string $template, string $path): bool {
+        $quoted = preg_quote(rtrim($template, '/'), '#');
+        $quoted = preg_replace('/\\\\\{[^}]+\\\\\}/', '[^/]+', $quoted) ?? $quoted;
+        $pattern = '#^' . $quoted . '/?$#';
+        return preg_match($pattern, $path) === 1;
+    }
+
+    private function briefingRows(): array {
+        $rows = json_decode($this->config->get('proactive_schedules'), true);
+        return is_array($rows) ? array_values(array_filter($rows, 'is_array')) : [];
+    }
+
+    private function validBriefingFields(string $prompt, string $time, array $days): ?string {
+        if ($prompt === '' || mb_strlen($prompt) > 2000) return 'prompt must contain 1-2000 characters.';
+        if (preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $time) !== 1) return 'time must use HH:MM format.';
+        $days = array_values(array_unique(array_map('intval', $days)));
+        if ($days === [] || count($days) > 7 || array_diff($days, [1, 2, 3, 4, 5, 6, 7]) !== []) return 'days must contain weekdays 1-7.';
+        return null;
+    }
+
+    private function listScheduledBriefings(): array {
+        $rows = $this->briefingRows();
+        return ['ok' => true, 'result' => ['briefings' => array_map(static function (array $row): array {
+            return ['id' => (string)($row['id'] ?? ''), 'prompt' => (string)($row['prompt'] ?? ''), 'time' => (string)($row['time'] ?? ''), 'days' => array_values(array_map('intval', is_array($row['days'] ?? null) ? $row['days'] : [])), 'enabled' => ($row['enabled'] ?? true) === true, 'allow_actions' => ($row['allow_actions'] ?? false) === true];
+        }, $rows)]];
+    }
+
+    private function persistBriefings(array $rows): void {
+        $this->config->set('proactive_schedules', json_encode(array_values($rows), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '[]');
+    }
+
+    private function createScheduledBriefing(array $args): array {
+        $prompt = trim((string)($args['prompt'] ?? ''));
+        $time = trim((string)($args['time'] ?? ''));
+        $days = is_array($args['days'] ?? null) ? array_values(array_unique(array_map('intval', $args['days']))) : [];
+        $error = $this->validBriefingFields($prompt, $time, $days);
+        if ($error !== null) return ['ok' => false, 'error' => $error];
+        $rows = $this->briefingRows();
+        if (count($rows) >= 20) return ['ok' => false, 'error' => 'At most 20 scheduled briefings are allowed.'];
+        $id = 'briefing-' . bin2hex(random_bytes(5));
+        $row = ['id' => $id, 'prompt' => $prompt, 'time' => $time, 'days' => $days, 'enabled' => true, 'allow_actions' => ($args['allow_actions'] ?? false) === true];
+        $rows[] = $row; $this->persistBriefings($rows);
+        return ['ok' => true, 'result' => ['briefing' => $row]];
+    }
+
+    private function updateScheduledBriefing(array $args): array {
+        $id = preg_replace('/[^a-zA-Z0-9_-]/', '', (string)($args['briefing_id'] ?? '')) ?? '';
+        if ($id === '') return ['ok' => false, 'error' => 'briefing_id is required.'];
+        $rows = $this->briefingRows(); $found = false; $updated = null;
+        foreach ($rows as &$row) {
+            if ((string)($row['id'] ?? '') !== $id) continue;
+            $prompt = array_key_exists('prompt', $args) ? trim((string)$args['prompt']) : (string)($row['prompt'] ?? '');
+            $time = array_key_exists('time', $args) ? trim((string)$args['time']) : (string)($row['time'] ?? '');
+            $days = array_key_exists('days', $args) && is_array($args['days']) ? array_values(array_unique(array_map('intval', $args['days']))) : (array)$row['days'];
+            $error = $this->validBriefingFields($prompt, $time, $days);
+            if ($error !== null) return ['ok' => false, 'error' => $error];
+            $row['prompt'] = $prompt; $row['time'] = $time; $row['days'] = $days;
+            if (array_key_exists('enabled', $args)) $row['enabled'] = $args['enabled'] === true;
+            if (array_key_exists('allow_actions', $args)) $row['allow_actions'] = $args['allow_actions'] === true;
+            $updated = $row; $found = true; break;
+        }
+        unset($row);
+        if (!$found) return ['ok' => false, 'error' => 'Scheduled briefing not found.'];
+        $this->persistBriefings($rows);
+        return ['ok' => true, 'result' => ['briefing' => $updated]];
+    }
+
+    private function deleteScheduledBriefing(array $args): array {
+        $id = preg_replace('/[^a-zA-Z0-9_-]/', '', (string)($args['briefing_id'] ?? '')) ?? '';
+        if ($id === '') return ['ok' => false, 'error' => 'briefing_id is required.'];
+        $rows = $this->briefingRows(); $filtered = array_values(array_filter($rows, static fn(array $row): bool => (string)($row['id'] ?? '') !== $id));
+        if (count($filtered) === count($rows)) return ['ok' => false, 'error' => 'Scheduled briefing not found.'];
+        $this->persistBriefings($filtered);
+        return ['ok' => true, 'result' => ['briefing_id' => $id, 'deleted' => true]];
+    }
+
+    /** @return array<array{name:string,path:string,type:string,size?:int}> */
+    private function listFiles(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        $folder = $this->folderAt($home, $path);
+        $rootLen = strlen($folder->getPath()) + 1;
+        $out = [];
+        $count = 0;
+        $this->walk($folder, $out, 0, $count, $rootLen);
+        $this->rememberFileLocations($out);
+        return ['ok' => true, 'result' => $out];
+    }
+
+    private function walk(Folder $folder, array &$out, int $depth, int &$count, int $rootLen): void {
+        if ($depth >= self::MAX_LIST_DEPTH || $count >= self::MAX_LIST_ENTRIES) {
+            return;
+        }
+        foreach ($folder->getDirectoryListing() as $node) {
+            if ($count >= self::MAX_LIST_ENTRIES) {
+                return;
+            }
+            $count++;
+            $rel = substr($node->getPath(), $rootLen);
+            if ($node instanceof File) {
+                $out[] = ['name' => $node->getName(), 'path' => $rel, 'type' => 'file', 'file_id' => (int)$node->getId(), 'size' => $node->getSize()];
+            } elseif ($node instanceof Folder) {
+                $out[] = ['name' => $node->getName(), 'path' => $rel, 'type' => 'folder', 'file_id' => (int)$node->getId()];
+                if ($depth + 1 < self::MAX_LIST_DEPTH) {
+                    $this->walk($node, $out, $depth + 1, $count, $rootLen);
+                }
+            }
+        }
+    }
+
+    /** @return array{ok:true,result:string} */
+    private function createFile(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        $binary = array_key_exists('content_base64', $args);
+        if ($binary) {
+            $decoded = base64_decode((string)$args['content_base64'], true);
+            if ($decoded === false || $decoded === '') return ['ok' => false, 'error' => 'content_base64 must be non-empty valid base64'];
+            $content = $decoded;
+        } else {
+            $content = (string)($args['content'] ?? '');
+        }
+        if ($path === '' || str_ends_with($path, '/')) {
+            return ['ok' => false, 'error' => 'A valid file path is required'];
+        }
+        if ($content === '') {
+            return ['ok' => false, 'error' => 'File content must not be empty'];
+        }
+        $maxChars = (int)$this->config->get('exec_write_max_chars') ?: 100000;
+        if (($binary ? strlen($content) : mb_strlen($content)) > $maxChars) {
+            return ['ok' => false, 'error' => 'File content exceeds ' . $maxChars . ' characters'];
+        }
+        if (!$binary && strpos($content, "\0") !== false) {
+            return ['ok' => false, 'error' => 'Only text files can be created'];
+        }
+        [, $name] = $this->splitPath($path);
+        $typeError = $this->checkWriteType($name);
+        if ($typeError !== null) {
+            return ['ok' => false, 'error' => $typeError];
+        }
+        if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'docx') {
+            try { $content = $this->buildDocx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'DOCX generation is unavailable on this server: ' . $e->getMessage()]; }
+        }
+        if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'xlsx') {
+            try { $content = $this->buildXlsx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'XLSX generation is unavailable on this server: ' . $e->getMessage()]; }
+        }
+        [$dir, $name] = $this->splitPath($path);
+        $folder = $this->ensureFolderPath($home, $dir);
+        if ($folder->nodeExists($name)) {
+            $existing = $folder->get($name);
+            if ($existing instanceof File) {
+                $existing->putContent($content);
+                $this->bumpSearchRevision();
+                return ['ok' => true, 'result' => 'Updated ' . $path] + $this->fileLinks($home, $existing);
+            }
+            return ['ok' => false, 'error' => 'A folder with that name already exists at ' . $path];
+        }
+        // The ownership marker is recorded BEFORE the file is created and
+        // finalized with the resulting node afterwards, so an interruption
+        // between the two leaves a pending record that reconciliation resolves
+        // instead of a missing grant (Issue #183).
+        $this->markOwnedPending($home, $path, function () use ($folder, $name, $content): void {
+            $folder->newFile($name, $content);
+        });
+        $this->bumpSearchRevision();
+        try {
+            $created = $folder->get($name);
+        } catch (\Throwable $e) {
+            return ['ok' => true, 'result' => 'Created ' . $path];
+        }
+        return ['ok' => true, 'result' => 'Created ' . $path] + $this->fileLinks($home, $created);
+    }
+
+    /**
+     * Direct links to a written file, returned NEXT TO the unchanged `result`
+     * string (key `file`), so every existing consumer keeps receiving the same
+     * "Created <path>" text — in particular the confirmation dialog, which
+     * would otherwise label a `result.url` as "Share created". `url` opens the
+     * file in Nextcloud (/index.php/f/<id>), `download_url` downloads it
+     * (WebDAV, served as an attachment). Both need a logged-in session with
+     * access to the file: no public share is created, no permission changes.
+     * Building the links never makes the write fail: any error returns [].
+     *
+     * @return array{file?: array{name:string,path:string,file_id:int,url:string,download_url:string}}
+     */
+    private function fileLinks(Folder $home, \OCP\Files\Node $node): array {
+        try {
+            $relative = ltrim((string)$home->getRelativePath($node->getPath()), '/');
+            $owner = explode('/', trim($home->getPath(), '/'))[0] ?? '';
+            if ($relative === '' || $owner === '') {
+                return [];
+            }
+            $urls = Server::get(\OCP\IURLGenerator::class);
+            $davPath = implode('/', array_map('rawurlencode', explode('/', $relative)));
+            return ['file' => [
+                'name' => $node->getName(),
+                'path' => $relative,
+                'file_id' => $node->getId(),
+                // getAbsoluteURL() with a path WITHOUT the web root: correct both in a web
+                // request and in CLI (linkToRouteAbsolute() doubles a sub-path web root such
+                // as /workspace in CLI). /index.php/f/<id> works with or without pretty URLs.
+                'url' => $urls->getAbsoluteURL('/index.php/f/' . $node->getId()),
+                'download_url' => $urls->getAbsoluteURL('/remote.php/dav/files/' . rawurlencode($owner) . '/' . $davPath),
+            ]];
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /** Build a minimal standards-compliant Word document without external services. */
+    private function buildDocx(string $text): string {
+        if (!class_exists(\ZipArchive::class)) throw new \RuntimeException('PHP ZipArchive extension is required');
+        $zip = new \ZipArchive(); $tmp = tempnam(sys_get_temp_dir(), 'eva_docx_');
+        if ($tmp === false || $zip->open($tmp, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) throw new \RuntimeException('could not create archive');
+        $esc = static fn(string $v): string => htmlspecialchars($v, ENT_XML1 | ENT_COMPAT, 'UTF-8');
+        $lines = preg_split("/\\R/u", $text) ?: [];
+        $paras = ''; foreach ($lines as $line) $paras .= '<w:p><w:r><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
+        $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+        $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>');
+        $zip->addFromString('word/document.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' . $paras . '<w:sectPr/></w:body></w:document>');
+        $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
+    }
+
+    /** Build a minimal Excel workbook from comma/tab separated text. */
+    private function buildXlsx(string $text): string {
+        if (!class_exists(\ZipArchive::class)) throw new \RuntimeException('PHP ZipArchive extension is required');
+        $zip = new \ZipArchive(); $tmp = tempnam(sys_get_temp_dir(), 'eva_xlsx_');
+        if ($tmp === false || $zip->open($tmp, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) throw new \RuntimeException('could not create archive');
+        $esc = static fn(string $v): string => htmlspecialchars($v, ENT_XML1 | ENT_COMPAT, 'UTF-8');
+        $rows = preg_split('/\R/u', trim($text)) ?: []; $sheet = ''; $r = 0;
+        foreach ($rows as $line) { $r++; $cells = str_contains($line, "\t") ? explode("\t", $line) : str_getcsv($line); $c = 0; $sheet .= '<row r="' . $r . '">'; foreach ($cells as $value) { $c++; $col = ''; $n = $c; while ($n > 0) { $n--; $col = chr(65 + ($n % 26)) . $col; $n = intdiv($n, 26); } $sheet .= '<c r="' . $col . $r . '" t="inlineStr"><is><t>' . $esc((string)$value) . '</t></is></c>'; } $sheet .= '</row>'; }
+        $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');
+        $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
+        $zip->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="EVA" sheetId="1" r:id="rId1"/></sheets></workbook>');
+        $zip->addFromString('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
+        $zip->addFromString('xl/worksheets/sheet1.xml', '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' . $sheet . '</sheetData></worksheet>');
+        $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
+    }
+
+    /** Create several files while preserving per-file validation/results. */
+    private function createFiles(Folder $home, array $args): array {
+        $files = $args['files'] ?? null;
+        if (!is_array($files) || $files === [] || count($files) > 20) return ['ok' => false, 'error' => 'files must contain between 1 and 20 entries'];
+        $results = []; $allOk = true;
+        foreach ($files as $entry) {
+            if (!is_array($entry)) { $results[] = ['ok' => false, 'error' => 'Each entry must contain path and content']; $allOk = false; continue; }
+            $payload = ['path' => $entry['path'] ?? ''];
+            if (array_key_exists('content_base64', $entry)) $payload['content_base64'] = $entry['content_base64']; else $payload['content'] = $entry['content'] ?? '';
+            $result = $this->createFile($home, $payload);
+            $results[] = $result; if (empty($result['ok'])) $allOk = false;
+        }
+        return ['ok' => $allOk, 'result' => ['files' => $results, 'created' => count(array_filter($results, static fn(array $r): bool => !empty($r['ok']))), 'failed' => count(array_filter($results, static fn(array $r): bool => empty($r['ok'])))]];
+    }
+
+    /** Prüft die konfigurierte Dateityp-Einschränkung; liefert Fehlertext oder null. */
+    private function checkWriteType(string $name): ?string {
+        $allowed = strtolower(trim((string)$this->config->get('exec_write_types')));
+        if ($allowed === '' || $allowed === '*') {
+            return null;
+        }
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        $list = array_map('trim', explode(',', $allowed));
+        if (in_array($ext, $list, true)) {
+            return null;
+        }
+        return 'File type .' . ($ext !== '' ? $ext : '?') . ' is not allowed (allowed: ' . $allowed . ')';
+    }
+
+    /** @return array{ok:true,result:string} */
+    private function createNote(Folder $home, array $args): array {
+        $title = trim((string)($args['title'] ?? ''));
+        $content = (string)($args['content'] ?? '');
+        if ($title === '') {
+            return ['ok' => false, 'error' => 'A note title is required'];
+        }
+        if (!str_ends_with(strtolower($title), '.md')) {
+            $title .= '.md';
+        }
+        $title = $this->cleanName($title);
+        return $this->createFile($home, ['path' => self::NOTES_FOLDER . '/' . $title, 'content' => $content]);
+    }
+
+    /** @return array{ok:true,result:string} */
+    private function createFolder(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        if ($path === '') {
+            return ['ok' => false, 'error' => 'Folder path required'];
+        }
+        $existed = $home->nodeExists($path);
+        if (!$existed) {
+            // Pending marker before the folder is created, finalize afterwards
+            // (Issue #183) — same crash-safe semantics as file creation.
+            $this->markOwnedPending($home, $path, function () use ($home, $path): void {
+                $this->ensureFolderPath($home, $path);
+            });
+        } else {
+            $this->ensureFolderPath($home, $path);
+        }
+        $this->bumpSearchRevision();
+        return ['ok' => true, 'result' => 'Created folder ' . $path];
+    }
+
+    /** @return array{ok:true,result:string} */
+    private function renameFile(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        $newName = trim((string)($args['new_name'] ?? ''));
+        if ($path === '' || $newName === '' || str_contains($newName, '/') || $newName === '.' || $newName === '..') {
+            return ['ok' => false, 'error' => 'Valid path and new_name are required'];
+        }
+        $node = $this->resolve($home, $path);
+        $parent = $node->getParent();
+        if ($parent->nodeExists($newName)) {
+            return ['ok' => false, 'error' => 'Target name already exists'];
+        }
+        $node->move($parent->getPath() . '/' . $newName);
+        $this->bumpSearchRevision();
+        return ['ok' => true, 'result' => 'Renamed to ' . $newName];
+    }
+
+    /** Move a file or folder to a new relative path, creating destination folders. */
+    private function moveFile(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        $targetPath = $this->cleanPath((string)($args['target_path'] ?? ''));
+        if ($path === '' || $targetPath === '' || $path === $targetPath || $targetPath === '/') {
+            return ['ok' => false, 'error' => 'Valid, different path and target_path are required'];
+        }
+        $node = $this->resolve($home, $path);
+        if ($node instanceof Folder && str_starts_with($targetPath . '/', $path . '/')) {
+            return ['ok' => false, 'error' => 'A folder cannot be moved into itself'];
+        }
+        [$targetDir, $targetName] = $this->splitPath($targetPath);
+        $targetName = $this->cleanName($targetName);
+        if ($targetName === '') {
+            return ['ok' => false, 'error' => 'A valid target name is required'];
+        }
+        $destination = $this->ensureFolderPath($home, $targetDir);
+        if ($destination->nodeExists($targetName)) {
+            return ['ok' => false, 'error' => 'Target already exists'];
+        }
+        $node->move($destination->getPath() . '/' . $targetName);
+        $this->bumpSearchRevision();
+        return ['ok' => true, 'result' => 'Moved ' . $path . ' to ' . $targetPath];
+    }
+
+    /** Copy a file or folder to a new relative path, creating destination folders. */
+    private function copyFile(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        $targetPath = $this->cleanPath((string)($args['target_path'] ?? ''));
+        if ($path === '' || $targetPath === '' || $path === $targetPath || $targetPath === '/') {
+            return ['ok' => false, 'error' => 'Valid, different path and target_path are required'];
+        }
+        $node = $this->resolve($home, $path);
+        if ($node instanceof Folder && str_starts_with($targetPath . '/', $path . '/')) {
+            return ['ok' => false, 'error' => 'A folder cannot be copied into itself'];
+        }
+        [$targetDir, $targetName] = $this->splitPath($targetPath);
+        $targetName = $this->cleanName($targetName);
+        if ($targetName === '') return ['ok' => false, 'error' => 'A valid target name is required'];
+        $destination = $this->ensureFolderPath($home, $targetDir);
+        if ($destination->nodeExists($targetName)) return ['ok' => false, 'error' => 'Target already exists'];
+        $node->copy($destination->getPath() . '/' . $targetName);
+        $this->bumpSearchRevision();
+        return ['ok' => true, 'result' => 'Copied ' . $path . ' to ' . $targetPath];
+    }
+
+    /** Return a bounded checksum for post-operation integrity validation. */
+    private function fileChecksum(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        if ($path === '') return ['ok' => false, 'error' => 'File path required'];
+        $node = $this->resolve($home, $path);
+        if (!$node instanceof File) return ['ok' => false, 'error' => 'Not a file'];
+        if ($node->getSize() > self::MAX_READ_FILE_BYTES) return ['ok' => false, 'error' => 'File too large to checksum'];
+        try {
+            $content = (string)$node->getContent();
+            return ['ok' => true, 'result' => ['path' => $path, 'algorithm' => 'sha256', 'checksum' => hash('sha256', $content), 'size' => (int)$node->getSize(), 'modified' => (int)$node->getMTime()]];
+        } catch (\Throwable) {
+            return ['ok' => false, 'error' => 'File checksum could not be calculated'];
+        }
+    }
+
+    /** @return array{ok:true,result:string}|array{ok:false,error:string} */
+    private function deleteFile(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        if ($path === '' || $path === '/') {
+            return ['ok' => false, 'error' => 'A valid path is required'];
+        }
+        $mode = (string)$this->config->get('exec_delete_mode');
+        if ($mode === 'off') {
+            return ['ok' => false, 'error' => 'Deleting files is disabled in the app settings.'];
+        }
+        $node = $this->resolve($home, $path);
+        if ($mode !== 'all' && !$this->isOwned($home, $node)) {
+            return ['ok' => false, 'error' => 'Only files EVA created itself may be deleted (adjust "delete permission" in the app settings to allow more).'];
+        }
+        if ($node instanceof Folder && $node->getDirectoryListing() !== []) {
+            return ['ok' => false, 'error' => 'Folder is not empty'];
+        }
+        $fileId = (int)$node->getId();
+        $node->delete();
+        $this->unmarkOwned($home, $fileId);
+        $this->bumpSearchRevision();
+        return ['ok' => true, 'result' => 'Deleted ' . ($node instanceof Folder ? 'folder ' : 'file ') . $path];
+    }
+
+    /** @return array{ok:true,result:array} */
+    private function readFile(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        if ($path === '') {
+            return ['ok' => false, 'error' => 'File path required'];
+        }
+        $node = $this->resolve($home, $path);
+        if (!$node instanceof File) {
+            return ['ok' => false, 'error' => 'Not a file'];
+        }
+        if ($node->getSize() > self::MAX_READ_FILE_BYTES) {
+            return ['ok' => false, 'error' => 'File too large to read'];
+        }
+        $content = (string)$node->getContent();
+        if (strpos($content, "\0") !== false) {
+            return ['ok' => false, 'error' => 'File is not text'];
+        }
+        $offset = filter_var($args['offset'] ?? 0, FILTER_VALIDATE_INT);
+        $maxChars = filter_var($args['max_chars'] ?? self::MAX_READ_CHARS, FILTER_VALIDATE_INT);
+        if ($offset === false || $offset < 0) {
+            return ['ok' => false, 'error' => 'offset must be a non-negative integer'];
+        }
+        if ($maxChars === false || $maxChars < 1 || $maxChars > self::MAX_READ_CHUNK_CHARS) {
+            return ['ok' => false, 'error' => 'max_chars must be between 1 and ' . self::MAX_READ_CHUNK_CHARS];
+        }
+        $totalChars = mb_strlen($content);
+        if ($offset > $totalChars) {
+            return ['ok' => false, 'error' => 'offset is beyond the end of the file'];
+        }
+        $page = mb_substr($content, $offset, $maxChars);
+        $nextOffset = $offset + mb_strlen($page);
+        return ['ok' => true, 'result' => [
+            'path' => $path,
+            'content' => $page,
+            'offset' => $offset,
+            'next_offset' => $nextOffset,
+            'total_chars' => $totalChars,
+            'has_more' => $nextOffset < $totalChars,
+        ]];
+    }
+
+    /** Read several files while preserving per-file pagination and errors. */
+    private function readFiles(Folder $home, array $args): array {
+        $files = $args['files'] ?? null;
+        if (!is_array($files) || $files === [] || count($files) > 20) return ['ok' => false, 'error' => 'files must contain between 1 and 20 entries'];
+        $results = []; $allOk = true;
+        foreach ($files as $entry) {
+            if (!is_array($entry) || trim((string)($entry['path'] ?? '')) === '') { $results[] = ['ok' => false, 'error' => 'Each entry must contain a path']; $allOk = false; continue; }
+            $result = $this->readFile($home, $entry); $results[] = $result; if (empty($result['ok'])) $allOk = false;
+        }
+        return ['ok' => $allOk, 'result' => ['files' => $results, 'read' => count(array_filter($results, static fn(array $r): bool => !empty($r['ok']))), 'failed' => count(array_filter($results, static fn(array $r): bool => empty($r['ok'])))]];
+    }
+
+    /** Extract indexed text from binary/Office formats in bounded pages. */
+    private function extractFileText(Folder $home, array $args): array {
+        if ($this->indexer === null) return ['ok' => false, 'error' => 'Document extraction is unavailable'];
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        if ($path === '') return ['ok' => false, 'error' => 'File path required'];
+        $node = $this->resolve($home, $path);
+        if (!$node instanceof File) return ['ok' => false, 'error' => 'Not a file'];
+        if ($node->getSize() > self::MAX_READ_FILE_BYTES) return ['ok' => false, 'error' => 'File too large to extract'];
+        $maxChars = filter_var($args['max_chars'] ?? self::MAX_READ_CHARS, FILTER_VALIDATE_INT);
+        $offset = filter_var($args['offset'] ?? 0, FILTER_VALIDATE_INT);
+        if ($maxChars === false || $maxChars < 1 || $maxChars > self::MAX_READ_CHUNK_CHARS || $offset === false || $offset < 0) {
+            return ['ok' => false, 'error' => 'offset/max_chars are outside the allowed range'];
+        }
+        try { $content = $this->indexer->extractTextForAgent($node, 100000); }
+        catch (\Throwable $e) { return ['ok' => false, 'error' => 'Document extraction failed: ' . $e->getMessage()]; }
+        $total = mb_strlen($content);
+        if ($offset > $total) return ['ok' => false, 'error' => 'offset is beyond extracted text'];
+        $page = mb_substr($content, $offset, $maxChars); $next = $offset + mb_strlen($page);
+        return ['ok' => true, 'result' => ['path' => $path, 'content' => $page, 'offset' => $offset, 'next_offset' => $next, 'total_chars' => $total, 'has_more' => $next < $total, 'mime_type' => (string)$node->getMimeType()]];
+    }
+
+    private function inspectFile(Folder $home, array $args): array {
+        $path = $this->cleanPath((string)($args['path'] ?? ''));
+        if ($path === '') return ['ok' => false, 'error' => 'File path required'];
+        $node = $this->resolve($home, $path);
+        return ['ok' => true, 'result' => [
+            'path' => $path,
+            'type' => $node instanceof Folder ? 'folder' : 'file',
+            'size' => $node instanceof File ? (int)$node->getSize() : null,
+            'mime_type' => $node instanceof File ? (string)$node->getMimeType() : null,
+            'modified' => (int)$node->getMTime(),
+        ]];
+    }
+
+    /** @return array{ok:true,result:array} */
+    private function searchFiles(Folder $home, array $args): array {
+        $query = trim((string)($args['query'] ?? ''));
+        if ($query === '') {
+            return ['ok' => false, 'error' => 'Search query required'];
+        }
+        $scopePath = $this->cleanPath((string)($args['path'] ?? ''));
+        $scope = $this->folderAt($home, $scopePath);
+        $extension = strtolower(ltrim(trim((string)($args['extension'] ?? '')), '.'));
+        $forceRefresh = filter_var($args['force_refresh'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        $maxDepth = filter_var($args['max_depth'] ?? self::MAX_SEARCH_DEPTH, FILTER_VALIDATE_INT);
+        $maxNodes = filter_var($args['max_nodes'] ?? self::MAX_SEARCH_NODES, FILTER_VALIDATE_INT);
+        $maxResults = filter_var($args['max_results'] ?? self::MAX_SEARCH_RESULTS, FILTER_VALIDATE_INT);
+        $maxDepth = $maxDepth === false ? self::MAX_SEARCH_DEPTH : max(1, min(self::MAX_SEARCH_DEPTH_CONFIG, $maxDepth));
+        $maxNodes = $maxNodes === false ? self::MAX_SEARCH_NODES : max(100, min(self::MAX_SEARCH_NODES_CONFIG, $maxNodes));
+        $maxResults = $maxResults === false ? self::MAX_SEARCH_RESULTS : max(1, min(self::MAX_SEARCH_RESULTS_CONFIG, $maxResults));
+        if ($extension !== '' && !preg_match('/^[a-z0-9]{1,12}$/', $extension)) {
+            return ['ok' => false, 'error' => 'extension must contain only letters and digits'];
+        }
+        $cache = null;
+        $userKey = '';
+        try { $userKey = (string)($this->config->userId() ?? ''); } catch (\Throwable) { }
+        $revision = 0;
+        try { $revision = max(0, (int)$this->config->get('search_revision')); } catch (\Throwable) { }
+        $cacheKey = 'search_' . substr(hash('sha256', $userKey . "\0" . $revision . "\0" . $query . "\0" . $scopePath . "\0" . $extension . "\0" . $maxDepth . "\0" . $maxNodes . "\0" . $maxResults), 0, 40);
+        try {
+            $cache = Server::get(\OCP\ICacheFactory::class)->createDistributed('eva_ai_search_');
+            $cached = $forceRefresh ? null : $cache->get($cacheKey);
+            if (is_string($cached) && $cached !== '') {
+                $decoded = json_decode($cached, true);
+                if (is_array($decoded) && isset($decoded['result']) && is_array($decoded['result'])) {
+                    $this->rememberFileLocations($decoded['result']['matches'] ?? []);
+                    return ['ok' => true, 'result' => $decoded['result']];
+                }
+            }
+        } catch (\Throwable) { $cache = null; }
+        $matches = [];
+        $visited = 0;
+        $truncated = false;
+        $extracted = 0;
+        $this->searchWalk($scope, mb_strtolower($query), $matches, $visited, $truncated, $extracted, 0, $scopePath, $extension, $maxDepth, $maxNodes, $maxResults);
+        $this->rememberFileLocations($matches);
+        $result = [
+            'query' => $query,
+            'path' => $scopePath,
+            'extension' => $extension !== '' ? $extension : null,
+            'cache_bypassed' => $forceRefresh,
+            'matches' => $matches,
+            'truncated' => $truncated,
+            'visited_nodes' => $visited,
+            'extracted_documents' => $extracted,
+            'limits' => [
+                'max_results' => $maxResults,
+                'max_nodes' => $maxNodes,
+                'max_depth' => $maxDepth,
+                'requested_max_results' => $maxResults,
+                'max_text_file_bytes' => self::MAX_SEARCH_FILE_BYTES,
+                'max_document_bytes' => self::MAX_SEARCH_DOCUMENT_BYTES,
+                'max_extracted_documents' => self::MAX_SEARCH_EXTRACT_FILES,
+            ],
+        ];
+        if ($cache !== null) {
+            try { $cache->set($cacheKey, json_encode(['result' => $result], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}', self::SEARCH_CACHE_TTL); } catch (\Throwable) { }
+        }
+        return ['ok' => true, 'result' => $result];
+    }
+
+    /** Store only paths/types and timestamps; never file contents. */
+    private function rememberFileLocations(array $rows): void {
+        try {
+            $known = json_decode($this->config->get('learned_file_locations'), true);
+            $known = is_array($known) ? $known : [];
+            $now = time();
+            foreach ($rows as $row) {
+                if (!is_array($row)) continue;
+                $path = trim((string)($row['path'] ?? ''));
+                if ($path === '' || mb_strlen($path) > 1000 || str_contains($path, '..')) continue;
+                $known[$path] = ['type' => (string)($row['type'] ?? 'file'), 'last_seen' => $now];
+            }
+            uasort($known, static fn(array $a, array $b): int => ((int)($b['last_seen'] ?? 0)) <=> ((int)($a['last_seen'] ?? 0)));
+            $this->config->set('learned_file_locations', json_encode(array_slice($known, 0, 500, true), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}');
+        } catch (\Throwable) { /* learning is best effort */ }
+    }
+
+    /** Advance the per-user search revision after a successful VFS mutation. */
+    private function bumpSearchRevision(): void {
+        try {
+            $current = max(0, (int)$this->config->get('search_revision'));
+            $this->config->set('search_revision', (string)(($current + 1) % 2147483647));
+        } catch (\Throwable) { /* cache invalidation is best effort */ }
+    }
+
+    private function listLearnedFileLocations(): array {
+        try {
+            $known = json_decode($this->config->get('learned_file_locations'), true);
+            return ['ok' => true, 'result' => ['locations' => is_array($known) ? array_slice($known, 0, 200, true) : [], 'note' => 'Only paths and types are stored; refresh with list_files or search_files when a location may have changed.']];
+        } catch (\Throwable) { return ['ok' => true, 'result' => ['locations' => []]]; }
+    }
+
+    /**
+     * Search names and bounded text content while protecting the request from
+     * an unbounded VFS walk or unexpectedly large/binary files.
+     *
+     * @param array<int,array<string,mixed>> $matches
+     */
+    private function searchWalk(Folder $folder, string $query, array &$matches, int &$visited, bool &$truncated, int &$extracted, int $depth, string $prefix, string $extension = '', int $maxDepth = self::MAX_SEARCH_DEPTH, int $maxNodes = self::MAX_SEARCH_NODES, int $maxResults = self::MAX_SEARCH_RESULTS): void {
+        if ($depth >= $maxDepth || count($matches) >= $maxResults) {
+            $truncated = true;
+            return;
+        }
+        try {
+            $entries = $folder->getDirectoryListing();
+        } catch (\Throwable) {
+            // A single unavailable remote folder must not discard matches
+            // already collected from other branches. Report a bounded,
+            // inspectable partial result instead.
+            $truncated = true;
+            return;
+        }
+        foreach ($entries as $node) {
+            if (count($matches) >= $maxResults || $visited >= $maxNodes) {
+                $truncated = true;
+                return;
+            }
+            $visited++;
+            $rel = $prefix === '' ? $node->getName() : $prefix . '/' . $node->getName();
+            $nameMatches = str_contains(mb_strtolower($node->getName()), $query);
+            if ($node instanceof Folder) {
+                if ($nameMatches) {
+                    $matches[] = ['path' => $rel, 'reason' => 'filename', 'file_id' => (int)$node->getId()];
+                }
+                $this->searchWalk($node, $query, $matches, $visited, $truncated, $extracted, $depth + 1, $rel, $extension, $maxDepth, $maxNodes, $maxResults);
+                continue;
+            }
+
+            if ($extension !== '' && strtolower(pathinfo($node->getName(), PATHINFO_EXTENSION)) !== $extension) {
+                continue;
+            }
+
+            $contentMatch = $this->searchFileContent($node, $query, $extracted);
+
+            if ($nameMatches && $contentMatch !== null) {
+                $matches[] = ['path' => $rel, 'reason' => 'filename and content', 'file_id' => (int)$node->getId(), 'snippet' => $contentMatch];
+            } elseif ($nameMatches) {
+                $matches[] = ['path' => $rel, 'reason' => 'filename', 'file_id' => (int)$node->getId()];
+            } elseif ($contentMatch !== null) {
+                $matches[] = ['path' => $rel, 'reason' => 'content', 'file_id' => (int)$node->getId(), 'snippet' => $contentMatch];
+            }
+        }
+    }
+
+    /**
+     * Search a file that is not necessarily indexed yet. Text files are read
+     * directly; common PDFs/Office/OpenDocument formats go through the same
+     * bounded extractor used by the agent. Extraction is deliberately capped
+     * per search so a query cannot trigger an implicit crawl or re-index.
+     */
+    private function searchFileContent(File $file, string $query, int &$extracted): ?string {
+        try {
+            if ($this->isSearchableTextFile($file)) {
+                $content = (string)$file->getContent();
+            } elseif (($content = $this->readLikelyPlainText($file)) !== null) {
+                // Some WebDAV uploads have an unknown extension and only the
+                // generic octet-stream MIME. Sniff a bounded prefix before
+                // accepting the file, so arbitrary binary data is not read as
+                // searchable text.
+                // The helper returns the already-read bounded content so the
+                // file is not fetched twice (important for remote storage).
+            } elseif ($this->isSearchableDocument($file)
+                && $this->indexer !== null
+                && $extracted < self::MAX_SEARCH_EXTRACT_FILES
+                && $file->getSize() <= self::MAX_SEARCH_DOCUMENT_BYTES) {
+                $extracted++;
+                $content = $this->indexer->extractTextForAgent($file, 100000);
+            } else {
+                return null;
+            }
+            if (strpos($content, "\0") !== false) {
+                return null;
+            }
+            $position = mb_stripos($content, $query);
+            return $position === false
+                ? null
+                : $this->searchSnippet($content, $position, mb_strlen($query));
+        } catch (\Throwable) {
+            // A single unreadable or malformed document must not abort search.
+            return null;
+        }
+    }
+
+    private function isSearchableDocument(File $file): bool {
+        if ($file->getSize() > self::MAX_SEARCH_DOCUMENT_BYTES) {
+            return false;
+        }
+        $mime = strtolower((string)$file->getMimeType());
+        if (in_array($mime, [
+            'application/pdf',
+            'application/rtf',
+            'application/epub+zip',
+            'application/msword',
+            'application/vnd.ms-word',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'application/vnd.oasis.opendocument.text',
+            'application/vnd.oasis.opendocument.spreadsheet',
+            'application/vnd.oasis.opendocument.presentation',
+            'application/vnd.apple.pages',
+        ], true)) {
+            return true;
+        }
+        $extension = strtolower(pathinfo($file->getName(), PATHINFO_EXTENSION));
+        return in_array($extension, ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'epub', 'rtf'], true);
+    }
+
+    private function isSearchableTextFile(File $file): bool {
+        if ($file->getSize() > self::MAX_SEARCH_FILE_BYTES) {
+            return false;
+        }
+        $mime = strtolower((string)$file->getMimeType());
+        if (str_starts_with($mime, 'text/')) {
+            return true;
+        }
+        if (in_array($mime, [
+            'application/json', 'application/ld+json', 'application/xml',
+            'application/x-yaml', 'application/yaml', 'application/rtf',
+            'application/sql', 'application/x-sh', 'application/x-httpd-php',
+        ], true)) {
+            return true;
+        }
+        // Nextcloud may report an uploaded text document as
+        // application/octet-stream when its MIME map is incomplete. The
+        // extension fallback keeps direct, non-indexed search useful without
+        // reading arbitrary binary files: only well-known text extensions are
+        // eligible and the existing byte/NUL guards still apply.
+        $extension = strtolower(pathinfo($file->getName(), PATHINFO_EXTENSION));
+        return in_array($extension, [
+            'txt', 'md', 'markdown', 'csv', 'tsv', 'log', 'json', 'jsonl',
+            'xml', 'yaml', 'yml', 'html', 'htm', 'xhtml', 'ini', 'cfg',
+            'conf', 'properties', 'sql', 'js', 'mjs', 'cjs', 'ts', 'tsx',
+            'jsx', 'css', 'scss', 'less', 'vue', 'py', 'rb', 'php', 'sh',
+            'bash', 'zsh', 'fish', 'go', 'rs', 'java', 'kt', 'swift', 'r',
+            'tex', 'rst', 'adoc', 'org', 'toml', 'env', 'srt', 'vtt',
+        ], true);
+    }
+
+    private function isLikelyPlainTextFile(File $file): bool {
+        return $this->readLikelyPlainText($file) !== null;
+    }
+
+    /**
+     * Read an unknown octet-stream once and return it only when its bounded
+     * prefix looks like UTF-8 text. Remote-storage reads can be expensive, so
+     * callers should use the returned content instead of probing then reading
+     * the file a second time.
+     */
+    private function readLikelyPlainText(File $file): ?string {
+        if ($file->getSize() <= 0 || $file->getSize() > self::MAX_SEARCH_FILE_BYTES) {
+            return null;
+        }
+        $mime = strtolower((string)$file->getMimeType());
+        if (!in_array($mime, ['', 'application/octet-stream', 'binary/octet-stream'], true)) {
+            return null;
+        }
+        $sample = (string)$file->getContent();
+        if ($sample === '' || !mb_check_encoding(mb_substr($sample, 0, 65536), 'UTF-8')) {
+            return null;
+        }
+        if (strpos($sample, "\0") !== false) {
+            return null;
+        }
+        $prefix = mb_substr($sample, 0, 65536);
+        $controls = preg_match_all('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $prefix);
+        return ($controls === false || $controls <= max(2, (int)floor(mb_strlen($prefix) * 0.01))) ? $sample : null;
+    }
+
+    private function searchSnippet(string $content, int $position, int $queryLength): string {
+        $start = max(0, $position - 120);
+        $snippet = mb_substr($content, $start, $queryLength + 240);
+        $snippet = preg_replace('/\s+/u', ' ', trim($snippet)) ?? trim($snippet);
+        if ($start > 0) {
+            $snippet = '…' . $snippet;
+        }
+        if ($start + mb_strlen($snippet) < mb_strlen($content)) {
+            $snippet .= '…';
+        }
+        return mb_substr($snippet, 0, 300);
+    }
+
+    /** @return array{ok:true,result:array} */
+    /** @return array{ok:true,result:array{contacts:list<array>,count:int}} */
+    private function listContacts(string $userId): array {
+        $out = [];
+        $seen = [];
+        $backend = Server::get(\OCA\DAV\CardDAV\CardDavBackend::class);
+        foreach ($this->allAddressBookPrincipals($userId) as $principal) {
+            // Die System-/System-Adressbuecher enthalten nur Selbst-Kontakte
+            // aller Nutzer und gehoeren nicht zu den Kontakten des Users.
+            if ($principal === 'principals/system/system') {
+                continue;
+            }
+            foreach ($backend->getAddressBooksForUser($principal) as $book) {
+                foreach ($backend->getCards((int)$book['id']) as $card) {
+                    $entry = $this->extractContact((string)($card['carddata'] ?? ''));
+                    if ($entry === null) {
+                        continue;
+                    }
+                    $dedup = strtolower(($entry['name'] ?? '') . '|' . implode(',', $entry['emails'] ?? []));
+                    if ($dedup !== '' && isset($seen[$dedup])) {
+                        continue;
+                    }
+                    $seen[$dedup] = true;
+                    $out[] = $entry;
+                    if (count($out) >= 100) {
+                        break 3;
+                    }
+                }
+            }
+        }
+        return ['ok' => true, 'result' => ['contacts' => $out, 'count' => count($out)]];
+    }
+
+    private function findContact(string $userId, array $args): array {
+        $query = trim((string)($args['query'] ?? ''));
+        if ($query === '') {
+            // Ohne Suchbegriff: alle Kontakte auflisten (Frage "Welche Kontakte habe ich?").
+            return $this->listContacts($userId);
+        }
+        $results = $this->contacts->search($query, ['FN', 'NICKNAME', 'EMAIL', 'ORG']);
+        $out = [];
+        foreach (array_slice($results, 0, 8) as $c) {
+            $out[] = [
+                'name' => $c['FN'] ?? $c['NICKNAME'] ?? '',
+                'emails' => array_values(array_map('strval', (array)($c['EMAIL'] ?? []))),
+                'phones' => array_values(array_map('strval', (array)($c['TEL'] ?? []))),
+                'org' => $c['ORG'] ?? '',
+            ];
+        }
+        if ($out === []) {
+            $found = $this->findContactCard($userId, $query);
+            if ($found !== null) {
+                $vc = \Sabre\VObject\Reader::read($found['carddata']);
+                $entry = [];
+                foreach (['FN' => 'name', 'EMAIL' => 'emails', 'TEL' => 'phones', 'ORG' => 'org'] as $propName => $key) {
+                    $vals = [];
+                    foreach ($vc->select($propName) as $prop) {
+                        $val = trim((string)$prop);
+                        if ($val !== '') {
+                            $vals[] = $val;
+                        }
+                    }
+                    $entry[$key] = ($propName === 'FN') ? (string)($vals[0] ?? '') : $vals;
+                }
+                $out[] = $entry;
+            }
+        }
+        return ['ok' => true, 'result' => ['query' => $query, 'contacts' => $out]];
+
+    }
+
+    /**
+     * Extrahiert Name/E-Mail/Telefon/Organisation aus einer vCard.
+     * Liefert null bei leerer oder unparsbarer Karte.
+     */
+    private function extractContact(string $carddata): ?array {
+        if ($carddata === '') {
+            return null;
+        }
+        try {
+            $v = \Sabre\VObject\Reader::read($carddata);
+        } catch (\Throwable $e) {
+            return null;
+        }
+        $entry = [];
+        foreach (['FN' => 'name', 'EMAIL' => 'emails', 'TEL' => 'phones', 'ORG' => 'org'] as $propName => $key) {
+            $vals = [];
+            foreach ($v->select($propName) as $prop) {
+                $val = trim((string)$prop);
+                if ($val !== '') {
+                    $vals[] = $val;
+                }
+            }
+            $entry[$key] = ($propName === 'FN') ? (string)($vals[0] ?? '') : $vals;
+        }
+        if (($entry['name'] ?? '') === '' && ($entry['emails'] ?? []) === [] && ($entry['phones'] ?? []) === []) {
+            return null;
+        }
+        return $entry;
+    }
+
+    /** @return array{ok:true,result:string} */
+    private function createContact(string $userId, array $args): array {
+        $name = trim((string)($args['name'] ?? ''));
+        if ($name === '') {
+            return ['ok' => false, 'error' => 'Contact name required'];
+        }
+        $email = trim((string)($args['email'] ?? ''));
+        $phone = trim((string)($args['phone'] ?? ''));
+        $org = trim((string)($args['org'] ?? ''));
+
+        $uid = 'ai-' . date('YmdHis') . '-' . bin2hex(random_bytes(4));
+        $vcard = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:" . $uid . "\r\nFN:" . $name . "\r\nN:" . $name . ";;;;\r\n";
+        if ($email !== '') {
+            $vcard .= "EMAIL;TYPE=HOME:" . $email . "\r\n";
+        }
+        if ($phone !== '') {
+            $vcard .= "TEL;TYPE=CELL:" . $phone . "\r\n";
+        }
+        if ($org !== '') {
+            $vcard .= "ORG:" . $org . "\r\n";
+        }
+        $vcard .= "END:VCARD\r\n";
+
+        try {
+            $backend = Server::get(\OCA\DAV\CardDAV\CardDavBackend::class);
+            $books = $backend->getAddressBooksForUser('principals/users/' . $userId);
+            if ($books === []) {
+                return ['ok' => false, 'error' => 'No address book found for user'];
+            }
+            $backend->createCard((int)$books[0]['id'], $uid . '.vcf', $vcard);
+            return ['ok' => true, 'result' => 'Created contact "' . $name . '"'];
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Address book write failed: ' . $e->getMessage()];
+        }
+    }
+
+    /** @return array{ok:true,result:string}|array{ok:false,error:string} */
+    private function updateKnowledge(Folder $home, array $args): array {
+        $fact = trim((string)($args['fact'] ?? ''));
+        if ($fact === '') {
+            return ['ok' => false, 'error' => 'A fact is required'];
+        }
+        if (mb_strlen($fact) > 500) {
+            return ['ok' => false, 'error' => 'Fact too long (max 500 characters)'];
+        }
+        $path = 'KNOWLEDGE.md';
+        $line = '- ' . date('Y-m-d') . ': ' . $fact;
+        $content = '';
+        if ($home->nodeExists($path) && $home->get($path) instanceof File) {
+            $content = (string)$home->get($path)->getContent();
+        } elseif ($home->nodeExists($path)) {
+            return ['ok' => false, 'error' => 'KNOWLEDGE.md exists but is not a file'];
+        }
+        $content = rtrim($content) . "
+" . $line . "
+";
+        $trimmed = false;
+        if (mb_strlen($content) > self::KNOWLEDGE_MAX_CHARS) {
+            [$content, $trimmed] = $this->trimKnowledge($content);
+        }
+        if ($home->nodeExists($path)) {
+            $home->get($path)->putContent($content);
+        } else {
+            $home->newFile($path, $content);
+        }
+        if ($trimmed) {
+            try {
+                \OC::$server->get(\Psr\Log\LoggerInterface::class)->warning('eva_ai: knowledge file trimmed; automatic profile section preserved', [
+                    'file' => $path,
+                ]);
+            } catch (\Throwable $e) {
+                // Logging must not make a successful knowledge update fail.
+            }
+        }
+        $result = 'Knowledge updated: ' . $line;
+        if ($trimmed) {
+            $result .= ' Older non-profile entries were trimmed to keep KNOWLEDGE.md bounded; the automatic profile section was preserved.';
+        }
+        return ['ok' => true, 'result' => $result];
+    }
+
+    /**
+     * Remove the oldest non-profile lines while retaining the automatic
+     * identity block. The block is recognized by its marker (or heading for
+     * files created before the marker was introduced).
+     *
+     * @return array{0:string,1:bool}
+     */
+    private function trimKnowledge(string $content): array {
+        $lines = explode("\n", $content);
+        $protected = array_fill(0, count($lines), false);
+        $inProfile = false;
+        foreach ($lines as $i => $line) {
+            $trimmed = trim($line);
+            if ($trimmed === self::KNOWLEDGE_PROFILE_MARKER || $trimmed === '## About me (from my Nextcloud profile)') {
+                $inProfile = true;
+            }
+            if ($inProfile) {
+                $protected[$i] = true;
+            }
+            if ($inProfile && str_starts_with($trimmed, '- Imported automatically on ')) {
+                $inProfile = false;
+            }
+        }
+
+        $removed = array_fill(0, count($lines), false);
+        $length = mb_strlen($content);
+        foreach ($lines as $i => $line) {
+            if ($length <= self::KNOWLEDGE_TARGET_CHARS) {
+                break;
+            }
+            if ($protected[$i]) {
+                continue;
+            }
+            $removed[$i] = true;
+            $length -= mb_strlen($line) + ($i < count($lines) - 1 ? 1 : 0);
+        }
+
+        $kept = [];
+        foreach ($lines as $i => $line) {
+            if (!$removed[$i]) {
+                $kept[] = $line;
+            }
+        }
+        $updated = implode("\n", $kept);
+        return [$updated, $updated !== $content];
+    }
+
+    /** @return array{ok:true,result:array}|array{ok:false,error:string} */
+    private function readProfile(string $userId): array {
+        $userObj = $this->userManager->get($userId);
+        if ($userObj === null) {
+            return ['ok' => false, 'error' => 'User not found'];
+        }
+        try {
+            $account = $this->accounts->getAccount($userObj);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Profile unavailable: ' . $e->getMessage()];
+        }
+        $fields = [
+            'display_name' => IAccountManager::PROPERTY_DISPLAYNAME,
+            'email' => IAccountManager::PROPERTY_EMAIL,
+            'phone' => IAccountManager::PROPERTY_PHONE,
+            'website' => IAccountManager::PROPERTY_WEBSITE,
+            'address' => IAccountManager::PROPERTY_ADDRESS,
+            'organisation' => IAccountManager::PROPERTY_ORGANISATION,
+            'role' => IAccountManager::PROPERTY_ROLE,
+            'headline' => IAccountManager::PROPERTY_HEADLINE,
+            'biography' => IAccountManager::PROPERTY_BIOGRAPHY,
+            'pronouns' => IAccountManager::PROPERTY_PRONOUNS,
+        ];
+        $profile = [];
+        foreach ($fields as $label => $prop) {
+            $value = $account->getProperty($prop)->getValue();
+            if ($value !== '' && $value !== null) {
+                $profile[$label] = $value;
+            }
+        }
+        return ['ok' => true, 'result' => ['profile' => $profile]];
+    }
+
+    /** @return array{ok:true,result:string}|array{ok:false,error:string} */
+    private function updateProfile(string $userId, array $args): array {
+        $userObj = $this->userManager->get($userId);
+        if ($userObj === null) {
+            return ['ok' => false, 'error' => 'User not found'];
+        }
+        try {
+            $account = $this->accounts->getAccount($userObj);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Profile unavailable: ' . $e->getMessage()];
+        }
+        $map = [
+            'display_name' => [IAccountManager::PROPERTY_DISPLAYNAME, IAccountManager::VERIFIED],
+            'email' => [IAccountManager::PROPERTY_EMAIL, IAccountManager::NOT_VERIFIED],
+            'phone' => [IAccountManager::PROPERTY_PHONE, IAccountManager::NOT_VERIFIED],
+            'website' => [IAccountManager::PROPERTY_WEBSITE, IAccountManager::NOT_VERIFIED],
+            'address' => [IAccountManager::PROPERTY_ADDRESS, IAccountManager::NOT_VERIFIED],
+            'organisation' => [IAccountManager::PROPERTY_ORGANISATION, IAccountManager::NOT_VERIFIED],
+            'role' => [IAccountManager::PROPERTY_ROLE, IAccountManager::NOT_VERIFIED],
+            'headline' => [IAccountManager::PROPERTY_HEADLINE, IAccountManager::NOT_VERIFIED],
+            'biography' => [IAccountManager::PROPERTY_BIOGRAPHY, IAccountManager::NOT_VERIFIED],
+            'pronouns' => [IAccountManager::PROPERTY_PRONOUNS, IAccountManager::NOT_VERIFIED],
+        ];
+        $changed = [];
+        foreach ($map as $key => [$prop, $verified]) {
+            if (!array_key_exists($key, $args) || !is_string($args[$key])) {
+                continue;
+            }
+            $account->setProperty($prop, trim($args[$key]), IAccountManager::SCOPE_LOCAL, $verified);
+            $changed[] = $key;
+        }
+        if ($changed === []) {
+            return ['ok' => false, 'error' => 'No profile fields to update'];
+        }
+        try {
+            $this->accounts->updateAccount($account);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Profile update failed: ' . $e->getMessage()];
+        }
+        return ['ok' => true, 'result' => 'Updated profile fields: ' . implode(', ', $changed)];
+    }
+
+    /** @return array{bookId:int,uri:string,carddata:string,principaluri:string}|null */
+    private function findContactCard(string $userId, string $query): ?array {
+        $backend = Server::get(\OCA\DAV\CardDAV\CardDavBackend::class);
+        foreach ($this->allAddressBookPrincipals($userId) as $principal) {
+            foreach ($backend->getAddressBooksForUser($principal) as $book) {
+            foreach ($backend->getCards((int)$book['id']) as $card) {
+                $carddata = (string)($card['carddata'] ?? '');
+                if ($carddata === '') {
+                    continue;
+                }
+                try {
+                    $v = \Sabre\VObject\Reader::read($carddata);
+                } catch (\Throwable $e) {
+                    continue;
+                }
+                $hayParts = [];
+                foreach (['FN', 'EMAIL', 'TEL', 'ORG'] as $propName) {
+                    foreach ($v->select($propName) as $prop) {
+                        $val = trim((string)$prop);
+                        if ($val !== '') {
+                            $hayParts[] = $val;
+                        }
+                    }
+                }
+                $hay = strtolower(implode(' ', $hayParts));
+                if (str_contains($hay, strtolower($query))) {
+                    return [
+                        'bookId' => (int)$book['id'],
+                        'uri' => (string)($card['uri'] ?? ''),
+                        'carddata' => $carddata,
+                        'principaluri' => (string)($book['principaluri'] ?? ''),
+                    ];
+                }
+            }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether the current user may mutate a given address book.
+     * Only the user's own personal address books are writable; shared,
+     * group/circle and system books must never be modified through the raw
+     * DAV backend without an explicit write grant (Issue #11).
+     * @param array{bookId:int,principaluri?:string} $found
+     */
+    private function addressBookWritable(string $userId, array $found): bool {
+        $principal = (string)($found['principaluri'] ?? '');
+        if ($principal === 'principals/users/' . $userId) {
+            return true;
+        }
+        // Shared books are only writable with an explicit write grant.
+        try {
+            $backend = Server::get(\OCA\DAV\CardDAV\CardDavBackend::class);
+            foreach ($backend->getShares((int)$found['bookId']) as $share) {
+                $href = (string)($share['href'] ?? '');
+                if ($href === 'principal:principals/users/' . $userId) {
+                    return empty($share['readOnly']);
+                }
+            }
+        } catch (\Throwable $e) {
+            // fall through: unknown -> not writable
+        }
+        return false;
+    }
+
+    /**
+     * Alle Adressbuch-Prinzipalen, auf die der Nutzer Zugriff hat:
+     * eigene, geteilte (ueber Shares im eigenen Principal), Gruppen-Adressbuecher,
+     * Circles/Teams sowie das System-Adressbuch.
+     * @return list<string>
+     */
+    private function allAddressBookPrincipals(string $userId): array {
+        $principals = ['principals/users/' . $userId];
+        $user = Server::get(\OCP\IUserManager::class)->get($userId);
+        if ($user !== null) {
+            foreach (Server::get(\OCP\IGroupManager::class)->getUserGroupIds($user) as $gid) {
+                $principals[] = 'principals/groups/' . $gid;
+            }
+        }
+        if (Server::get(\OCP\App\IAppManager::class)->isEnabledForUser('circles')) {
+            $principals[] = 'principals/circles/' . $userId;
+        }
+        $principals[] = 'principals/system/system';
+        return array_values(array_unique($principals));
+    }
+
+    /** @return array{ok:true,result:string}|array{ok:false,error:string} */
+    private function updateContact(string $userId, array $args): array {
+        $query = trim((string)($args['query'] ?? ''));
+        if ($query === '') {
+            return ['ok' => false, 'error' => 'Contact query required'];
+        }
+        $found = $this->findContactCard($userId, $query);
+        if ($found === null) {
+            return ['ok' => false, 'error' => 'Contact not found'];
+        }
+        if (!$this->addressBookWritable($userId, $found)) {
+            return ['ok' => false, 'error' => 'Contact lives in a read-only address book (shared or system). Only your own address books can be modified.'];
+        }
+        try {
+            $backend = Server::get(\OCA\DAV\CardDAV\CardDavBackend::class);
+            $vc = \Sabre\VObject\Reader::read($found['carddata']);
+            foreach (['FN' => 'name', 'EMAIL' => 'email', 'TEL' => 'phone', 'ORG' => 'org'] as $prop => $key) {
+                if (!array_key_exists($key, $args) || !is_string($args[$key])) {
+                    continue;
+                }
+                $value = trim($args[$key]);
+                $vc->remove($prop);
+                if ($value !== '') {
+                    $vc->add($prop, $value);
+                }
+            }
+            $backend->updateCard($found['bookId'], $found['uri'], $vc->serialize());
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Contact update failed: ' . $e->getMessage()];
+        }
+        return ['ok' => true, 'result' => 'Updated contact "' . $query . '"'];
+    }
+
+    /** @return array{ok:true,result:string}|array{ok:false,error:string} */
+    private function deleteContact(string $userId, array $args): array {
+        $query = trim((string)($args['query'] ?? ''));
+        if ($query === '') {
+            return ['ok' => false, 'error' => 'Contact query required'];
+        }
+        $found = $this->findContactCard($userId, $query);
+        if ($found === null) {
+            return ['ok' => false, 'error' => 'Contact not found'];
+        }
+        if (!$this->addressBookWritable($userId, $found)) {
+            return ['ok' => false, 'error' => 'Contact lives in a read-only address book (shared or system). Only your own address books can be modified.'];
+        }
+        try {
+            $backend = Server::get(\OCA\DAV\CardDAV\CardDavBackend::class);
+            $backend->deleteCard($found['bookId'], $found['uri']);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Contact delete failed: ' . $e->getMessage()];
+        }
+        return ['ok' => true, 'result' => 'Deleted contact'];
+    }
+
+    // ---- Marker für "von der KI erstellt" ----
+
+    private function marksFile(string $userId): \OCP\Files\SimpleFS\ISimpleFile {
+        // IAppDataFactory wird lazy geholt statt per Konstruktor injiziert:
+        // die Aufloesung blockiert im CLI/taskprocessing-Worker.
+        $appdata = \OC::$server->get(\OCP\Files\AppData\IAppDataFactory::class)->get('eva_ai');
+        try {
+            $dir = $appdata->getFolder('ai-marks');
+        } catch (\OCP\Files\NotFoundException $e) {
+            $dir = $appdata->newFolder('ai-marks');
+        }
+        // Collision-free per-user namespace (SHA-256 of the exact user ID).
+        // Legacy lossy-slug folders are migrated lazily so existing markers
+        // are preserved (Issue #8).
+        $ns = substr(hash('sha256', $userId), 0, 40);
+        try {
+            $uid = $dir->getFolder($ns);
+        } catch (\OCP\Files\NotFoundException $e) {
+            $legacy = preg_replace('/[^a-zA-Z0-9_-]/', '_', $userId) ?: 'user';
+            try {
+                $legacyFolder = $dir->getFolder($legacy);
+                $uid = $dir->newFolder($ns);
+                if ($legacyFolder->fileExists('created.json')) {
+                    $uid->newFile('created.json', $legacyFolder->getFile('created.json')->getContent());
+                }
+                $legacyFolder->delete();
+            } catch (\OCP\Files\NotFoundException $e2) {
+                $uid = $dir->newFolder($ns);
+            }
+        }
+        if (!$uid->fileExists('created.json')) {
+            $uid->newFile('created.json', '[]');
+        }
+        return $uid->getFile('created.json');
+    }
+
+    private function userNameOf(Folder $home): string {
+        $owner = $home->getOwner();
+        if ($owner !== null && $owner->getUID() !== '') {
+            return $owner->getUID();
+        }
+        $parts = explode('/', trim($home->getPath(), '/'));
+        return $parts[0] ?? '';
+    }
+
+    private function ownershipStore(Folder $home): FileOwnershipStore {
+        $userId = $this->userNameOf($home);
+        if ($userId === '') {
+            throw new \RuntimeException('No ownership namespace');
+        }
+        return new FileOwnershipStore($this->marksFile($userId), $home, $this->lockingProvider, $userId);
+    }
+
+    /**
+     * Run a filesystem-creating action between a pending ownership marker and
+     * its finalize (Issue #183):
+     * - beginPending runs before the action, so a crash leaves a truthful
+     *   pending record instead of a missing grant;
+     * - a failed action cancels the record;
+     * - a finalize failure keeps the pending record, which reconciliation
+     *   resolves on the next ownership check.
+     */
+    private function markOwnedPending(Folder $home, string $path, callable $action): void {
+        $store = $this->ownershipStore($home);
+        $token = $store->beginPending($path);
+        try {
+            $action();
+            try {
+                $store->finalizePending($token, $home->get($path));
+            } catch (\Throwable $e) {
+                // The file exists and the pending record survives; the next
+                // ownership check reconciles it into a grant.
+            }
+        } catch (\Throwable $e) {
+            try {
+                $store->cancelPending($token);
+            } catch (\Throwable $ignored) {
+                // Never mask the original action failure.
+            }
+            throw $e;
+        }
+    }
+
+    private function unmarkOwned(Folder $home, int $fileId): void {
+        try {
+            $this->ownershipStore($home)->forget($fileId);
+        } catch (\Throwable $e) {
+            // Stale IDs never authorize a replacement file and are pruned on next access.
+        }
+    }
+
+    private function isOwned(Folder $home, \OCP\Files\Node $node): bool {
+        try {
+            return $this->ownershipStore($home)->contains($node);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    // ---- Helfer ----
+
+    private function cleanName(string $name): string {
+        $name = str_replace(['/', '\\', '..', "\0"], '-', $name);
+        return trim($name, " \t.-");
+    }
+
+    /** Entfernt .., führende Slashes und leere Segmente; darf nicht aus dem Home raus. */
+    private function cleanPath(string $path): string {
+        $parts = [];
+        foreach (explode('/', $path) as $seg) {
+            if ($seg === '' || $seg === '.') {
+                continue;
+            }
+            if ($seg === '..') {
+                array_pop($parts);
+                continue;
+            }
+            $parts[] = $seg;
+        }
+        return implode('/', $parts);
+    }
+
+    /** @return array{0:string,1:string} */
+    private function splitPath(string $path): array {
+        $pos = strrpos($path, '/');
+        if ($pos === false) {
+            return ['', $path];
+        }
+        return [substr($path, 0, $pos), substr($path, $pos + 1)];
+    }
+
+    private function folderAt(Folder $home, string $path): Folder {
+        if ($path === '') {
+            return $home;
+        }
+        $node = $home->get($path);
+        if (!$node instanceof Folder) {
+            throw new NotPermittedException('Not a folder');
+        }
+        return $node;
+    }
+
+    private function ensureFolderPath(Folder $home, string $path): Folder {
+        if ($path === '') {
+            return $home;
+        }
+        $current = $home;
+        foreach (explode('/', $path) as $seg) {
+            if ($seg === '') {
+                continue;
+            }
+            if (!$current->nodeExists($seg)) {
+                $current->newFolder($seg);
+            }
+            $node = $current->get($seg);
+            if (!$node instanceof Folder) {
+                throw new NotPermittedException('Path component is not a folder: ' . $seg);
+            }
+            $current = $node;
+        }
+        return $current;
+    }
+
+    private function resolve(Folder $home, string $path): \OCP\Files\Node {
+        if ($path === '') {
+            return $home;
+        }
+        return $home->get($path);
+    }
+
+    private function currentTime(string $userId): array {
+        $tz = 'Europe/Berlin';
+        try {
+            $tz = \OCP\Server::get(\OCP\IConfig::class)->getUserValue($userId, 'core', 'timezone', 'Europe/Berlin');
+        } catch (\Throwable $e) {
+        }
+        $now = new \DateTimeImmutable('now', new \DateTimeZone($tz));
+        $names = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
+        return [
+            'ok' => true,
+            'result' => [
+                'datetime' => $now->format('Y-m-d H:i:s'),
+                'date' => $now->format('Y-m-d'),
+                'time' => $now->format('H:i'),
+                'weekday' => $names[(int)$now->format('w')],
+                'iso8601' => $now->format('c'),
+                'timezone' => $tz,
+                'unix' => $now->getTimestamp(),
+            ],
+        ];
+    }
+
+    private function serverStatus(string $userId): array {
+        $version = implode('.', \OCP\Util::getVersion());
+        $quota = null;
+        try {
+            $home = $this->rootFolder->getUserFolder($userId);
+            $quota = ['free_bytes' => $home->getFreeSpace(), 'used_bytes' => (int)$home->getSize()];
+        } catch (\Throwable $e) {
+        }
+        $dbName = '';
+        try {
+            $dbName = \OC::$server->get(\OC\SystemConfig::class)->getValue('dbtype', 'sqlite');
+        } catch (\Throwable $e) {
+        }
+        return ['ok' => true, 'result' => [
+            'user' => $userId,
+            'nextcloud' => $version,
+            'php' => PHP_VERSION,
+            'database' => $dbName,
+            'ollama_url' => $this->config->get('ollama_url'),
+            'chat_model' => $this->config->get('chat_model'),
+            'embedding_model' => $this->config->get('embedding_model'),
+            'quota' => $quota,
+            'mail_index_enabled' => $this->config->get('mail_index_enabled') === '1',
+        ]];
+    }
+
+    private function runSafeCommand(array $args): array {
+        if ($this->config->get('safe_commands_enabled') !== '1') return ['ok' => false, 'error' => 'Safe local commands are disabled in EVA settings.'];
+        $name = trim((string)($args['command'] ?? ''));
+        $commands = [
+            'date' => ['date'], 'uptime' => ['uptime'], 'php_version' => ['php', '-v'],
+            'node_version' => ['node', '--version'], 'disk_free' => ['df', '-h'],
+            'memory_free' => ['free', '-h'], 'eva_git_status' => ['git', '-C', __DIR__ . '/../../', 'status', '--short'],
+        ];
+        if (!isset($commands[$name])) return ['ok' => false, 'error' => 'Command is not on the safe diagnostic allowlist.'];
+        $pipes = [];
+        $process = proc_open($commands[$name], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, __DIR__ . '/../../');
+        if (!is_resource($process)) return ['ok' => false, 'error' => 'Could not start the diagnostic command.'];
+        stream_set_blocking($pipes[1], false); stream_set_blocking($pipes[2], false);
+        $stdout = ''; $stderr = ''; $deadline = microtime(true) + 5; $timedOut = false; $observedExitCode = null;
+        while (true) {
+            $stdout .= (string)stream_get_contents($pipes[1]);
+            $stderr .= (string)stream_get_contents($pipes[2]);
+            $status = proc_get_status($process);
+            if (!$status['running']) { $observedExitCode = is_int($status['exitcode']) ? $status['exitcode'] : null; break; }
+            if (microtime(true) >= $deadline) { $timedOut = true; proc_terminate($process, 9); break; }
+            usleep(20000);
+        }
+        $stdout .= (string)stream_get_contents($pipes[1]); $stderr .= (string)stream_get_contents($pipes[2]);
+        fclose($pipes[1]); fclose($pipes[2]);
+        $closedExitCode = proc_close($process);
+        $exit = ($observedExitCode !== null && $closedExitCode < 0) ? $observedExitCode : $closedExitCode;
+        return ['ok' => !$timedOut && $exit === 0, 'result' => ['command' => $name, 'output' => mb_substr(trim($stdout), 0, 10000), 'error_output' => mb_substr(trim($stderr), 0, 2000), 'exit_code' => $timedOut ? null : $exit, 'timed_out' => $timedOut]];
+    }
+
+    /**
+     * Execute a user-requested command without invoking a shell. This is an
+     * intentionally separate, opt-in tool: unlike runSafeCommand it accepts
+     * arguments, but only for executable names configured in the user's
+     * allowlist and only after the normal explicit-confirmation gate.
+     */
+    private function runTerminalCommand(array $args): array {
+        if ($this->config->get('terminal_commands_enabled') !== '1') {
+            return ['ok' => false, 'error' => 'Confirmed terminal commands are disabled in EVA settings.'];
+        }
+        $command = trim((string)($args['command'] ?? ''));
+        if ($command === '' || mb_strlen($command) > 1000 || preg_match('/[\x00-\x1F\x7F;&|<>`$()\r\n]/', $command)) {
+            return ['ok' => false, 'error' => 'Command is empty, too long, or contains shell syntax/control characters.'];
+        }
+        $stdin = (string)($args['stdin'] ?? '');
+        if (mb_strlen($stdin) > 4000 || str_contains($stdin, "\0")) {
+            return ['ok' => false, 'error' => 'stdin is limited to 4000 characters and cannot contain NUL bytes.'];
+        }
+        if (preg_match_all('/"(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|[^\s]+/u', $command, $parts) === false || $parts[0] === []) {
+            return ['ok' => false, 'error' => 'Command arguments could not be parsed safely.'];
+        }
+        $argv = [];
+        foreach ($parts[0] as $part) {
+            $first = $part[0] ?? '';
+            $last = substr($part, -1);
+            if (($first === '"' && $last === '"') || ($first === "'" && $last === "'")) {
+                $part = substr($part, 1, -1);
+                $part = str_replace(['\\"', '\\\\'], ['"', '\\'], $part);
+            } elseif (str_contains($part, '"') || str_contains($part, "'")) {
+                return ['ok' => false, 'error' => 'Quotes must wrap a complete argument.'];
+            }
+            if ($part === '' || mb_strlen($part) > 400) {
+                return ['ok' => false, 'error' => 'Command arguments are outside the allowed bounds.'];
+            }
+            $argv[] = $part;
+        }
+        $executable = (string)($argv[0] ?? '');
+        $allowlist = array_values(array_filter(array_map('trim', explode(',', (string)$this->config->get('terminal_command_allowlist'))), static fn(string $item): bool => $item !== ''));
+        $allowed = $this->config->get('terminal_command_any') === '1';
+        if (!$allowed) {
+            foreach ($allowlist as $entry) {
+                // A configured absolute path is an exact capability grant. Do not
+                // let `/tmp/date` inherit permission merely because `date` is on
+                // the allowlist; for bare names, matching an absolute configured
+                // entry remains convenient and still resolves through PATH.
+                $allowed = str_contains($executable, '/')
+                    ? $executable === $entry
+                    : ($executable === $entry || basename($entry) === $executable);
+                if ($allowed) {
+                    break;
+                }
+            }
+        }
+        if (!$allowed) {
+            return ['ok' => false, 'error' => 'The executable is not in the configured terminal allowlist.'];
+        }
+        $timeout = filter_var($args['timeout_seconds'] ?? 10, FILTER_VALIDATE_INT);
+        $timeout = $timeout === false ? 10 : max(1, min(30, $timeout));
+        $pipes = [];
+        $process = proc_open($argv, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, __DIR__ . '/../../');
+        if (!is_resource($process)) {
+            return ['ok' => false, 'error' => 'Could not start the terminal command.'];
+        }
+        if ($stdin !== '') {
+            fwrite($pipes[0], $stdin);
+        }
+        // Always close stdin after the bounded payload. Programs that expect
+        // more input receive EOF instead of hanging until the timeout.
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+        $stdout = '';
+        $stderr = '';
+        $deadline = microtime(true) + $timeout;
+        $timedOut = false;
+        $observedExitCode = null;
+        while (true) {
+            $stdout .= (string)stream_get_contents($pipes[1]);
+            $stderr .= (string)stream_get_contents($pipes[2]);
+            $status = proc_get_status($process);
+            if (!$status['running']) {
+                $observedExitCode = is_int($status['exitcode']) ? $status['exitcode'] : null;
+                break;
+            }
+            if (microtime(true) >= $deadline) {
+                $timedOut = true;
+                proc_terminate($process, 9);
+                break;
+            }
+            usleep(20000);
+        }
+        $stdout .= (string)stream_get_contents($pipes[1]);
+        $stderr .= (string)stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $closedExitCode = proc_close($process);
+        // PHP can return -1 from proc_close after proc_get_status has already
+        // reaped a short-lived child. Prefer the observed exit code in that
+        // case so successful custom commands are not reported as failures.
+        $exit = ($observedExitCode !== null && $closedExitCode < 0) ? $observedExitCode : $closedExitCode;
+        return [
+            'ok' => !$timedOut && $exit === 0,
+            'result' => [
+                'command' => $command,
+                'output' => mb_substr(trim($stdout), 0, 20000),
+                'error_output' => mb_substr(trim($stderr), 0, 4000),
+                'exit_code' => $timedOut ? null : $exit,
+                'timed_out' => $timedOut,
+            ],
+        ];
+    }
+
+    /** Execute a short, explicitly confirmed diagnostic workflow without a shell. */
+    private function runTerminalSequence(array $args): array {
+        $commands = $args['commands'] ?? null;
+        if (!is_array($commands) || $commands === [] || count($commands) > 5) {
+            return ['ok' => false, 'error' => 'commands must contain between 1 and 5 entries'];
+        }
+        $inputs = $args['stdin'] ?? [];
+        if (!is_array($inputs) || count($inputs) > count($commands)) {
+            return ['ok' => false, 'error' => 'stdin must contain at most one string per command'];
+        }
+        foreach ($inputs as $input) {
+            if (!is_string($input) || mb_strlen($input) > 4000 || str_contains($input, "\0")) {
+                return ['ok' => false, 'error' => 'Each stdin value is limited to 4000 characters and cannot contain NUL bytes.'];
+            }
+        }
+        $timeout = filter_var($args['timeout_seconds'] ?? 10, FILTER_VALIDATE_INT);
+        $timeout = $timeout === false ? 10 : max(1, min(30, $timeout));
+        $results = [];
+        foreach ($commands as $index => $command) {
+            if (!is_string($command) || trim($command) === '') {
+                return ['ok' => false, 'error' => 'Every terminal sequence entry must be a non-empty command string'];
+            }
+            $result = $this->runTerminalCommand(['command' => $command, 'stdin' => (string)($inputs[$index] ?? ''), 'timeout_seconds' => $timeout]);
+            $results[] = ['index' => (int)$index, 'command' => mb_substr($command, 0, 1000), 'ok' => !empty($result['ok']), 'result' => $result['result'] ?? null, 'error' => $result['error'] ?? null];
+            if (empty($result['ok'])) {
+                return ['ok' => false, 'error' => 'Terminal sequence stopped after command ' . ((int)$index + 1) . '.', 'result' => ['completed' => count($results) - 1, 'results' => $results]];
+            }
+        }
+        return ['ok' => true, 'result' => ['completed' => count($results), 'results' => $results]];
+    }
+
+    /** @return array{ok:true,result:array}|array{ok:false,error:string} */
+    private function searchMails(string $userId, array $args): array {
+        try {
+            $res = $this->email->search($userId, (string)($args['query'] ?? ''), max(1, (int)($args['limit'] ?? 10)));
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Mail access failed: ' . $e->getMessage()];
+        }
+        return ['ok' => true, 'result' => ['mails' => $res]];
+    }
+
+    /** @return array{ok:true,result:array}|array{ok:false,error:string} */
+    private function listMails(string $userId, array $args): array {
+        try {
+            $res = $this->email->listMessages($userId, max(1, (int)($args['limit'] ?? 15)), !empty($args['unread_only']));
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Mail access failed: ' . $e->getMessage()];
+        }
+        return ['ok' => true, 'result' => ['mails' => $res]];
+    }
+
+    /** @return array{ok:true,result:array}|array{ok:false,error:string} */
+    private function readMail(string $userId, array $args): array {
+        try {
+            return $this->email->readMessage($userId, (int)($args['message_id'] ?? 0));
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Mail access failed: ' . $e->getMessage()];
+        }
+    }
+
+    /** @return array{ok:true,result:array}|array{ok:false,error:string} */
+    private function unreadMailCount(string $userId): array {
+        try {
+            $n = $this->email->unreadCount($userId);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Mail access failed: ' . $e->getMessage()];
+        }
+        return ['ok' => true, 'result' => ['unread' => $n]];
+    }
+
+    /** @return array{ok:true,result:array}|array{ok:false,error:string} */
+    private function summarizeEmails(string $userId, array $args): array {
+        if ($this->ollama === null) {
+            return ['ok' => false, 'error' => 'Email summarization requires a configured chat provider.'];
+        }
+        $limit = max(1, min(20, (int)($args['limit'] ?? 8)));
+        $query = trim((string)($args['query'] ?? ''));
+        try {
+            $rows = $query !== ''
+                ? $this->email->search($userId, $query, $limit)
+                : $this->email->listMessages($userId, $limit, !empty($args['unread_only']));
+            if ($rows === []) {
+                return ['ok' => true, 'result' => ['count' => 0, 'summary' => 'No matching emails found.', 'messages' => []]];
+            }
+            $documents = [];
+            $metadata = [];
+            foreach (array_slice($rows, 0, $limit) as $row) {
+                $id = (int)($row['id'] ?? 0);
+                $full = $id > 0 ? $this->email->readMessage($userId, $id) : ['ok' => false];
+                $mail = is_array($full['result'] ?? null) ? $full['result'] : $row;
+                $body = trim((string)($mail['body'] ?? $mail['preview'] ?? ''));
+                $documents[] = sprintf("[%s] From: %s\nSubject: %s\nDate: %s\n%s", $id, (string)($mail['from'] ?? $row['from'] ?? ''), (string)($mail['subject'] ?? $row['subject'] ?? ''), (string)($mail['date'] ?? $row['sent'] ?? ''), mb_substr($body, 0, 5000));
+                $metadata[] = ['id' => $id, 'subject' => (string)($mail['subject'] ?? $row['subject'] ?? ''), 'from' => (string)($mail['from'] ?? $row['from'] ?? ''), 'date' => (string)($mail['date'] ?? $row['sent'] ?? ''), 'unread' => (bool)($row['unread'] ?? false)];
+            }
+            $focus = trim((string)($args['focus'] ?? ''));
+            $prompt = 'Summarize these emails in the language used by most messages. Give a concise overview, then bullet key points, explicit action items and dates/deadlines. Do not invent facts; say when a detail is unclear.';
+            if ($focus !== '') {
+                $prompt .= ' Pay special attention to: ' . mb_substr($focus, 0, 300) . '.';
+            }
+            $response = $this->ollama->chat([
+                ['role' => 'system', 'content' => 'You are EVA, a careful email assistant. Never expose secrets or claim an action was taken.'],
+                ['role' => 'user', 'content' => $prompt . "\n\n" . implode("\n\n", $documents)],
+            ], [], 90);
+            $summary = trim((string)($response['answer'] ?? ''));
+            if ($summary === '') {
+                return ['ok' => false, 'error' => (string)($response['error'] ?? 'The chat provider returned no summary.')];
+            }
+            return ['ok' => true, 'result' => ['count' => count($metadata), 'summary' => $summary, 'messages' => $metadata]];
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Mail summarization failed: ' . $e->getMessage()];
+        }
+    }
+
+    /**
+     * Pictures for the answer, not pages about them.
+     *
+     * A text search returns pages, so a model asked to "show pictures of X"
+     * used to answer that it cannot display images. This returns pictures the
+     * model can embed, each with a caption and the page it came from, and the
+     * source list below the answer shows where they came from.
+     */
+    private function runImageSearch(array $args): array {
+        $query = trim((string)($args['query'] ?? ''));
+        if ($query === '') {
+            return ['ok' => false, 'error' => 'query required'];
+        }
+        $count = isset($args['count']) ? (int)$args['count'] : null;
+        $result = $this->webSearch->searchImages($query, $count);
+        if (!$result['ok']) {
+            return ['ok' => false, 'error' => (string)($result['error'] ?? 'The image search failed.')];
+        }
+        return [
+            'ok' => true,
+            'result' => [
+                'query' => $query,
+                'provider' => $result['provider'],
+                // `external: true` marks these as links outside the Nextcloud
+                // instance so callers never confuse them with indexed files.
+                'external' => true,
+                'images' => array_map(static fn(array $image): array => [
+                    'url' => $image['url'],
+                    'preview' => $image['preview'],
+                    'title' => $image['title'],
+                    'page' => $image['page'],
+                ], $result['images']),
+                'markdown' => implode("\n", array_map(static fn(array $image): string =>
+                    '![' . str_replace([']', '['], '', (string)$image['title']) . '](' . (string)$image['url'] . ')',
+                    array_slice($result['images'], 0, 4)
+                )),
+            ],
+        ];
+    }
+
+    /** Generate one confirmed sticker and keep it in the user's EVA folder. */
+    private function createSticker(?Folder $home, array $args): array {
+        if (!$home instanceof Folder || $this->imageProvider === null) {
+            return ['ok' => false, 'error' => 'Sticker generation requires a configured OpenAI-compatible image provider.'];
+        }
+        $prompt = trim((string)($args['prompt'] ?? ''));
+        if ($prompt === '') return ['ok' => false, 'error' => 'prompt required'];
+        try {
+            $images = $this->imageProvider->generateImages(
+                'Create a single friendly sticker with a transparent background, bold clean outline, no watermark and no readable text: ' . mb_substr($prompt, 0, 1000),
+                1,
+                180,
+            );
+            $folder = $home->nodeExists('EVA') ? $home->get('EVA') : $home->newFolder('EVA');
+            if (!$folder instanceof Folder) return ['ok' => false, 'error' => 'The EVA folder exists but is not a folder.'];
+            $name = 'eva-sticker-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(3)) . '.png';
+            $file = $folder->newFile($name, $images[0]['bytes']);
+            return ['ok' => true, 'result' => ['path' => 'EVA/' . $name, 'file_id' => (int)$file->getId(), 'mime' => $images[0]['mime']]];
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => $e->getMessage()];
+        }
+    }
+
+    /**
+     * Read one page in full for the model.
+     *
+     * Search results only carry a bounded excerpt, so a detail that sits deeper
+     * in a page (a figure, a date, a quotation) would otherwise be guessed at.
+     * The URL is validated by the service, so a tool call can never make the
+     * server fetch an internal or non-http address.
+     */
+    private function openWebsite(array $args): array {
+        $url = trim((string)($args['url'] ?? ''));
+        if ($url === '') {
+            return ['ok' => false, 'error' => 'url required'];
+        }
+        $query = trim((string)($args['query'] ?? ''));
+        $offset = max(0, (int)($args['offset'] ?? 0));
+        $maxChars = isset($args['max_chars']) ? (int)$args['max_chars'] : null;
+        $page = $this->webSearch->openPage($url, $query, $offset, $maxChars);
+        if (!$page['ok']) {
+            return ['ok' => false, 'error' => (string)($page['error'] ?? 'The page could not be opened.')];
+        }
+        return [
+            'ok' => true,
+            'result' => [
+                'url' => $page['url'],
+                'title' => $page['title'],
+                'external' => true,
+                'published' => $page['published'],
+                'truncated' => $page['truncated'],
+                'offset' => $page['offset'],
+                'next_offset' => $page['next_offset'],
+                'total_chars' => $page['total_chars'],
+                'has_more' => $page['has_more'],
+                'highlights' => $page['highlights'],
+                'images' => $page['images'],
+                'text' => $page['text'],
+            ],
+        ];
+    }
+
+    /**
+     * The user's Talk rooms, so the model can pick the right one by name.
+     */
+    private function listTalkRooms(string $userId, array $args): array
+    {
+        $limit = (int)($args['limit'] ?? 25);
+        $rooms = $this->talkChat->rooms($userId, $limit);
+        if ($rooms === []) {
+            return [
+                'ok' => false,
+                'error' => 'No Nextcloud Talk rooms found. Either Talk is not installed, or the user is not a member of any room.',
+            ];
+        }
+        return ['ok' => true, 'result' => $rooms];
+    }
+
+    /**
+     * Read one Talk room's recent messages. The room is resolved against the
+     * user's own room list, so a name from the model can never reach a room the
+     * user is not in.
+     */
+    private function readTalkChat(string $userId, array $args): array
+    {
+        $room = trim((string)($args['room'] ?? ''));
+        if ($room === '') {
+            return ['ok' => false, 'error' => 'room required'];
+        }
+        $limit = (int)($args['limit'] ?? 50);
+        $result = $this->talkChat->read($userId, $room, $limit, !empty($args['unread_only']));
+        if (!$result['ok']) {
+            return ['ok' => false, 'error' => (string)($result['error'] ?? 'The chat could not be read.')];
+        }
+        return [
+            'ok' => true,
+            'result' => [
+                'room' => $result['room'],
+                'messages' => $result['messages'],
+                'unreadOnly' => (bool)($result['unreadOnly'] ?? false),
+                'lastReadMessage' => $result['lastReadMessage'] ?? null,
+                'text' => $result['text'],
+            ],
+        ];
+    }
+
+    /**
+     * Post into a Talk room as the asking user.
+     */
+    private function sendTalkMessage(string $userId, array $args): array
+    {
+        $room = trim((string)($args['room'] ?? ''));
+        $message = trim((string)($args['message'] ?? ''));
+        if ($room === '' || $message === '') {
+            return ['ok' => false, 'error' => 'room and message required'];
+        }
+        $result = $this->talkChat->send($userId, $room, $message);
+        if (!$result['ok']) {
+            return ['ok' => false, 'error' => (string)($result['error'] ?? 'The message could not be posted.')];
+        }
+        return [
+            'ok' => true,
+            'result' => [
+                'room' => $result['room'],
+                'messageId' => $result['messageId'],
+                'sentAt' => $result['sentAt'],
+            ],
+        ];
+    }
+
+    /**
+     * Ground an answer with external search results (Issue #187). The model
+     * decides when to call this; a failed search is reported as a normal tool
+     * error so the answer still falls back to the local sources.
+     */
+    private function runWebSearch(array $args): array {
+        $query = trim((string)($args['query'] ?? ''));
+        if ($query === '') {
+            return ['ok' => false, 'error' => 'query required'];
+        }
+        $mode = trim((string)($args['mode'] ?? 'web'));
+        if (!in_array($mode, WebSearchService::MODES, true)) {
+            $mode = 'web';
+        }
+        $result = $this->webSearch->search($query, null, $mode);
+        if (!$result['ok']) {
+            return ['ok' => false, 'error' => (string)($result['error'] ?? 'Web search failed.')];
+        }
+        // The service already ranks and bounds the list; this only guards the
+        // tool result against a misconfigured limit.
+        $results = array_slice($result['results'], 0, 20);
+        if ($results === []) {
+            return ['ok' => true, 'result' => ['query' => $query, 'provider' => $result['provider'], 'results' => []]];
+        }
+        return [
+            'ok' => true,
+            'result' => [
+                'query' => $query,
+                'mode' => $result['mode'] ?? $mode,
+                'provider' => $result['provider'],
+                // `external: true` marks these as links outside the Nextcloud
+                // instance so callers never confuse them with indexed files.
+                'external' => true,
+                'results' => $results,
+            ],
+        ];
+    }
+
+    private function connectorRows(): array {
+        $user = $this->config->userId() ?? '';
+        if ($user === '') return [];
+        $raw = Server::get(\OCP\IConfig::class)->getUserValue($user, AppConfig::APP, 'external_connectors', '{}');
+        $rows = json_decode($raw, true);
+        return is_array($rows) ? $rows : [];
+    }
+
+    private function listExternalConnectors(): array {
+        $out = [];
+        $user = $this->config->userId() ?? '';
+        $credentials = Server::get(ProviderCredentials::class);
+        foreach ($this->connectorRows() as $id => $row) {
+            if (!is_array($row)) continue;
+            $endpoints = is_array($row['openapi']['endpoints'] ?? null) ? array_values(array_slice($row['openapi']['endpoints'], -1000)) : [];
+            $prefix = 'connector_' . (string)$id;
+            // Bearer tokens were historically stored in the generic api_key
+            // slot. Accept both that legacy slot and the explicit token slot
+            // so settings edits cannot make a valid connector look unauthenticated.
+            $tokenConfigured = $credentials->customValueConfigured($user, $prefix, 'token')
+                || $credentials->customValueConfigured($user, $prefix, 'api_key');
+            $usernameConfigured = $credentials->customValueConfigured($user, $prefix, 'username');
+            $passwordConfigured = $credentials->customValueConfigured($user, $prefix, 'password');
+            $apiKeyConfigured = $credentials->customValueConfigured($user, $prefix, 'api_key');
+            $authType = (string)($row['auth_type'] ?? ($tokenConfigured ? 'bearer' : 'none'));
+            $out[] = ['id' => (string)$id, 'name' => (string)($row['name'] ?? $id), 'base_url' => (string)($row['base_url'] ?? ''), 'openapi_url' => (string)($row['openapi_url'] ?? ''), 'auth_type' => $authType, 'token_configured' => $tokenConfigured, 'username_configured' => $usernameConfigured, 'password_configured' => $passwordConfigured, 'api_key_configured' => $apiKeyConfigured, 'api_key_header' => $this->normalizedApiKeyHeader($row), 'updated_at' => (int)($row['updated_at'] ?? 0), 'discovered_endpoint_count' => count($endpoints), 'learned_endpoints' => $endpoints, 'openapi_source' => mb_substr((string)($row['openapi']['source'] ?? ''), 0, 300), 'openapi_updated_at' => (int)($row['openapi']['updated_at'] ?? 0)];
+        }
+        return ['ok' => true, 'result' => ['connectors' => $out]];
+    }
+
+    private function discoverExternalConnector(array $args): array {
+        $id = strtolower(trim((string)($args['id'] ?? ''))); $row = $this->connectorRows()[$id] ?? null;
+        if (!preg_match('/^[a-z0-9][a-z0-9_-]{0,39}$/D', $id) || !is_array($row) || !$this->safeConnectorUrl((string)($row['base_url'] ?? ''))) return ['ok' => false, 'error' => 'Connector is not configured.'];
+        $user = $this->config->userId() ?? ''; $headers = ['Accept' => 'application/json'];
+        try {
+            $discoveryDeadline = microtime(true) + self::CONNECTOR_DISCOVERY_BUDGET;
+            $headers = array_merge($headers, $this->connectorAuthHeaders($id, $row, $user));
+            $found = null; $source = null;
+            // Establish transport reachability once before probing multiple
+            // documentation paths. An offline host now fails quickly with a
+            // useful message instead of appearing to do nothing for minutes.
+            [$rootProbeStatus, $rootProbeBody] = $this->connectorCurlGet(rtrim((string)$row['base_url'], '/') . '/', $headers, 4);
+            if ($rootProbeStatus === 0) {
+                return ['ok' => false, 'error' => 'Connector host is unreachable from the Nextcloud server. Check DNS, routing, VPN and firewall settings.'];
+            }
+            // Browser-oriented services (including Immich) may return 406 to
+            // an API-style Accept header while serving their landing page as
+            // HTML. Retry that one probe with a browser Accept value so the
+            // service can still identify itself without a vendor preset.
+            if ($rootProbeStatus === 406) {
+                [$htmlStatus, $htmlBody] = $this->connectorCurlGet(rtrim((string)$row['base_url'], '/') . '/', ['Accept' => 'text/html,application/xhtml+xml'], 4);
+                if ($htmlStatus >= 200 && $htmlStatus < 400 && $htmlBody !== '') {
+                    $rootProbeStatus = $htmlStatus;
+                    $rootProbeBody = $htmlBody;
+                }
+            }
+            // Probe standard schema locations uniformly. Using curl here is
+            // intentional: Nextcloud's HTTP client can reject private/LAN
+            // addresses even when the connector was explicitly allow-listed.
+            // There are no vendor-specific adapters; any service publishing a
+            // standard OpenAPI/Swagger document is learned the same way.
+            $candidates = [];
+            $customSchema = trim((string)($row['openapi_url'] ?? ''));
+            if ($customSchema !== '' && $this->sameConnectorHost($customSchema, (string)$row['base_url'])) $candidates[] = $customSchema;
+            $candidates = array_merge($candidates, ['/api/v2.0', '/openapi.json', '/openapi.yaml', '/openapi.yml', '/swagger.json', '/swagger.yaml', '/swagger.yml', '/.well-known/openapi.json', '/.well-known/openapi.yaml', '/api/open-api', '/api/openapi.json', '/api/openapi.yaml', '/api/openapi.yml', '/api/swagger.json', '/api/swagger.yaml', '/api/swagger.yml', '/api/openapi', '/api/swagger', '/docs', '/docs/openapi.json', '/docs/openapi.yaml', '/api/docs', '/api/docs/openapi.json', '/api/docs/openapi.yaml', '/api/v2.0/docs', '/api', '/graphql', '/api/graphql']);
+            // Some services advertise their schema only as a link in the
+            // landing page. Extract same-host JSON/YAML documentation links
+            // without trusting arbitrary external URLs or executing them.
+            if (is_string($rootProbeBody) && $rootProbeBody !== '') {
+                preg_match_all('~(?:href|src)=["\']([^"\']*(?:openapi|swagger|api-docs|docs)[^"\']*)["\']~i', $rootProbeBody, $linkMatches);
+                foreach (($linkMatches[1] ?? []) as $linked) {
+                    $parts = parse_url(html_entity_decode((string)$linked, ENT_QUOTES | ENT_HTML5));
+                    $linkedPath = (string)($parts['path'] ?? '');
+                    if ($linkedPath !== '' && str_starts_with($linkedPath, '/') && !in_array($linkedPath, $candidates, true)) $candidates[] = $linkedPath;
+                }
+                // Hypermedia APIs often publish no schema but expose a
+                // bounded set of navigable links in the root JSON document.
+                // Learn same-host GET routes as a generic fallback.
+                $rootJson = json_decode(mb_substr($rootProbeBody, 0, 1048576), true);
+                $collectLinks = function ($value) use (&$collectLinks, &$candidates): void {
+                    if (!is_array($value)) return;
+                    foreach ($value as $key => $item) {
+                        if (is_string($item) && in_array(strtolower((string)$key), ['href', 'url', 'uri', 'path', 'self', 'next', 'endpoint'], true)
+                            && str_starts_with($item, '/') && !str_starts_with($item, '//') && strlen($item) <= 300
+                            && !in_array($item, $candidates, true)) $candidates[] = $item;
+                        if (is_array($item)) $collectLinks($item);
+                    }
+                };
+                if (is_array($rootJson)) $collectLinks($rootJson);
+                // Single-page applications often ship their route map only in
+                // same-origin JavaScript bundles, without publishing a schema.
+                // Read a few bounded bundles and learn literal API paths. This
+                // is vendor-neutral and never follows a third-party host.
+                preg_match_all('~(?:src|href)=["\']([^"\']+\\.js(?:\\?[^"\']*)?)["\']~i', $rootProbeBody, $assetMatches);
+                foreach (array_slice(array_values(array_unique($assetMatches[1] ?? [])), 0, 3) as $asset) {
+                    $assetParts = parse_url(html_entity_decode((string)$asset, ENT_QUOTES | ENT_HTML5));
+                    $assetPath = (string)($assetParts['path'] ?? '');
+                    if ($assetPath === '' || !str_starts_with($assetPath, '/')) continue;
+                    $assetUrl = rtrim((string)$row['base_url'], '/') . $assetPath;
+                    if (!$this->safeConnectorUrl($assetUrl)) continue;
+                    [, $assetBody] = $this->connectorCurlGet($assetUrl, ['Accept' => 'application/javascript,text/javascript,*/*'], 4);
+                    if (!is_string($assetBody) || $assetBody === '') continue;
+                    preg_match_all('~["\'](\/(?:api|rest|ocs)(?:\/[A-Za-z0-9_.$:{}~+@%\-]+){1,12})["\']~', mb_substr($assetBody, 0, 1048576), $routeMatches);
+                    foreach (array_slice(array_values(array_unique($routeMatches[1] ?? [])), 0, 120) as $route) {
+                        if (!in_array($route, $candidates, true)) $candidates[] = $route;
+                    }
+                }
+            }
+            $authDiscoveryStatus = 0;
+            $reachableRoutes = [];
+            $graphqlEndpoints = [];
+            foreach ($found === null ? array_slice(array_values(array_unique($candidates)), 0, 80) : [] as $candidate) {
+                if (microtime(true) >= $discoveryDeadline) break;
+                $url = preg_match('~^https?://~i', $candidate) ? $candidate : rtrim((string)$row['base_url'], '/') . $candidate; if (!$this->safeConnectorUrl($url)) continue;
+                [$status, $body] = $this->connectorCurlGet($url, $headers, 4);
+                if ($status === 401 || $status === 403) $authDiscoveryStatus = $status;
+                $graphql = $this->graphqlEndpointMeta((string)$candidate, $status);
+                if ($graphql !== null) $graphqlEndpoints[] = $graphql;
+                if ($status >= 200 && $status < 500 && $status !== 404 && str_starts_with((string)$candidate, '/')) {
+                    $reachableRoutes[] = ['path' => mb_substr((string)$candidate, 0, 300), 'method' => 'GET', 'operation_id' => 'runtime_probe', 'requires_auth' => in_array($status, [401, 403], true)];
+                }
+                if ($status < 200 || $status >= 300) continue;
+                $decoded = $this->decodeConnectorSchema((string)$body);
+                if (is_array($decoded) && is_array($decoded['paths'] ?? null)) { $found = $decoded; $source = $candidate; break; }
+            }
+            if ($found === null) {
+                // A protected API can still prove its route shape through a
+                // 401/403 response. Persist those same-origin probes so the
+                // agent can call them after credentials are corrected.
+                // Handle GraphQL first: its GET probe commonly returns 405,
+                // which is also a reachable generic route, but the learned
+                // POST body schema is more useful than a GET runtime probe.
+                if ($graphqlEndpoints !== []) {
+                    $rows = $this->connectorRows();
+                    $rows[$id]['openapi'] = ['source' => 'runtime-graphql', 'version' => '', 'endpoints' => array_values(array_unique($graphqlEndpoints, SORT_REGULAR)), 'updated_at' => time()];
+                    Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}');
+                    return ['ok' => true, 'result' => ['connector' => $id, 'source' => 'runtime-graphql', 'title' => 'GraphQL', 'endpoints' => $graphqlEndpoints, 'note' => 'A GraphQL endpoint was learned. POST requests require a query field; variables and operationName are optional.']];
+                }
+                if ($reachableRoutes !== [] && (is_string($rootProbeBody) ? stripos($rootProbeBody, 'immich') === false : true)) {
+                    $reachableRoutes = array_values(array_unique(array_merge($reachableRoutes, $graphqlEndpoints), SORT_REGULAR));
+                    $rows = $this->connectorRows();
+                    $rows[$id]['openapi'] = ['source' => 'runtime-probe', 'version' => '', 'endpoints' => array_values(array_unique($reachableRoutes, SORT_REGULAR)), 'updated_at' => time()];
+                    Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}');
+                    return ['ok' => true, 'result' => ['connector' => $id, 'source' => 'runtime-probe', 'title' => '', 'endpoints' => $reachableRoutes, 'note' => 'The service exposes no readable schema, but reachable same-origin routes were learned. Protected routes require valid credentials.']];
+                }
+                // Immich deployments often disable Swagger in production but
+                // expose a stable REST surface. Identify Immich from the
+                // returned landing page and learn only its read/search routes
+                // (writes remain confirmation-gated as usual).
+                if (is_string($rootProbeBody) && stripos($rootProbeBody, 'immich') !== false) {
+                    // Production Immich installations may disable Swagger.
+                    // Probe its documented controller roots and common
+                    // read-only subroutes: protected routes answer 401/403,
+                    // which is enough to prove that the route exists without
+                    // exposing data. This keeps discovery useful for every
+                    // Immich deployment while never issuing mutating calls.
+                    $immichCandidates = [
+                        '/api/activities', '/api/albums', '/api/albums/statistics', '/api/assets', '/api/assets/statistics',
+                        '/api/auth/status', '/api/duplicates', '/api/faces', '/api/jobs', '/api/libraries', '/api/map/markers',
+                        '/api/memories', '/api/notifications', '/api/people', '/api/partners', '/api/search', '/api/search/smart',
+                        '/api/search/metadata', '/api/server/about', '/api/server/config', '/api/server/features', '/api/server/statistics',
+                        '/api/sessions', '/api/shared-links', '/api/stacks', '/api/system-config', '/api/system-metadata', '/api/tags',
+                        '/api/timeline/bucket', '/api/timeline/buckets', '/api/trash', '/api/users', '/api/views', '/api/workflows',
+                        '/api/asset-files', '/api/download/info', '/api/notifications', '/api/oauth/mobile-redirect',
+                        '/api/api-keys', '/api/api-keys/me', '/api/activities/statistics', '/api/albums/map-markers', '/api/faces',
+                        '/api/cluster-groups/requests', '/api/config', '/api/config/defaults', '/api/public/config', '/api/public/config/defaults',
+                        '/api/duplicates', '/api/integrity/summary', '/api/integrity/report', '/api/libraries', '/api/memories/statistics',
+                        '/api/notifications', '/api/partners', '/api/plugins/methods', '/api/plugins/templates', '/api/queues',
+                        '/api/queues/thumbnail/jobs', '/api/queues/smartSearch/jobs', '/api/search/explore', '/api/search/person',
+                        '/api/search/places', '/api/search/cities', '/api/search/suggestions', '/api/server/apk-links', '/api/server/storage',
+                        '/api/server/ping', '/api/server/version', '/api/server/version-history', '/api/server/media-types', '/api/server/license',
+                        '/api/server/version-check', '/api/sessions', '/api/shared-links', '/api/shared-links/me', '/api/stacks',
+                        '/api/sync/ack', '/api/system-config/defaults', '/api/system-config/storage-template-options', '/api/system-metadata/admin-onboarding',
+                        '/api/system-metadata/reverse-geocoding-state', '/api/system-metadata/version-check-state', '/api/tags', '/api/timeline/buckets',
+                        '/api/trash/restore', '/api/trash/restore/assets', '/api/view/folder/unique-paths', '/api/view/folder', '/api/workflows/triggers',
+                    ];
+                    $immichEndpoints = [];
+                    foreach (array_slice(array_values(array_unique($immichCandidates)), 0, 24) as $candidate) {
+                        if (microtime(true) >= $discoveryDeadline) break;
+                        [$probeStatus] = $this->connectorCurlGet(rtrim((string)$row['base_url'], '/') . $candidate, $headers, 4);
+                        if (($probeStatus >= 200 && $probeStatus < 500) && $probeStatus !== 404) $immichEndpoints[] = ['path' => $candidate, 'method' => 'GET', 'operation_id' => 'immich_discovered'];
+                    }
+                    // Parameterized and write/search routes are retained as
+                    // capabilities for the agent but are never probed.
+                    foreach ([
+                        ['/api/people/{id}', 'GET', 'person'], ['/api/people/{id}/thumbnail', 'GET', 'person_thumbnail'],
+                        ['/api/assets/{id}', 'GET', 'asset'], ['/api/assets/{id}/thumbnail', 'GET', 'asset_thumbnail'],
+                        ['/api/search/person', 'POST', 'search_person'], ['/api/search/face', 'POST', 'search_face'],
+                        ['/api/search/clip', 'POST', 'search_clip'], ['/api/assets', 'POST', 'upload_asset'],
+                    ] as [$path, $method, $operation]) $immichEndpoints[] = ['path' => $path, 'method' => $method, 'operation_id' => $operation];
+                    if ($immichEndpoints === []) $immichEndpoints[] = ['path' => '/api/people', 'method' => 'GET', 'operation_id' => 'people'];
+                    $rows = $this->connectorRows();
+                    // Immich often disables Swagger in production but its
+                    // REST API consistently uses x-api-key. Infer that
+                    // scheme for a fresh connector so the Settings form and
+                    // subsequent calls use the right field automatically.
+                    $currentRow = is_array($rows[$id] ?? null) ? $rows[$id] : [];
+                    $hasStoredSecret = !empty($currentRow['token_configured']) || !empty($currentRow['api_key_configured'])
+                        || !empty($currentRow['username_configured']) || !empty($currentRow['password_configured']);
+                    if (!$hasStoredSecret && (($currentRow['auth_type'] ?? 'bearer') === 'bearer')) {
+                        $currentRow['auth_type'] = 'api_key';
+                        $currentRow['api_key_header'] = 'x-api-key';
+                        $rows[$id] = $currentRow;
+                    }
+                    $rows[$id]['openapi'] = ['source' => 'runtime-immich', 'version' => '', 'endpoints' => $immichEndpoints, 'updated_at' => time()];
+                    Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}');
+                    return ['ok' => true, 'result' => ['connector' => $id, 'source' => 'runtime-immich', 'title' => 'Immich', 'endpoints' => $immichEndpoints, 'auth_type' => $rows[$id]['auth_type'] ?? 'bearer', 'note' => 'Immich API routes were learned. Configure an Immich API key using the x-api-key header before calling protected endpoints.']];
+                }
+                // Many appliances expose no schema at all. A bounded GET of
+                // the configured root is still useful discovery and gives the
+                // user a concrete learned endpoint to inspect next.
+                $rootUrl = rtrim((string)$row['base_url'], '/') . '/';
+                [$rootStatus] = $this->connectorCurlGet($rootUrl, $headers, 8);
+                if ($rootStatus >= 200 && $rootStatus < 300) {
+                    $fallbackEndpoints = [['path' => '/', 'method' => 'GET', 'operation_id' => 'root']];
+                    foreach (array_slice(array_values(array_unique($candidates)), 0, 20) as $candidate) {
+                        if ($candidate !== '/' && str_starts_with($candidate, '/') && !str_contains($candidate, '{')) $fallbackEndpoints[] = ['path' => mb_substr($candidate, 0, 300), 'method' => 'GET', 'operation_id' => 'discovered_link'];
+                    }
+                    $rows = $this->connectorRows(); $rows[$id]['openapi'] = ['source' => 'runtime', 'version' => '', 'endpoints' => $fallbackEndpoints, 'updated_at' => time()];
+                    Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}');
+                    return ['ok' => true, 'result' => ['connector' => $id, 'source' => 'runtime', 'title' => '', 'endpoints' => $rows[$id]['openapi']['endpoints'], 'note' => 'No API schema was published; the service root was learned and can be tested.']];
+                }
+                if ($rootProbeStatus === 401 || $rootProbeStatus === 403) {
+                    return ['ok' => false, 'error' => 'Connector is reachable (HTTP ' . $rootProbeStatus . ') but requires valid credentials before its API can be discovered.'];
+                }
+                if ($authDiscoveryStatus !== 0) {
+                    return ['ok' => false, 'error' => 'Connector is reachable, but its API description requires authentication (HTTP ' . $authDiscoveryStatus . ').'];
+                }
+                return ['ok' => false, 'error' => 'No OpenAPI or Swagger description was found (root HTTP ' . $rootProbeStatus . '). The service may disable schema discovery or use a custom API base path.'];
+            }
+            $endpoints = [];
+            // Prefer the authentication scheme advertised by the service when
+            // the user has not stored credentials yet. This makes first-time
+            // connector setup intuitive (Immich commonly advertises x-api-key)
+            // while never replacing an explicitly configured secret or scheme.
+            $inferredAuth = $this->inferConnectorAuth($found);
+            if ($inferredAuth !== null) {
+                $current = $this->connectorRows();
+                $currentRow = is_array($current[$id] ?? null) ? $current[$id] : [];
+                $hasStoredSecret = !empty($currentRow['token_configured']) || !empty($currentRow['api_key_configured'])
+                    || !empty($currentRow['username_configured']) || !empty($currentRow['password_configured']);
+                if (!$hasStoredSecret && (($currentRow['auth_type'] ?? 'bearer') === 'bearer')) {
+                    $currentRow['auth_type'] = $inferredAuth['auth_type'];
+                    if (isset($inferredAuth['api_key_header'])) $currentRow['api_key_header'] = $inferredAuth['api_key_header'];
+                    $current[$id] = $currentRow;
+                    Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($current, JSON_UNESCAPED_SLASHES) ?: '{}');
+                }
+            }
+            // Do not slice the schema's paths before iterating: TrueNAS places
+            // VM and container routes after the first hundred entries. Bound
+            // the persisted result instead, so discovery covers the complete
+            // document without allowing unbounded user-config data growth.
+            foreach ($found['paths'] as $path => $operations) {
+                if (count($endpoints) >= 1000) break;
+                if (!is_string($path) || !is_array($operations) || !str_starts_with($path, '/')) continue;
+                $pathParameters = is_array($operations['parameters'] ?? null) ? $operations['parameters'] : [];
+                // The TrueNAS document is served from /api/v2.0 but its
+                // paths are relative to that mount point. Persist absolute
+                // connector paths so subsequent calls do not accidentally
+                // hit the appliance root (which yields a misleading 404).
+                $schemaPrefix = $source === '/api/v2.0' ? '/api/v2.0' : (str_starts_with((string)$source, '/api/') ? '/api' : '');
+                // OpenAPI 3 declares the mounted API prefix in servers.url;
+                // Swagger 2 uses basePath. Honour only a path component so a
+                // malicious schema cannot redirect calls to another host.
+                $declaredPrefix = $this->connectorSchemaPrefix($found, $schemaPrefix);
+                $prefix = $declaredPrefix !== '' ? $declaredPrefix : $schemaPrefix;
+                $routePath = $prefix !== '' && !str_starts_with($path, $prefix . '/') && $path !== $prefix
+                    ? $prefix . $path : $path;
+                foreach ($operations as $method => $operation) if (in_array(strtoupper((string)$method), ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+                    $meta = ['path' => mb_substr($routePath, 0, 300), 'method' => strtoupper((string)$method), 'operation_id' => is_array($operation) ? mb_substr((string)($operation['operationId'] ?? ''), 0, 120) : ''];
+                    if (is_array($operation)) {
+                        $params = [];
+                        $operationParameters = array_merge($pathParameters, is_array($operation['parameters'] ?? null) ? $operation['parameters'] : []);
+                        foreach (array_slice($operationParameters, 0, 20) as $parameter) {
+                            if (!is_array($parameter)) continue;
+                            $name = (string)($parameter['name'] ?? '');
+                            if (preg_match('/^[A-Za-z0-9_.-]{1,80}$/', $name) !== 1) continue;
+                            $schema = is_array($parameter['schema'] ?? null) ? $parameter['schema'] : [];
+                            // Swagger 2 keeps `type` on the parameter itself;
+                            // OpenAPI 3 nests it under `schema`.
+                            $type = (string)($schema['type'] ?? $parameter['type'] ?? 'string');
+                            $params[] = ['name' => $name, 'in' => in_array(($parameter['in'] ?? ''), ['query', 'path', 'header', 'cookie'], true) ? (string)$parameter['in'] : 'query', 'required' => !empty($parameter['required']), 'type' => preg_match('/^[A-Za-z0-9_.-]{1,40}$/', $type) === 1 ? $type : 'string'];
+                        }
+                        if ($params !== []) $meta['parameters'] = $params;
+                        $requestBody = $this->connectorRequestBodyMeta($operation, $found);
+                        if ($requestBody !== null) $meta['request_body'] = $requestBody;
+                    }
+                    $endpoints[] = $meta;
+                }
+            }
+            $rows = $this->connectorRows(); $rows[$id]['openapi'] = ['source' => $source, 'version' => mb_substr((string)($found['openapi'] ?? $found['swagger'] ?? ''), 0, 30), 'endpoints' => array_slice($endpoints, 0, 1000), 'updated_at' => time()];
+            Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}');
+            return ['ok' => true, 'result' => ['connector' => $id, 'source' => $source, 'title' => mb_substr((string)($found['info']['title'] ?? ''), 0, 160), 'endpoints' => array_slice($endpoints, 0, 1000)]];
+        } catch (\Throwable) { return ['ok' => false, 'error' => 'External API discovery failed.']; }
+    }
+
+    /** Decode JSON schemas everywhere; use PHP's optional YAML extension when available. */
+    private function decodeConnectorSchema(string $body): ?array {
+        $body = mb_substr($body, 0, 8388608);
+        $decoded = json_decode($body, true);
+        if (is_array($decoded)) return $decoded;
+        if (function_exists('yaml_parse')) {
+            try {
+                $yaml = yaml_parse($body);
+                return is_array($yaml) ? $yaml : null;
+            } catch (\Throwable) { return null; }
+        }
+        // Ship a parser fallback so OpenAPI YAML works on standard PHP
+        // installations where the optional ext-yaml extension is unavailable.
+        if (class_exists(\Symfony\Component\Yaml\Yaml::class)) {
+            try {
+                $yaml = \Symfony\Component\Yaml\Yaml::parse($body);
+                return is_array($yaml) ? $yaml : null;
+            } catch (\Throwable) { return null; }
+        }
+        return null;
+    }
+
+    /** Resolve a safe path prefix from OpenAPI servers.url/basePath metadata. */
+    private function connectorSchemaPrefix(array $document, string $fallback = ''): string {
+        $prefix = '';
+        $server = is_array($document['servers'][0] ?? null) ? $document['servers'][0] : null;
+        if ($server !== null) {
+            $serverUrl = (string)($server['url'] ?? '');
+            $serverParts = parse_url($serverUrl);
+            $prefix = (string)($serverParts['path'] ?? '');
+            $variables = is_array($server['variables'] ?? null) ? $server['variables'] : [];
+            $invalidVariable = false;
+            // OpenAPI permits templated server paths such as /api/{version}.
+            // Resolve only declared defaults and never interpolate arbitrary
+            // user-provided values into connector URLs.
+            $prefix = preg_replace_callback('/\{([A-Za-z][A-Za-z0-9_-]{0,63})\}/', static function (array $match) use ($variables, &$invalidVariable): string {
+                $variable = $variables[$match[1]] ?? null;
+                $default = is_array($variable) ? trim((string)($variable['default'] ?? '')) : '';
+                if (preg_match('/^[A-Za-z0-9._~-]{1,80}$/D', $default) !== 1) {
+                    $invalidVariable = true;
+                    return '';
+                }
+                return $default;
+            }, $prefix) ?? '';
+            if ($invalidVariable) $prefix = '';
+        }
+        if ($prefix === '') $prefix = (string)($document['basePath'] ?? '');
+        $prefix = '/' . trim($prefix, '/');
+        if ($prefix === '/' || str_contains($prefix, '..') || preg_match('/[\r\n?#]/', $prefix) || mb_strlen($prefix) > 200) {
+            $prefix = '';
+        }
+        return $prefix !== '' ? $prefix : $fallback;
+    }
+
+    /** @return array{path:string,method:string,operation_id:string,request_body:array}|null */
+    private function graphqlEndpointMeta(string $candidate, int $status): ?array {
+        $path = (string)(parse_url($candidate, PHP_URL_PATH) ?: $candidate);
+        if (!preg_match('~(?:^|/)graphql/?$~i', $path) || in_array($status, [0, 404], true) || $status < 200 || $status >= 500) return null;
+        return ['path' => mb_substr($path, 0, 300), 'method' => 'POST', 'operation_id' => 'graphql', 'request_body' => [
+            'required' => true,
+            'content_type' => 'application/json',
+            'fields' => [
+                ['name' => 'query', 'type' => 'string', 'required' => true],
+                ['name' => 'variables', 'type' => 'object', 'required' => false],
+                ['name' => 'operationName', 'type' => 'string', 'required' => false],
+            ],
+        ]];
+    }
+
+    /** @return array{auth_type:string,api_key_header?:string}|null */
+    private function inferConnectorAuth(array $document): ?array {
+        $schemes = [];
+        if (is_array($document['components']['securitySchemes'] ?? null)) $schemes = $document['components']['securitySchemes'];
+        elseif (is_array($document['securityDefinitions'] ?? null)) $schemes = $document['securityDefinitions'];
+        foreach ($schemes as $scheme) {
+            if (!is_array($scheme)) continue;
+            $type = strtolower((string)($scheme['type'] ?? ''));
+            if ($type === 'apikey' || $type === 'apiKey') {
+                $header = (string)($scheme['name'] ?? 'X-API-Key');
+                return ['auth_type' => 'api_key', 'api_key_header' => $this->normalizedApiKeyHeader(['api_key_header' => $header])];
+            }
+        }
+        foreach ($schemes as $scheme) {
+            if (!is_array($scheme)) continue;
+            $type = strtolower((string)($scheme['type'] ?? ''));
+            if ($type === 'basic' || ($type === 'http' && strtolower((string)($scheme['scheme'] ?? '')) === 'basic')) return ['auth_type' => 'basic'];
+        }
+        foreach ($schemes as $scheme) {
+            if (!is_array($scheme)) continue;
+            $type = strtolower((string)($scheme['type'] ?? ''));
+            if ($type === 'http' && in_array(strtolower((string)($scheme['scheme'] ?? '')), ['bearer', 'token'], true)) return ['auth_type' => 'bearer'];
+            if ($type === 'oauth2' || $type === 'openidconnect') return ['auth_type' => 'bearer'];
+        }
+        return null;
+    }
+
+    /**
+     * Extract a bounded description of an OpenAPI JSON request body. The
+     * values are schema metadata only; defaults/examples are deliberately not
+     * copied into learned connector state.
+     *
+     * @return array{required:bool,content_type:string,fields:list<array{name:string,type:string,required:bool}>}|null
+     */
+    private function connectorRequestBodyMeta(array $operation, array $document = []): ?array {
+        $schema = null;
+        $required = false;
+        $contentType = 'application/json';
+        $requestBody = $operation['requestBody'] ?? null;
+        if (is_array($requestBody)) {
+            $required = !empty($requestBody['required']);
+            $content = is_array($requestBody['content'] ?? null) ? $requestBody['content'] : [];
+            foreach (['application/json', 'application/*+json', '*/*'] as $candidate) {
+                if (is_array($content[$candidate]['schema'] ?? null)) {
+                    $schema = $this->resolveConnectorSchema($content[$candidate]['schema'], $document);
+                    $contentType = $candidate;
+                    break;
+                }
+            }
+        }
+        // Swagger 2 describes JSON bodies as an operation parameter with
+        // in=body rather than requestBody/content.
+        if ($schema === null && is_array($operation['parameters'] ?? null)) {
+            foreach ($operation['parameters'] as $parameter) {
+                if (is_array($parameter) && ($parameter['in'] ?? '') === 'body' && is_array($parameter['schema'] ?? null)) {
+                    $schema = $this->resolveConnectorSchema($parameter['schema'], $document);
+                    $required = !empty($parameter['required']);
+                    break;
+                }
+            }
+        }
+        if (!is_array($schema)) return null;
+        // A schema may combine referenced fragments. Merge only bounded,
+        // local object fragments; never fetch a remote $ref.
+        foreach (['allOf', 'oneOf', 'anyOf'] as $combiner) {
+            if (!is_array($schema[$combiner] ?? null)) continue;
+            foreach (array_slice($schema[$combiner], 0, 8) as $fragment) {
+                if (!is_array($fragment)) continue;
+                $fragment = $this->resolveConnectorSchema($fragment, $document);
+                if (!is_array($fragment)) continue;
+                if (is_array($fragment['properties'] ?? null)) $schema['properties'] = array_merge($schema['properties'] ?? [], $fragment['properties']);
+                if (is_array($fragment['required'] ?? null)) $schema['required'] = array_values(array_unique(array_merge($schema['required'] ?? [], $fragment['required'])));
+            }
+        }
+        $properties = is_array($schema['properties'] ?? null) ? $schema['properties'] : [];
+        $requiredFields = array_fill_keys(is_array($schema['required'] ?? null) ? array_map('strval', $schema['required']) : [], true);
+        $fields = [];
+        foreach (array_slice($properties, 0, 40, true) as $name => $property) {
+            if (!is_array($property) || preg_match('/^[A-Za-z0-9_.-]{1,80}$/D', (string)$name) !== 1) continue;
+            $type = (string)($property['type'] ?? 'object');
+            if (preg_match('/^[A-Za-z0-9_.-]{1,40}$/D', $type) !== 1) $type = 'object';
+            $fields[] = ['name' => (string)$name, 'type' => $type, 'required' => isset($requiredFields[(string)$name])];
+        }
+        return ['required' => $required, 'content_type' => $contentType, 'fields' => $fields];
+    }
+
+    /** Resolve at most a few local JSON pointers from a learned OpenAPI document. */
+    private function resolveConnectorSchema(array $schema, array $document, int $depth = 0): array {
+        if ($depth >= 4 || !isset($schema['$ref']) || !is_string($schema['$ref'])) return $schema;
+        $ref = $schema['$ref'];
+        if (!str_starts_with($ref, '#/') || str_contains($ref, '..')) return $schema;
+        $value = $document;
+        foreach (array_slice(explode('/', substr($ref, 2)), 0, 20) as $part) {
+            $part = str_replace(['~1', '~0'], ['/', '~'], $part);
+            if (!is_array($value) || !array_key_exists($part, $value)) return $schema;
+            $value = $value[$part];
+        }
+        if (!is_array($value)) return $schema;
+        $resolved = $this->resolveConnectorSchema($value, $document, $depth + 1);
+        // Inline constraints/properties override referenced defaults.
+        foreach ($schema as $key => $item) if ($key !== '$ref') $resolved[$key] = $item;
+        return $resolved;
+    }
+
+    private function configureExternalConnector(array $args): array {
+        $id = strtolower(trim((string)($args['id'] ?? '')));
+        $base = rtrim(trim((string)($args['base_url'] ?? '')), '/');
+        if (!preg_match('/^[a-z0-9][a-z0-9_-]{0,39}$/D', $id) || !$this->safeConnectorUrl($base)) return ['ok' => false, 'error' => 'Connector id or base_url is invalid; use public HTTPS or a local HTTP(S) host.'];
+        $name = trim((string)($args['name'] ?? $id));
+        if ($name === '') $name = $id;
+        $rows = $this->connectorRows();
+        $previous = is_array($rows[$id] ?? null) ? $rows[$id] : [];
+        $authType = in_array((string)($args['auth_type'] ?? ($previous['auth_type'] ?? 'bearer')), ['none', 'bearer', 'basic', 'api_key'], true) ? (string)($args['auth_type'] ?? ($previous['auth_type'] ?? 'bearer')) : 'bearer';
+        $schemaUrl = trim((string)($args['openapi_url'] ?? ($previous['openapi_url'] ?? '')));
+        if ($schemaUrl !== '' && (!$this->safeConnectorUrl($schemaUrl) || !$this->sameConnectorHost($schemaUrl, $base))) return ['ok' => false, 'error' => 'The OpenAPI URL must use the same host as the connector base URL.'];
+        $rows[$id] = ['name' => mb_substr($name, 0, 120), 'base_url' => $base, 'openapi_url' => $schemaUrl, 'auth_type' => $authType,
+            'token_configured' => isset($args['token']) && trim((string)$args['token']) !== '' ? true : !empty($previous['token_configured']),
+            'username_configured' => isset($args['username']) && trim((string)$args['username']) !== '' ? true : !empty($previous['username_configured']),
+            'password_configured' => isset($args['password']) && trim((string)$args['password']) !== '' ? true : !empty($previous['password_configured']),
+            'api_key_configured' => isset($args['api_key']) && trim((string)$args['api_key']) !== '' ? true : !empty($previous['api_key_configured']),
+            'api_key_header' => $this->normalizedApiKeyHeader(['api_key_header' => (string)($args['api_key_header'] ?? ($previous['api_key_header'] ?? 'X-API-Key'))]), 'updated_at' => time()];
+        // Learned routes belong to a specific service origin and schema. Do
+        // not carry them over when either changes; stale paths otherwise make
+        // a valid connector appear broken (or, worse, target the old host).
+        $previousBase = rtrim((string)($previous['base_url'] ?? ''), '/');
+        $previousSchema = trim((string)($previous['openapi_url'] ?? ''));
+        if (is_array($previous['openapi'] ?? null) && $previousBase === $base && $previousSchema === $schemaUrl) {
+            $rows[$id]['openapi'] = $previous['openapi'];
+        }
+        $user = $this->config->userId() ?? '';
+        Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}');
+        $credentials = Server::get(ProviderCredentials::class);
+        // The settings form intentionally sends empty secret fields when a
+        // user edits a connector. An empty value means "keep the stored
+        // secret" (matching the UI placeholder), never delete credentials.
+        // Explicit credential removal can be added separately without making
+        // ordinary connector edits silently break authentication.
+        if (array_key_exists('token', $args) && trim((string)$args['token']) !== '') {
+            $credentials->saveCustomValue($user, 'connector_' . $id, 'token', trim((string)$args['token']));
+        }
+        foreach (['username', 'password', 'api_key'] as $field) {
+            if (array_key_exists($field, $args) && trim((string)$args[$field]) !== '') {
+                $credentials->saveCustomValue($user, 'connector_' . $id, $field, trim((string)$args[$field]));
+            }
+        }
+        return ['ok' => true, 'result' => ['id' => $id, 'name' => $name, 'base_url' => $base, 'token_configured' => $rows[$id]['token_configured']]];
+    }
+
+    /**
+     * Perform a bounded connectivity probe from the Nextcloud host itself.
+     * This deliberately uses the same allow-list and credentials as normal
+     * connector calls, but returns only transport metadata (never a body or
+     * secret) so a missing route is distinguishable from an API/auth error.
+     */
+    private function diagnoseExternalConnector(array $args): array {
+        $id = strtolower(trim((string)($args['id'] ?? '')));
+        $row = $this->connectorRows()[$id] ?? null;
+        $base = is_array($row) ? rtrim((string)($row['base_url'] ?? ''), '/') : '';
+        if (!preg_match('/^[a-z0-9][a-z0-9_-]{0,39}$/D', $id) || !is_array($row) || !$this->safeConnectorUrl($base)) {
+            return ['ok' => false, 'error' => 'Connector is not configured or its host is no longer allowed.'];
+        }
+        $user = $this->config->userId() ?? '';
+        try {
+            $headers = array_merge(['Accept' => 'application/json'], $this->connectorAuthHeaders($id, $row, $user));
+            $lines = [];
+            foreach ($headers as $name => $value) $lines[] = $name . ': ' . $value;
+            $ch = curl_init($base . '/');
+            $started = microtime(true);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => self::CONNECTOR_TIMEOUT,
+                CURLOPT_CONNECTTIMEOUT => self::CONNECTOR_CONNECT_TIMEOUT,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_HTTPHEADER => $lines,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_USERAGENT => 'EvaAi/1.0 connector-diagnostic',
+            ]);
+            $body = curl_exec($ch);
+            $errno = curl_errno($ch);
+            $error = $errno !== 0 ? curl_error($ch) : '';
+            $info = curl_getinfo($ch);
+            $elapsed = (int)round((microtime(true) - $started) * 1000);
+            $status = (int)($info['http_code'] ?? 0);
+            $ip = (string)($info['primary_ip'] ?? '');
+            $category = $errno !== 0 ? 'network' : ($status === 401 || $status === 403 ? 'authentication' : ($status >= 200 && $status < 500 ? 'reachable' : 'http'));
+            $effectiveAuthType = (string)($row['auth_type'] ?? '');
+            if ($effectiveAuthType === '') {
+                $effectiveAuthType = !empty($row['token_configured']) ? 'bearer' : 'none';
+            }
+            return ['ok' => $errno === 0 && $status >= 200 && $status < 500, 'result' => [
+                'connector' => $id, 'base_url' => $base, 'status' => $status,
+                'resolved_ip' => $ip, 'elapsed_ms' => $elapsed, 'category' => $category,
+                'auth_type' => $effectiveAuthType,
+                'error' => $error !== '' ? mb_substr($error, 0, 240) : null,
+                'hint' => $errno !== 0 ? 'The Nextcloud server cannot reach this host. Check routing/VPN/firewall and bind the service to a reachable address.' : null,
+            ]];
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'Connector diagnostic failed: ' . mb_substr($e->getMessage(), 0, 200)];
+        }
+    }
+
+    private function callExternalConnector(array $args): array {
+        $id = strtolower(trim((string)($args['id'] ?? ''))); $path = trim((string)($args['path'] ?? '')); $method = strtoupper(trim((string)($args['method'] ?? ''))); $params = $args['params'] ?? [];
+        if (!preg_match('/^[a-z0-9][a-z0-9_-]{0,39}$/D', $id) || !in_array($method, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'], true) || !is_array($params) || count($params) > 50 || $path === '' || str_contains($path, '..') || preg_match('/[\r\n]/', $path)) return ['ok' => false, 'error' => 'Invalid connector request.'];
+        $split = $this->splitRequestPath($path, $params);
+        if ($split === null) return ['ok' => false, 'error' => 'The connector path or query string is invalid.'];
+        [$path, $params] = $split;
+        $row = $this->connectorRows()[$id] ?? null; if (!is_array($row) || !$this->safeConnectorUrl((string)($row['base_url'] ?? ''))) return ['ok' => false, 'error' => 'Connector is not configured or its host is no longer allowed.'];
+        $knownEndpoints = is_array($row['openapi']['endpoints'] ?? null) ? $row['openapi']['endpoints'] : [];
+        $matchedEndpoint = null;
+        if ($knownEndpoints !== []) {
+            $known = false;
+            foreach ($knownEndpoints as $endpoint) {
+                if (!is_array($endpoint)) continue;
+                if (strtoupper((string)($endpoint['method'] ?? '')) === $method
+                    && $this->matchesDiscoveredRoute((string)($endpoint['path'] ?? ''), $path)) { $known = true; $matchedEndpoint = $endpoint; break; }
+            }
+            if (!$known) {
+                // Discovery is read-only, so refresh a stale/partial route
+                // catalog transparently before rejecting a confirmed call.
+                // This keeps generic connectors self-learning without
+                // allowing arbitrary host/path probing: the request is still
+                // retried only when discovery records the exact route.
+                if (($args['_auto_discover'] ?? true) === true) {
+                    $discovered = $this->discoverExternalConnector(['id' => $id]);
+                    if (($discovered['ok'] ?? false) === true) {
+                        $args['_auto_discover'] = false;
+                        return $this->callExternalConnector($args);
+                    }
+                }
+                return ['ok' => false, 'error' => 'This connector route was not discovered. Run discover_external_connector first.'];
+            }
+            if ($method !== 'GET' && is_array($matchedEndpoint)) {
+                $bodyError = $this->validateConnectorRequestBody($matchedEndpoint, $params);
+                if ($bodyError !== null) return ['ok' => false, 'error' => $bodyError];
+            }
+        }
+        $pathTemplate = $path;
+        $expandedPath = $this->expandConnectorPath($pathTemplate, $params);
+        if ($expandedPath === null) return ['ok' => false, 'error' => 'A required connector path parameter is missing or invalid.'];
+        $params = $this->removePathParameters($pathTemplate, $params);
+        $path = $expandedPath;
+        $url = rtrim((string)$row['base_url'], '/') . '/' . ltrim($path, '/');
+        if (!$this->safeConnectorUrl($url)) return ['ok' => false, 'error' => 'Connector path leaves the configured HTTPS host.'];
+        try {
+            $headers = ['Accept' => 'application/json']; $user = $this->config->userId() ?? '';
+            $headers = array_merge($headers, $this->connectorAuthHeaders($id, $row, $user));
+            if ($method === 'GET') {
+                return $this->callExternalConnectorGet($id, $path, $url, $params, $headers, $user);
+            }
+            // OpenAPI distinguishes query parameters from JSON body fields.
+            // Preserve that distinction for learned POST/PUT/PATCH routes;
+            // unknown parameters remain in the body for backwards compatibility.
+            $queryParams = [];
+            if (is_array($matchedEndpoint['parameters'] ?? null)) {
+                foreach ($matchedEndpoint['parameters'] as $parameter) {
+                    if (!is_array($parameter) || ($parameter['in'] ?? '') !== 'query') continue;
+                    $name = (string)($parameter['name'] ?? '');
+                    if ($name !== '' && array_key_exists($name, $params)) {
+                        $queryParams[$name] = $params[$name];
+                        unset($params[$name]);
+                    }
+                }
+            }
+            if ($queryParams !== []) $url .= '?' . http_build_query($queryParams, '', '&', PHP_QUERY_RFC3986);
+            $contentType = strtolower(trim((string)($matchedEndpoint['request_body']['content_type'] ?? 'application/json')));
+            if (str_contains($contentType, ';')) $contentType = trim((string)explode(';', $contentType, 2)[0]);
+            if (!in_array($contentType, ['application/json', 'application/x-www-form-urlencoded', 'multipart/form-data'], true)) $contentType = 'application/json';
+            // cURL builds multipart boundaries itself; manually setting that
+            // header would omit the boundary and break otherwise valid APIs.
+            if ($contentType !== 'multipart/form-data') $headers['Content-Type'] = $contentType;
+            [$status, $body, $transportError] = $this->connectorCurlRequest($url, $method, $headers, $params, self::CONNECTOR_TIMEOUT, $contentType);
+            if ($transportError !== '') return ['ok' => false, 'error' => 'External connector request failed. ' . $transportError];
+            $body = mb_substr($body, 0, 50000); $data = json_decode($body, true); $safeData = is_array($data) ? $this->redactApiPayload($data) : $body;
+            if ($status >= 200 && $status < 300) {
+                $rows = $this->connectorRows(); $known = $rows[$id]['openapi']['endpoints'] ?? []; if (!is_array($known)) $known = [];
+                $seen = false; foreach ($known as $entry) if (is_array($entry) && strtoupper((string)($entry['method'] ?? '')) === $method && (string)($entry['path'] ?? '') === $path) { $seen = true; break; }
+                if (!$seen) { $known[] = ['path' => mb_substr($path, 0, 300), 'method' => $method, 'operation_id' => 'learned']; $rows[$id]['openapi'] = ['source' => $rows[$id]['openapi']['source'] ?? 'runtime', 'version' => $rows[$id]['openapi']['version'] ?? '', 'endpoints' => array_slice($known, -200), 'updated_at' => time()]; Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}'); }
+            }
+            return ['ok' => $status >= 200 && $status < 300, 'result' => ['status' => $status, 'data' => $safeData, 'connector' => $id, 'method' => $method, 'path' => $path, 'attempts' => 1]];
+        } catch (\Throwable $e) {
+            $detail = trim(preg_replace('/\s+/', ' ', $e->getMessage()));
+            return ['ok' => false, 'error' => 'External connector request failed.' . ($detail !== '' ? ' ' . mb_substr($detail, 0, 220) : '')];
+        }
+    }
+
+    /** GET adapter used by tests and read-only calls; cURL preserves HTTP
+     * status responses (401/404) instead of turning them into client errors. */
+    private function callExternalConnectorGet(string $id, string $path, string $url, array $params, array $headers, string $user): array {
+        if ($params !== []) $url .= (str_contains($url, '?') ? '&' : '?') . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+        [$status, $body, $attempts] = $this->connectorCurlGet($url, $headers, self::CONNECTOR_TIMEOUT);
+        if ($status === 0) return ['ok' => false, 'error' => 'External connector is unreachable from the Nextcloud server.'];
+        $body = mb_substr($body, 0, 50000); $data = json_decode($body, true); $safeData = is_array($data) ? $this->redactApiPayload($data) : $body;
+        if ($status >= 200 && $status < 300) {
+            $rows = $this->connectorRows(); $known = $rows[$id]['openapi']['endpoints'] ?? []; if (!is_array($known)) $known = [];
+            $seen = false; foreach ($known as $entry) if (is_array($entry) && strtoupper((string)($entry['method'] ?? '')) === 'GET' && (string)($entry['path'] ?? '') === $path) { $seen = true; break; }
+            if (!$seen) { $known[] = ['path' => mb_substr($path, 0, 300), 'method' => 'GET', 'operation_id' => 'learned']; $rows[$id]['openapi'] = ['source' => $rows[$id]['openapi']['source'] ?? 'runtime', 'version' => $rows[$id]['openapi']['version'] ?? '', 'endpoints' => array_slice($known, -200), 'updated_at' => time()]; Server::get(\OCP\IConfig::class)->setUserValue($user, AppConfig::APP, 'external_connectors', json_encode($rows, JSON_UNESCAPED_SLASHES) ?: '{}'); }
+        }
+        return ['ok' => $status >= 200 && $status < 300, 'result' => ['status' => $status, 'data' => $safeData, 'connector' => $id, 'method' => 'GET', 'path' => $path, 'attempts' => $attempts]];
+    }
+
+    private function safeConnectorUrl(string $url): bool {
+        $parts = parse_url($url); $host = strtolower((string)($parts['host'] ?? '')); $scheme = strtolower((string)($parts['scheme'] ?? ''));
+        if (!in_array($scheme, ['http', 'https'], true) || $host === '' || isset($parts['user']) || isset($parts['pass'])) return false;
+        // parse_url() retains brackets around IPv6 literals; remove them only
+        // for validation while preserving the original URL for curl.
+        $validationHost = trim($host, '[]');
+        $isIp = filter_var($validationHost, FILTER_VALIDATE_IP) !== false;
+        if (!$isIp && filter_var($validationHost, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) === false) return false;
+        $ip = $isIp ? $validationHost : gethostbyname($validationHost);
+        $isLocalName = $validationHost === 'localhost' || str_ends_with($validationHost, '.local') || str_ends_with($validationHost, '.lan');
+        $isPrivateIp = filter_var($ip, FILTER_VALIDATE_IP) !== false
+            && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false
+            && !str_starts_with($ip, '169.254.');
+        $local = $isLocalName || $isPrivateIp;
+        if ($scheme === 'http' && !$local) return false;
+        if ($local) return $isLocalName || $isPrivateIp;
+        // For hostnames gethostbyname() must resolve (the `$ip !== $host`
+        // condition); literal public IP addresses are already validated above.
+        return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
+    }
+
+    private function sameConnectorHost(string $candidate, string $base): bool {
+        $candidateParts = parse_url($candidate);
+        $baseParts = parse_url($base);
+        if (!is_array($candidateParts) || !is_array($baseParts)) return false;
+        return strtolower((string)($candidateParts['host'] ?? '')) === strtolower((string)($baseParts['host'] ?? ''))
+            && (int)($candidateParts['port'] ?? (($candidateParts['scheme'] ?? '') === 'https' ? 443 : 80)) === (int)($baseParts['port'] ?? (($baseParts['scheme'] ?? '') === 'https' ? 443 : 80));
+    }
+
+    private function expandConnectorPath(string $template, array $params): ?string {
+        $expanded = preg_replace_callback('/\{([A-Za-z0-9_.-]{1,80})\}/', static function (array $match) use ($params): string {
+            $name = $match[1];
+            if (!array_key_exists($name, $params) || is_array($params[$name]) || is_object($params[$name])) return $match[0];
+            $value = trim((string)$params[$name]);
+            return $value === '' ? $match[0] : rawurlencode($value);
+        }, $template);
+        if (!is_string($expanded) || preg_match('/\{[A-Za-z0-9_.-]{1,80}\}/', $expanded)) return null;
+        return $expanded;
+    }
+
+    private function removePathParameters(string $template, array $params): array {
+        preg_match_all('/\{([A-Za-z0-9_.-]{1,80})\}/', $template, $matches);
+        foreach (($matches[1] ?? []) as $name) unset($params[$name]);
+        return $params;
+    }
+
+    /** Validate only fields explicitly marked required by a learned schema. */
+    private function validateConnectorRequestBody(array $endpoint, array $params): ?string {
+        $body = $endpoint['request_body'] ?? null;
+        if (!is_array($body) || empty($body['required']) || !is_array($body['fields'] ?? null)) return null;
+        foreach ($body['fields'] as $field) {
+            if (!is_array($field) || empty($field['required'])) continue;
+            $name = (string)($field['name'] ?? '');
+            if ($name === '' || !array_key_exists($name, $params) || $params[$name] === '' || $params[$name] === null) {
+                return 'The discovered connector schema requires JSON field: ' . $name;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Accept both a clean path plus params and the common `/route?key=value`
+     * form emitted by models. Query values are merged without overwriting
+     * explicit structured params, so discovered-route matching always sees
+     * the actual route rather than its query string.
+     *
+     * @return array{0:string,1:array}|null
+     */
+    private function splitRequestPath(string $path, array $params): ?array {
+        if (str_contains($path, '#')) return null;
+        $question = strpos($path, '?');
+        if ($question === false) return [$path, $params];
+        $clean = substr($path, 0, $question);
+        $query = substr($path, $question + 1);
+        if ($clean === '' || strlen($query) > 4000) return null;
+        $parsed = [];
+        if ($query !== '') {
+            parse_str($query, $parsed);
+            if (!is_array($parsed)) return null;
+        }
+        foreach ($parsed as $key => $value) {
+            if (!is_string($key) || preg_match('/^[A-Za-z0-9_.-]{1,80}$/D', $key) !== 1) return null;
+            if (!array_key_exists($key, $params)) $params[$key] = $value;
+        }
+        return [$clean, $params];
+    }
+
+    /** Build connector auth headers without ever returning credential values. */
+    private function connectorAuthHeaders(string $id, array $row, string $user): array {
+        $type = (string)($row['auth_type'] ?? (!empty($row['token_configured']) ? 'bearer' : 'none'));
+        $credentials = Server::get(ProviderCredentials::class); $prefix = 'connector_' . $id;
+        try {
+            if ($type === 'basic' && !empty($row['username_configured']) && !empty($row['password_configured'])) {
+                return ['Authorization' => 'Basic ' . base64_encode($credentials->getCustomValue($user, $prefix, 'username') . ':' . $credentials->getCustomValue($user, $prefix, 'password'))];
+            }
+            if ($type === 'api_key' && !empty($row['api_key_configured'])) {
+                return [$this->normalizedApiKeyHeader($row) => $credentials->getCustomValue($user, $prefix, 'api_key')];
+            }
+            if ($type === 'bearer') {
+                if ($credentials->customValueConfigured($user, $prefix, 'token')) {
+                    return ['Authorization' => 'Bearer ' . $this->normalizeBearerToken($credentials->getCustomValue($user, $prefix, 'token'))];
+                }
+                if ($credentials->customValueConfigured($user, $prefix, 'api_key')) {
+                    return ['Authorization' => 'Bearer ' . $this->normalizeBearerToken($credentials->getCustomValue($user, $prefix, 'api_key'))];
+                }
+            }
+        } catch (\Throwable) { return []; }
+        return [];
+    }
+
+    /**
+     * Users commonly paste the complete header value ("Bearer xxx") into a
+     * token field. Do not send a malformed double prefix to TrueNAS or other
+     * RFC 6750 services; only the scheme prefix is removed, never token data.
+     */
+    private function normalizeBearerToken(string $value): string {
+        $value = trim($value);
+        return preg_replace('/^(?:Bearer|Token)\s+/i', '', $value) ?? $value;
+    }
+
+    /** Prevent an API secret accidentally being used as the header name. */
+    private function normalizedApiKeyHeader(array $row): string {
+        $header = trim((string)($row['api_key_header'] ?? 'X-API-Key'));
+        if (preg_match('/^[A-Za-z][A-Za-z0-9-]{0,59}$/D', $header) !== 1) return 'X-API-Key';
+        // Long, delimiter-free values are characteristic of pasted secrets,
+        // not HTTP header names. Recover the documented default automatically.
+        if (strlen($header) > 32 && !str_contains($header, '-')) return 'X-API-Key';
+        return $header;
+    }
+
+    private function weather(array $args): array {
+        $loc = trim((string)($args['location'] ?? ''));
+        if ($loc === '') {
+            return ['ok' => false, 'error' => 'location required'];
+        }
+        $geo = $this->httpGet('https://geocoding-api.open-meteo.com/v1/search?count=1&language=de&format=json&name=' . rawurlencode($loc));
+        if ($geo === null) {
+            return ['ok' => false, 'error' => 'Weather service unreachable.'];
+        }
+        $g = json_decode($geo, true);
+        $lat = $g['results'][0]['latitude'] ?? null;
+        $lon = $g['results'][0]['longitude'] ?? null;
+        $name = (string)($g['results'][0]['name'] ?? $loc);
+        if ($lat === null || $lon === null) {
+            return ['ok' => false, 'error' => 'Place not found: ' . $loc];
+        }
+        $f = $this->httpGet('https://api.open-meteo.com/v1/forecast?latitude=' . $lat . '&longitude=' . $lon . '&daily=temperature_2m_max,temperature_2m_min,weathercode&forecast_days=3&timezone=auto');
+        if ($f === null) {
+            return ['ok' => false, 'error' => 'Weather service unreachable.'];
+        }
+        $j = json_decode($f, true);
+        $codes = [
+            0 => 'Clear', 1 => 'Mostly clear', 2 => 'Partly cloudy', 3 => 'Overcast',
+            45 => 'Fog', 48 => 'Rime fog',
+            51 => 'Light drizzle', 53 => 'Drizzle', 55 => 'Heavy drizzle',
+            61 => 'Light rain', 63 => 'Rain', 65 => 'Heavy rain',
+            71 => 'Light snow', 73 => 'Snow', 75 => 'Heavy snow',
+            80 => 'Light showers', 81 => 'Showers', 82 => 'Heavy showers',
+            95 => 'Thunderstorm', 96 => 'Thunderstorm with hail', 99 => 'Thunderstorm with hail',
+        ];
+        $days = [];
+        foreach (($j['daily']['time'] ?? []) as $i => $day) {
+            $code = (int)($j['daily']['weathercode'][$i] ?? 0);
+            $days[] = [
+                'date' => (string)$day,
+                'forecast' => (string)($codes[$code] ?? 'Unknown'),
+                'max' => ($j['daily']['temperature_2m_max'][$i] ?? null),
+                'min' => ($j['daily']['temperature_2m_min'][$i] ?? null),
+            ];
+        }
+        return ['ok' => true, 'result' => ['location' => $name, 'days' => $days]];
+    }
+
+    private function httpGet(string $url, int $timeout = 8): ?string {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => 1,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_FOLLOWLOCATION => 1,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_USERAGENT => 'EvaAi/1.0',
+        ]);
+        $r = curl_exec($ch);
+        $err = curl_errno($ch);
+        // No curl_close(): the handle is freed automatically (PHP 8.0+) and the
+        // function is deprecated in PHP 8.5.
+        return $err === 0 && is_string($r) && $r !== '' ? $r : null;
+    }
+
+    /** @return array{0:int,1:string,2:int} */
+    private function connectorCurlGet(string $url, array $headers, int $timeout): array {
+        $lines = [];
+        foreach ($headers as $name => $value) $lines[] = $name . ': ' . $value;
+        $status = 0; $body = '';
+        for ($attempt = 1; $attempt <= self::CONNECTOR_GET_ATTEMPTS; $attempt++) {
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => $timeout, CURLOPT_CONNECTTIMEOUT => self::CONNECTOR_CONNECT_TIMEOUT, CURLOPT_FOLLOWLOCATION => false, CURLOPT_HTTPHEADER => $lines, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2]);
+            $result = curl_exec($ch); $error = curl_errno($ch); $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $body = is_string($result) ? $result : '';
+            if ($error === 0 && !in_array($status, [408, 425, 429], true) && ($status < 500 || $status >= 600)) break;
+            if ($attempt < self::CONNECTOR_GET_ATTEMPTS) usleep(100000 * $attempt);
+        }
+        return [$error === 0 ? $status : 0, $body, $attempt];
+    }
+
+    /** @return array{0:int,1:string,2:string} */
+    private function connectorCurlRequest(string $url, string $method, array $headers, array $params, int $timeout, string $contentType = 'application/json'): array {
+        $lines = [];
+        foreach ($headers as $name => $value) $lines[] = $name . ': ' . $value;
+        try {
+            $payload = match ($contentType) {
+                'application/x-www-form-urlencoded' => http_build_query($params, '', '&', PHP_QUERY_RFC3986),
+                'multipart/form-data' => $params,
+                default => json_encode($params, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+            };
+        } catch (\Throwable) {
+            return [0, '', 'Request parameters could not be encoded as JSON.'];
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => self::CONNECTOR_CONNECT_TIMEOUT,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HTTPHEADER => $lines,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_USERAGENT => 'EvaAi/1.0 connector',
+        ]);
+        $body = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $error = $errno !== 0 ? curl_error($ch) : '';
+        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        return [$errno === 0 ? $status : 0, is_string($body) ? $body : '', mb_substr($error, 0, 220)];
+    }
+}
