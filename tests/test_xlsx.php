@@ -59,5 +59,10 @@ $l = lignes($g->x("Titre\na | b\nfin"));
 verifie('ligne « a | b » isolée sans séparateur → comportement CSV inchangé', $l === [['Titre'], ['a | b'], ['fin']], json_encode($l, JSON_UNESCAPED_UNICODE));
 $l = lignes($g->x("Liste\n---\nun"));
 verifie('ligne « --- » sans « | » → pas un tableau', $l === [['Liste'], ['---'], ['un']], json_encode($l, JSON_UNESCAPED_UNICODE));
+// revue de 229ea02 : des données CSV avant un tableau ne disparaissent plus avec l'intro
+$l = lignes($g->x("Date,Montant\n2026-01-01,10\n\nLégende | Code\n---|---\nA | 1"));
+verifie('CSV avant un tableau → gardé (colonne A), tableau en colonnes', $l === [['Date,Montant'], ['2026-01-01,10'], ['Légende', 'Code'], ['A', '1']], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("Voici, comme demandé, le tableau.\n\n| a | b |\n|---|---|\n| 1 | 2 |"));
+verifie('intro avec virgules finie par « . » → écartée', $l === [['a', 'b'], ['1', '2']], json_encode($l, JSON_UNESCAPED_UNICODE));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

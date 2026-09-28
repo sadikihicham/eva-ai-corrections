@@ -129,9 +129,22 @@ class ActionExecutor {
         'create_sticker' => ['prompt'],
     ];
 
-    /** Deletions are never run on a model call alone (recette 28/09, test I.1): the user confirms each one. */
-    private function requiresDeleteConfirmation(string $name): bool {
-        return str_starts_with($name, 'delete_');
+    /**
+     * Deletions are never run on a model call alone (recette 28/09, test I.1): the user confirms each one.
+     * Covers every tool the policy marks destructive (delete_*, restore_file_version, which overwrites the current
+     * content) and an external connector called with DELETE (reachable through the call_app_api alias).
+     */
+    private function requiresDeleteConfirmation(string $name, array $args = [], ?string $risk = null): bool {
+        return str_starts_with($name, 'delete_')
+            || $risk === ToolPolicy::RISK_DESTRUCTIVE
+            || ($name === 'call_external_connector' && strtoupper(trim((string)($args['method'] ?? ''))) === 'DELETE');
+    }
+
+    /** For callers that confirm on the user's behalf (autonomous briefings): true when the call would destroy data. */
+    public function isDestructiveCall(string $name, array $args): bool {
+        if ($name === 'call_app_api' && strtoupper(trim((string)($args['method'] ?? ''))) === 'DELETE') return true;
+        $policy = $this->toolPolicy->check($name);
+        return $this->requiresDeleteConfirmation($name, $args, isset($policy['risk']) ? (string)$policy['risk'] : null);
     }
 
     /** Says what would be deleted, from the tool's required arguments (path, event_id, share_id…). */
@@ -1156,9 +1169,10 @@ class ActionExecutor {
         }
 
         // Never delete without asking (recette 28/09, test I.1: "supprime le fichier X" deleted at once, because a
-        // complete call runs directly on the web surface). Every delete_* tool asks on every surface; the dialog
-        // runs the call again through runConfirmed().
-        if (!$confirmed && $this->requiresDeleteConfirmation($name)) {
+        // complete call runs directly on the web surface). Every destructive tool asks on the web and TaskProcessing
+        // surfaces; the dialog runs the call again through runConfirmed(). Autonomous briefings call runConfirmed()
+        // themselves: RagService refuses destructive tools there (nobody is present to confirm).
+        if (!$confirmed && $this->requiresDeleteConfirmation($name, $args, isset($policy['risk']) ? (string)$policy['risk'] : null)) {
             return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
                 'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),
                 'error' => $this->deleteConfirmationMessage($name, $args)];
@@ -2112,7 +2126,10 @@ class ActionExecutor {
         $first = null;
         foreach ($rows as $k => $l) { if (str_starts_with(ltrim($l), '|')) { $first = $k; break; } }
         $markdown = $first !== null;
-        if ($markdown) $rows = array_slice($rows, $first);
+        // Only a prose intro is dropped: when a line before the table looks like data (tab, ";" or "," and not ending
+        // like a sentence), everything is kept, in column A, rather than lost silently (review of 229ea02).
+        $looksLikeData = static fn(string $l): bool => trim($l) !== '' && preg_match('/[\t;,]/', $l) === 1 && preg_match('/[:.!?]\s*$/u', $l) !== 1;
+        if ($markdown && array_filter(array_slice($rows, 0, $first), $looksLikeData) === []) $rows = array_slice($rows, $first);
         $blockRow = 0;
         // French Excel writes "a;b;c" (seen 28/09: the whole row landed in column A). Decided on the header line, quoted
         // text left out: ";" inside cells or French decimals "48,85" in the data must not choose (review of 2195949).
