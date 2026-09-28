@@ -165,17 +165,17 @@ PROMPT;
             case 'help':
                 $event->addAnswer(
                     "These are my commands:\n"
-                    . "- @Eva /help - this help\n"
-                    . "- @Eva /summarize - summarize the recent messages in this room\n"
-                    . "- @Eva /status - index and model status\n"
-                    . "- @Eva /stop - pause me for this room\n"
-                    . "- @Eva /start - activate me again for this room\n\n"
-                    . "You can also simply mention @Eva and ask your question."
+                    . "- @Infinity AI /help - this help\n"
+                    . "- @Infinity AI /summarize - summarize the recent messages in this room\n"
+                    . "- @Infinity AI /status - index and model status\n"
+                    . "- @Infinity AI /stop - pause me for this room\n"
+                    . "- @Infinity AI /start - activate me again for this room\n\n"
+                    . "You can also simply mention @Infinity AI and ask your question."
                 );
                 return;
             case 'stop':
                 $this->roomState->setEnabled($roomId, false);
-                $event->addAnswer('Okay, I am paused for this room. Say @Eva /start to activate me again.');
+                $event->addAnswer('Okay, I am paused for this room. Say @Infinity AI /start to activate me again.');
                 return;
             case 'start':
                 $this->roomState->setEnabled($roomId, true);
@@ -230,11 +230,19 @@ PROMPT;
         return trim((string)$resp['answer']);
     }
 
+    /**
+     * Names the bot answers to (renamed « Infinity AI » on 28/09): the configured trigger, « Infinity AI » and the
+     * former « Eva », so existing habits in Talk rooms keep working. A space also matches « InfinityAI » / « Infinity-AI ».
+     */
+    private function triggerPattern(): string {
+        $names = array_unique(array_filter([trim($this->appConfig->get('talk_bot_trigger')), 'Infinity AI', 'Eva'], static fn(string $n): bool => $n !== ''));
+        return implode('|', array_map(static fn(string $n): string => str_replace(' ', '[\\s_\\-]?', preg_quote($n, '/')), $names));
+    }
+
     /** Prüft, ob EVA explizit per @Mention oder Custom-Trigger angesprochen wurde. */
     private function isExplicitlyMentioned(string $content): bool {
-        $configured = $this->appConfig->get('talk_bot_trigger');
-        return $configured !== '' && preg_match(
-            '/(^|[^[:alnum:]_])@?' . preg_quote($configured, '/') . '([^[:alnum:]_]|$)/i',
+        return preg_match(
+            '/(^|[^[:alnum:]_])@?(?:' . $this->triggerPattern() . ')([^[:alnum:]_]|$)/iu',
             $content
         ) === 1;
         /* Legacy alias matching is intentionally unreachable. */
@@ -450,11 +458,7 @@ PROMPT;
      *  da dieser ggf. auf eine reale Person verweisen könnte.
      */
     private function stripMention(string $content): string {
-        $configured = $this->appConfig->get('talk_bot_trigger');
-        if ($configured === '') {
-            return trim($content);
-        }
-        return trim(preg_replace('/@?' . preg_quote($configured, '/') . '[\\s,:.\\-]*/iu', '', $content) ?? $content);
+        return trim(preg_replace('/@?(?:' . $this->triggerPattern() . ')[\\s,:.\\-]*/iu', '', $content) ?? $content);
         /* Legacy alias stripping retained below for compatibility documentation. */
         // @EVA/@eva und @CustomTrigger entfernen (nur mit @!)
         $customTrigger = $this->appConfig->get('talk_bot_trigger');
