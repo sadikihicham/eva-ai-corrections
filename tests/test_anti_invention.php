@@ -40,7 +40,7 @@ foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE', 'WRITE_AFTER_READ_NUDGE', 'PERSONAL_D
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
     'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
     'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool', 'recoverTextToolCalls', 'recoveredOverwrite',
-    'forcedCompetitionSearch', 'inventionGuard', 'personalDataKinds', 'unreadPersonalData', 'personalDataWriteGuard', 'personalDataNudge', 'weatherPlaceGuard', 'placeKey', 'asksForPlace', 'needsWriteAfterRead'];
+    'forcedCompetitionSearch', 'inventionGuard', 'personalDataKinds', 'unreadPersonalData', 'personalDataWriteGuard', 'personalDataNudge', 'weatherPlaceGuard', 'placeKey', 'asksForPlace', 'needsWriteAfterRead', 'urduHint'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -84,6 +84,7 @@ eval('class RagSousTest {
     public function finir(string $a, array $msgs = [], string $q = "bonjour"): string { return $this->finishAnswer("hicham", $q, $a, $msgs); }
     public function historique(string $c): string { return $this->stripFileLinkLines($c); }
     public function donneesPerso(string $q): array { return $this->personalDataKinds($q); }
+    public function ourdou(string $q): string { return $this->urduHint($q); }
     public function gardeEcriture(string $intention, string $outil, array $outils): ?string { return $this->inventionGuard($intention, $outil, [], $outils, []); }
     public function gardeMeteo(array $args, array $msgs, string $outil = "weather"): ?string { return $this->inventionGuard("", $outil, $args, [], $msgs); }
     ' . $corps . '
@@ -690,6 +691,36 @@ foreach (["crée une présentation powerpoint sur la sécurité", "crée un diap
 }
 foreach (["crée une carte Deck pour la réunion", "make a new Deck board", "ajoute une tâche dans Deck"] as $q) {
     verifie('pas une présentation : « ' . $q . ' »', !$t->fichier($q));
+}
+
+// Urdu pour l'écriture de fichiers (admin 28/09) : consigne seulement quand l'urdu est demandé ou écrit
+foreach (["traduis le fichier rapport_ar.docx en urdu", "translate this document into Urdu", "اس فائل کا اردو میں ترجمہ کریں", "آپ کون ہیں؟"] as $q) {
+    verifie('consigne urdu : « ' . $q . ' »', str_contains($t->ourdou($q), 'Urdu (اردو) is NOT Arabic'));
+}
+foreach (["traduis le fichier en anglais", "ما هي عاصمة الإمارات؟", "crée un fichier excel", "de quelle couleur est le ciel ?"] as $q) {
+    verifie('pas de consigne urdu : « ' . $q . ' »', $t->ourdou($q) === '');
+}
+verifie('consigne urdu : jamais écraser l\'original, pas de PDF pour l\'urdu', str_contains($t->ourdou('en urdu'), 'never overwrite the original') && str_contains($t->ourdou('en urdu'), 'A .pdf cannot hold Urdu'));
+verifie('consigne urdu : nom « Infinity AI » en lettres latines + lieux en latin pour les outils', str_contains($t->ourdou('آپ کون ہیں؟'), 'میں Infinity AI ہوں') && str_contains($t->ourdou('آپ کون ہیں؟'), 'دبئی → Dubai'));
+verifie('consigne urdu branchée dans le prompt système', str_contains($source, '. $this->urduHint($message);'));
+foreach (["traduis le fichier rapport_ar.docx en urdu", "traduire ce document en ourdou", "translate the file notes.md into Urdu", "ترجم الملف إلى الأردية", "traduis Taux_de_chômage.md en urdu"] as $q) {
+    verifie('traduction d\'un fichier = demande de fichier : « ' . $q . ' »', $t->fichier($q));
+}
+// Urdu : question météo reconnue et ville « دبئی » = Dubai (la consigne urdu fait répondre en urdu)
+verifie('question météo en urdu (موسم) reconnue', $t->meteo('کل دبئی میں موسم کیسا ہوگا؟'));
+verifie('garde météo : « دبئی » dans la question = Dubai', $t->gardeMeteo(['location' => 'Dubai'], [['role' => 'user', 'content' => 'کل دبئی میں موسم کیسا ہوگا؟']]) === null);
+verifie('garde météo : کراچی = Karachi, لاہور = Lahore', $t->gardeMeteo(['location' => 'Karachi'], [['role' => 'user', 'content' => 'کراچی میں موسم']]) === null && $t->gardeMeteo(['location' => 'Lahore'], [['role' => 'user', 'content' => 'لاہور کا موسم']]) === null);
+verifie('garde météo : ville absente toujours refusée en urdu', $t->gardeMeteo(['location' => 'Abu Dhabi'], [['role' => 'user', 'content' => 'کل موسم کیسا ہوگا؟']]) !== null);
+// Revue de d07ffe9
+verifie('consigne urdu : « ترجم الملف إلى الأردية »', str_contains($t->ourdou('ترجم الملف إلى الأردية'), 'Urdu (اردو) is NOT Arabic'));
+verifie('arabe du Golfe avec گ / چ (« دور لي على گوگل وين أحصل چاي ») → PAS de consigne urdu', $t->ourdou('دور لي على گوگل وين أحصل چاي') === '');
+verifie('« موسم الحج » (saison, arabe) → pas une question météo', !$t->meteo('متى موسم الحج؟'));
+verifie('traduction en urdu (اس فائل کا اردو میں ترجمہ کریں) = demande de fichier', $t->fichier('اس فائل کا اردو میں ترجمہ کریں'));
+foreach (["as-tu traduit le fichier ?", "traduis le document que je t'ai envoyé en anglais dans le chat", "I translated the file yesterday, summarize it", "هل ترجمة الملف صحيحة؟", "what does fichier translate to?"] as $q) {
+    verifie('pas une demande de fichier : « ' . $q . ' »', !$t->fichier($q));
+}
+foreach (["traduis « bonjour » en urdu", "comment traduire un fichier en urdu ?", "translate hello into Urdu"] as $q) {
+    verifie('pas une demande de fichier : « ' . $q . ' »', !$t->fichier($q));
 }
 
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";

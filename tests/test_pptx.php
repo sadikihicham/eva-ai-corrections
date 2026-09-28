@@ -89,6 +89,8 @@ verifie('« Titre » + « Sous-titre » → une vraie diapositive de titre (titr
 verifie('préfixes « Diapositive 2: » / « Slide 3 - » retirés des titres', str_starts_with(textes($d['slides'][1]), 'Introduction à la cybersécurité') && str_starts_with(textes($d['slides'][2]), 'Les menaces'), textes($d['slides'][1]) . ' / ' . textes($d['slides'][2]));
 $d = ouvre($g->x("## Titre de la présentation\n- a"), 'titre-normal');
 verifie('un vrai titre qui commence par « Titre » est gardé', str_starts_with(textes($d['slides'][0]), 'Titre de la présentation'));
+$d = ouvre($g->x("## مثالیں\n- یہ ایک مثال ہے"), 'ourdou');
+verifie('texte urdu : lang="ur-PK" (arabe : ar-AE)', str_contains($d['slides'][0], 'lang="ur-PK"') && !str_contains($d['slides'][0], 'lang="ar-AE"'));
 verifie('câblage : create_file .pptx, convert_file pptx, plus refusé', str_contains($source, "=== 'pptx') {\n            try { \$content = \$this->buildPptx(") && str_contains($source, "CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'pptx'") && !preg_match("~noTextBuilder = \[[^\]]*'pptx'~", $source));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
