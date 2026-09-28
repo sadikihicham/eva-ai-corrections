@@ -45,7 +45,9 @@ after(() => { for (const w of fenetres) { try { w.close(); } catch (e) { /* déj
  * Monte une page. options :
  *  meta (URL ou null), corps (HTML), lang, dir, securise, micro ('ok'|'refus'),
  *  whisper(url, init, n) → réponse simulée pour les POST, dispo (bool) pour GET /, sansMediaRecorder,
- *  stockage ('ok'|'casse'), langueVoix (valeur pré-mémorisée)
+ *  stockage ('ok'|'casse'), drapeauTest (défaut true : pose window.__EVA_DICTEE_TEST__ avant chargement),
+ *  startLeve (MediaRecorder.start lève), decodeEchoue (decodeAudioData rejette), duree (s, défaut 0,5),
+ *  oc (objet OC simulé, défaut uid alice), nextcloud(url, init) → réponse au PUT, session {clé: valeur}
  */
 async function monter(o = {}) {
   const journalConsole = [];
@@ -55,13 +57,18 @@ async function monter(o = {}) {
   const html = `<!DOCTYPE html><html lang="${o.lang || 'fr'}" dir="${o.dir || 'ltr'}"><head>
     <meta name="requesttoken" content="JETON-NEXTCLOUD">
     ${meta === null ? '' : `<meta name="eva-ai-dictation" content="${meta}">`}
-    </head><body>${o.corps || FORM_MAIN}</body></html>`;
+    </head><body>${o.metaCorps ? `<meta name="eva-ai-dictation" content="${o.metaCorps}">` : ''}${o.corps || FORM_MAIN}</body></html>`;
   const dom = new JSDOM(html, { url: 'https://nc.test/workspace/apps/eva_ai/', runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: vc });
   const w = dom.window;
   fenetres.push(w);
   const appels = [];
   const etat = { dispo: o.dispo !== undefined ? o.dispo : true, nPost: 0 };
+  const appelsNc = [];
   w.fetch = async (url, init = {}) => {
+    if (!String(url).startsWith('http://localhost:8178/')) {
+      appelsNc.push({ url: String(url), init });
+      return o.nextcloud ? o.nextcloud(String(url), init) : reponse(200, {});
+    }
     appels.push({ url: String(url), init });
     if ((init.method || 'GET') === 'GET') {
       if (etat.dispo === 'rejet' || etat.dispo === false) throw new TypeError('Failed to fetch');
@@ -81,10 +88,11 @@ async function monter(o = {}) {
       },
     },
   });
+  const argsStart = [];
   if (!o.sansMediaRecorder) {
     w.MediaRecorder = class {
       constructor() { this.state = 'inactive'; this.mimeType = 'audio/webm'; }
-      start() { this.state = 'recording'; }
+      start(...a) { argsStart.push(a); if (o.startLeve) throw new Error('NotSupportedError'); this.state = 'recording'; }
       stop() {
         if (this.state === 'inactive') throw new Error('InvalidStateError');
         this.state = 'inactive';
@@ -92,7 +100,7 @@ async function monter(o = {}) {
       }
     };
   }
-  w.AudioContext = class { decodeAudioData() { return Promise.resolve({ duration: 0.5 }); } close() { return Promise.resolve(); } };
+  w.AudioContext = class { decodeAudioData() { return o.decodeEchoue ? Promise.reject(new Error('EncodingError')) : Promise.resolve({ duration: o.duree || 0.5 }); } close() { return Promise.resolve(); } };
   w.OfflineAudioContext = class {
     constructor(canaux, longueur, frequence) { this.longueur = longueur; this.frequence = frequence; this.destination = {}; }
     createBufferSource() { return { connect() {}, start() {} }; }
@@ -100,19 +108,23 @@ async function monter(o = {}) {
   };
   if (o.stockage === 'casse') {
     Object.defineProperty(w, 'localStorage', { configurable: true, get() { throw new Error('SecurityError'); } });
-  } else if (o.langueVoix) {
-    w.localStorage.setItem('eva_ai.dictee.langueVoix', o.langueVoix);
   }
+  if (o.drapeauTest !== false) w.__EVA_DICTEE_TEST__ = true;
+  w.OC = o.oc !== undefined ? o.oc : { webroot: '/workspace', requestToken: 'JETON-OC', getCurrentUser: () => ({ uid: 'alice' }) };
+  for (const [k, v] of Object.entries(o.session || {})) w.sessionStorage.setItem(k, v);
   let soumissions = 0;
   w.document.addEventListener('submit', (e) => { soumissions++; e.preventDefault(); }, true);
   w.eval(CODE);
+  const recharges = [];
+  if (w.EvaDictee.__test__) w.EvaDictee.__test__.definirRecharger(() => recharges.push(1));
   await pause();
   return {
-    dom, w, d: w.document, appels, etat, journalConsole, pistesArretees,
+    dom, w, d: w.document, appels, appelsNc, recharges, etat, journalConsole, pistesArretees, argsStart,
     soumissions: () => soumissions,
     boutons: () => w.document.querySelectorAll('.eva-dictee__micro'),
     bouton: () => w.document.querySelector('.eva-dictee__micro'),
     msg: () => (w.document.querySelector('.eva-dictee-msg') || {}).textContent || '',
+    compteur: () => w.document.querySelector('.eva-dictee__compteur'),
     posts: () => appels.filter((a) => (a.init.method || 'GET') === 'POST'),
     fermer: () => w.close(),
   };
@@ -125,7 +137,7 @@ async function dicter(p) {
   p.bouton().click();
   await attendre(() => p.bouton() && p.bouton().dataset.etat === 'repos');
 }
-const champs = (appel) => Object.fromEntries([...appel.init.body.entries()].map(([k, v]) => [k, typeof v === 'string' ? v : v]));
+const champs = (appel) => Object.fromEntries([...appel.init.body.entries()].map(([k, v]) => [k, v]));
 
 // ------------------------------------------------------------------------------------------------
 
@@ -159,7 +171,9 @@ test('sans meta eva-ai-dictation : aucun appel réseau, aucun bouton', async () 
 });
 
 test('meta vers un hôte non local : fonction éteinte, aucun appel', async () => {
-  for (const meta of ['http://192.168.1.50:8178/v1', 'http://localhost.evil.test/v1', 'http://user:pw@localhost:8178/v1', 'ftp://localhost/v1']) {
+  for (const meta of ['http://192.168.1.50:8178/v1', 'http://localhost.evil.test/v1', 'http://user:pw@localhost:8178/v1', 'ftp://localhost/v1',
+    'http://[::1]:8178/v1', 'http://0x7f.0.0.1:8178/v1', 'http://2130706433:8178/v1', '/v1', 'javascript:alert(1)',
+    'http://localhost:8178@evil.test/v1', 'http://127.0.0.1.evil.test/v1']) {
     const p = await monter({ meta });
     await pause(30);
     assert.equal(p.appels.length, 0, meta);
@@ -174,12 +188,15 @@ test('Whisper local joignable : GET <origine>/ sans cookie ni jeton, bouton uniq
   const get = p.appels[0];
   assert.equal(get.url, 'http://localhost:8178/');
   assert.equal(get.init.credentials, 'omit');
+  assert.equal(get.init.redirect, 'error');
+  assert.equal(get.init.referrerPolicy, 'no-referrer');
   assert.ok(!get.init.headers || !JSON.stringify(get.init.headers).includes('JETON'), 'aucun jeton Nextcloud');
   const envoi = p.d.querySelector('form.chatform button[type="submit"]');
   assert.equal(envoi.previousElementSibling.className, 'eva-dictee');
   assert.equal(p.bouton().type, 'button', 'ne doit jamais soumettre le formulaire');
-  assert.equal(p.bouton().getAttribute('aria-pressed'), 'false');
+  assert.equal(p.bouton().hasAttribute('aria-pressed'), false, 'un seul mécanisme : le libellé change');
   assert.equal(p.bouton().getAttribute('aria-label'), 'Dicter');
+  assert.equal(p.d.querySelector('.eva-dictee select, .eva-dictee__langue'), null, 'plus de menu de langue');
   // Re-vérifications répétées : toujours un seul bouton.
   await p.w.EvaDictee.__test__.verifierStatut();
   await p.w.EvaDictee.__test__.verifierStatut();
@@ -231,6 +248,8 @@ test('dictée « Auto », langue reconnue : un seul POST local, texte au curseur
   assert.equal(posts.length, 1);
   assert.equal(posts[0].url, 'http://localhost:8178/v1/audio/transcriptions');
   assert.equal(posts[0].init.credentials, 'omit');
+  assert.equal(posts[0].init.redirect, 'error');
+  assert.equal(posts[0].init.referrerPolicy, 'no-referrer');
   assert.ok(!posts[0].init.headers, 'aucun en-tête (ni requesttoken ni OCS)');
   const f = champs(posts[0]);
   assert.equal(f.response_format, 'verbose_json');
@@ -270,29 +289,7 @@ test('Auto, langue détectée hors {fr, ar, en} : UN seul 2e appel avec la langu
   q.fermer();
 });
 
-test('choix manuel de la langue : mémorisé, un seul appel avec language', async () => {
-  const p = await monter();
-  await attendre(() => p.bouton());
-  const sel = p.d.querySelector('.eva-dictee__langue');
-  assert.equal(sel.value, 'auto', 'Auto par défaut');
-  assert.deepEqual([...sel.options].map((o) => o.value), ['auto', 'fr', 'ar', 'en']);
-  sel.value = 'ar';
-  sel.dispatchEvent(new p.w.Event('change'));
-  assert.equal(p.w.localStorage.getItem('eva_ai.dictee.langueVoix'), 'ar');
-  await dicter(p);
-  assert.equal(p.posts().length, 1);
-  assert.equal(champs(p.posts()[0]).language, 'ar');
-  p.fermer();
-
-  const q = await monter({ langueVoix: 'en', whisper: () => reponse(200, { text: 'hi', language: 'icelandic' }) });
-  await attendre(() => q.bouton());
-  assert.equal(q.d.querySelector('.eva-dictee__langue').value, 'en', 'relu depuis localStorage');
-  await dicter(q);
-  assert.equal(q.posts().length, 1, 'manuel : pas de 2e appel même si la réponse annonce une autre langue');
-  q.fermer();
-});
-
-test('localStorage inaccessible : la dictée marche quand même (Auto)', async () => {
+test('localStorage inaccessible : sans effet, la dictée marche', async () => {
   const p = await monter({ stockage: 'casse' });
   await attendre(() => p.bouton());
   await dicter(p);
@@ -303,24 +300,26 @@ test('localStorage inaccessible : la dictée marche quand même (Auto)', async (
 
 test('messages d’erreur distincts : injoignable, 413, 400, 500, [BLANK_AUDIO]', async () => {
   const cas = [
+    { o: { decodeEchoue: true }, attendu: 'Enregistrement illisible. Réessayez.' },
     { w: () => { throw new TypeError('Failed to fetch'); }, attendu: 'Service de dictée injoignable sur cet ordinateur.' },
     { w: () => reponse(413, {}), attendu: 'Enregistrement trop long : raccourcissez-le.' },
-    { w: () => reponse(400, {}), attendu: 'Enregistrement illisible. Réessayez.' },
+    { w: () => reponse(400, {}), attendu: 'Enregistrement illisible. Réessayez.', memeTexte: true },
     { w: () => reponse(500, {}), attendu: 'La transcription a échoué. Réessayez.' },
     { w: () => reponse(200, { text: '[BLANK_AUDIO]', language: 'french' }), attendu: 'Rien d’audible n’a été entendu.' },
   ];
   const vus = new Set();
   for (const c of cas) {
-    const p = await monter({ whisper: c.w });
+    const p = await monter(Object.assign({ whisper: c.w }, c.o || {}));
     await attendre(() => p.bouton());
     await dicter(p);
     assert.equal(p.msg(), c.attendu);
     assert.equal(p.d.querySelector('.eva-dictee-msg').dataset.erreur, '1');
     assert.equal(p.d.getElementById('chatinput').value, '', 'rien inséré');
-    vus.add(p.msg());
+    if (c.o) assert.equal(p.posts().length, 0, 'décodage raté : rien envoyé');
+    if (!c.memeTexte) vus.add(p.msg());
     p.fermer();
   }
-  assert.equal(vus.size, cas.length);
+  assert.equal(vus.size, cas.length - 1, 'messages distincts (400 et décodage raté partagent « illisible »)');
 });
 
 test('Échap pendant l’enregistrement : annule, aucun envoi, rien inséré', async () => {
@@ -328,15 +327,17 @@ test('Échap pendant l’enregistrement : annule, aucun envoi, rien inséré', a
   await attendre(() => p.bouton());
   p.bouton().click();
   await attendre(() => p.bouton().dataset.etat === 'enregistrement');
-  assert.equal(p.bouton().getAttribute('aria-pressed'), 'true');
+  assert.equal(p.bouton().getAttribute('aria-label'), 'Arrêter et transcrire');
   assert.equal(p.d.querySelector('.eva-dictee__annuler').hidden, false);
-  assert.match(p.msg(), /^● 0:00 \/ 2:00$/);
+  assert.equal(p.compteur().getAttribute('aria-hidden'), 'true');
+  assert.match(p.compteur().textContent, /^● 0:00 \/ 2:00$/);
+  assert.equal(p.msg(), 'Enregistrement en cours. Échap pour annuler.');
   p.d.dispatchEvent(new p.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   await attendre(() => p.bouton().dataset.etat === 'repos');
   await pause(30);
   assert.equal(p.posts().length, 0);
   assert.equal(p.d.getElementById('chatinput').value, '');
-  assert.equal(p.bouton().getAttribute('aria-pressed'), 'false');
+  assert.equal(p.bouton().getAttribute('aria-label'), 'Dicter');
   p.fermer();
 });
 
@@ -383,7 +384,6 @@ test('textes et RTL : arabe et ourdou, styles en propriétés logiques', async (
   const p = await monter({ lang: 'ar', dir: 'rtl' });
   await attendre(() => p.bouton());
   assert.equal(p.bouton().getAttribute('aria-label'), 'إملاء');
-  assert.equal(p.d.querySelector('.eva-dictee__langue').getAttribute('aria-label'), 'لغة الصوت');
   const css = p.d.getElementById('eva-dictee-styles').textContent;
   assert.ok(!/(margin|padding)-(left|right)|(^|[^-])(left|right)\s*:/.test(css), 'pas de gauche/droite physiques');
   p.fermer();
@@ -423,10 +423,10 @@ test('segments recollés sans séparateur (mot coupé entre deux segments), repl
   await dicter(p);
   assert.equal(p.d.getElementById('chatinput').value, 'مرحبا الربا');
   p.fermer();
-  const q = await monter({ langueVoix: 'ar', whisper: () => reponse(200, { text: ' مرحبا ال\nربا', language: 'arabic' }) });
+  const q = await monter({ lang: 'ar', whisper: (u, i, n) => reponse(200, n === 1 ? { text: 'x', language: 'icelandic' } : { text: ' مرحبا ال\nربا', language: 'arabic' }) });
   await attendre(() => q.bouton());
   await dicter(q);
-  assert.equal(champs(q.posts()[0]).response_format, 'verbose_json', 'verbose_json même en choix manuel');
+  assert.equal(champs(q.posts()[1]).response_format, 'verbose_json', 'verbose_json même au 2e appel');
   assert.equal(q.d.getElementById('chatinput').value, 'مرحبا الربا');
   q.fermer();
   const r = await monter({ whisper: () => reponse(200, { text: 'x', language: 'french', segments: [{ text: ' Bonjour' }, { text: '  tout   le' }, { text: ' monde. ' }] }) });
@@ -450,5 +450,281 @@ test('seule la saisie est remplacée (formulaire conservé) : toujours un seul b
   }
   await dicter(p);
   assert.equal(p.d.getElementById('chatinput').value, TEXTE_SECRET);
+  p.fermer();
+});
+
+// ------------------------------------------------------------------ correctifs après revue adverse
+const reconstruire = async (p) => {
+  const vue = p.d.getElementById('vue');
+  vue.innerHTML = ''; await pause(5);
+  vue.innerHTML = FORM_MAIN.replace(/^<div id="vue">|<\/div>$/g, '');
+  await pause(10);
+};
+const bloquant = (init) => new Promise((res, rej) => {
+  const s = init.signal;
+  if (!s) return; // sans signal : ne se termine jamais (le test échouera sur l'attente)
+  s.addEventListener('abort', () => rej(new DOMException('abort', 'AbortError')));
+});
+
+test('B2 : re-rendu + Whisper perdu PENDANT l’enregistrement : bouton toujours là, arrêt possible, pistes coupées', async () => {
+  const p = await monter();
+  await attendre(() => p.bouton());
+  p.bouton().click();
+  await attendre(() => p.bouton().dataset.etat === 'enregistrement');
+  p.etat.dispo = false;
+  await p.w.EvaDictee.__test__.verifierStatut();
+  await reconstruire(p);
+  assert.equal(p.boutons().length, 1, 'bouton ré-attaché pendant l’enregistrement');
+  assert.equal(p.bouton().dataset.etat, 'enregistrement');
+  p.bouton().click();
+  await attendre(() => p.w.EvaDictee.__test__.etat() === 'repos');
+  assert.ok(p.pistesArretees.length >= 1, 'pistes coupées');
+  assert.equal(p.d.getElementById('chatinput').value, '', 'I1 : conversation changée, rien inséré');
+  assert.equal(p.msg(), 'Dictée annulée : vous avez changé de conversation.');
+  p.fermer();
+});
+
+test('I1 : re-rendu PENDANT la transcription : bouton présent, pas d’insertion dans la nouvelle conversation', async () => {
+  let lib; const bloque = new Promise((r) => { lib = r; });
+  const p = await monter({ whisper: async () => { await bloque; return reponse(200, { text: 'texte de A', language: 'french' }); } });
+  await attendre(() => p.bouton());
+  p.bouton().click(); await attendre(() => p.bouton().dataset.etat === 'enregistrement');
+  p.bouton().click(); await attendre(() => p.posts().length === 1);
+  await reconstruire(p);
+  assert.equal(p.boutons().length, 1);
+  assert.equal(p.bouton().dataset.etat, 'envoi');
+  lib();
+  await attendre(() => p.w.EvaDictee.__test__.etat() === 'repos');
+  assert.equal(p.d.getElementById('chatinput').value, '');
+  assert.equal(p.msg(), 'Dictée annulée : vous avez changé de conversation.');
+  p.fermer();
+});
+
+test('I4 : Échap pendant l’envoi interrompt fetch ; Annuler interrompt le 2e appel du repli', async () => {
+  const p = await monter({ whisper: (u, init) => bloquant(init) });
+  await attendre(() => p.bouton());
+  p.bouton().click(); await attendre(() => p.bouton().dataset.etat === 'enregistrement');
+  p.bouton().click(); await attendre(() => p.posts().length === 1);
+  assert.equal(p.d.querySelector('.eva-dictee__annuler').hidden, false, 'Annuler visible pendant l’envoi');
+  p.d.dispatchEvent(new p.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await attendre(() => p.w.EvaDictee.__test__.etat() === 'repos');
+  assert.equal(p.posts()[0].init.signal.aborted, true, 'fetch interrompu');
+  assert.equal(p.d.getElementById('chatinput').value, '');
+  assert.equal(p.msg(), 'Dictée annulée.');
+  p.fermer();
+
+  const q = await monter({ whisper: (u, init, n) => (n === 1 ? reponse(200, { text: 'x', language: 'icelandic' }) : bloquant(init)) });
+  await attendre(() => q.bouton());
+  q.bouton().click(); await attendre(() => q.bouton().dataset.etat === 'enregistrement');
+  q.bouton().click(); await attendre(() => q.posts().length === 2);
+  q.d.querySelector('.eva-dictee__annuler').click();
+  await attendre(() => q.w.EvaDictee.__test__.etat() === 'repos');
+  assert.equal(q.posts()[1].init.signal.aborted, true, '2e appel interrompu');
+  assert.equal(q.d.getElementById('chatinput').value, '');
+  q.fermer();
+});
+
+test('I3/I5 : rec.start() sans timeslice ; start qui lève ⇒ pistes coupées, retour au repos', async () => {
+  const p = await monter();
+  await attendre(() => p.bouton());
+  await dicter(p);
+  assert.deepEqual(p.argsStart[0], [], 'start() sans timeslice');
+  p.fermer();
+  const q = await monter({ startLeve: true });
+  await attendre(() => q.bouton());
+  q.bouton().click();
+  await attendre(() => q.msg() !== '');
+  assert.equal(q.w.EvaDictee.__test__.etat(), 'repos');
+  assert.ok(q.pistesArretees.length >= 1, 'pistes coupées');
+  assert.equal(q.msg(), 'Ce navigateur ne permet pas la dictée.');
+  q.fermer();
+});
+
+test('I2 : compteur hors zone aria-live ; annonce à 1:45 ; aucune annonce par seconde', async () => {
+  const p = await monter();
+  await attendre(() => p.bouton());
+  p.bouton().click(); await attendre(() => p.bouton().dataset.etat === 'enregistrement');
+  const zoneLive = p.d.querySelector('.eva-dictee-msg');
+  assert.equal(zoneLive.getAttribute('aria-live'), 'polite');
+  assert.equal(zoneLive.contains(p.compteur()), false);
+  let n = 0; new p.w.MutationObserver(() => n++).observe(zoneLive, { childList: true, characterData: true, subtree: true });
+  await pause(1100);
+  assert.equal(n, 0, 'la zone aria-live ne bouge pas chaque seconde');
+  const vrai = p.w.Date.now.bind(p.w.Date);
+  p.w.Date.now = () => vrai() + 105000;
+  await attendre(() => p.msg() === 'Plus que 15 secondes.');
+  assert.match(p.compteur().textContent, /^● 1:4[5-7] \/ 2:00$/, '≈ 1:45 (+ ~1 s réel déjà écoulé)');
+  p.d.dispatchEvent(new p.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await attendre(() => p.w.EvaDictee.__test__.etat() === 'repos');
+  p.fermer();
+});
+
+test('silence : [BLANK_AUDIO] avec langue exotique ⇒ un seul appel, rien inséré', async () => {
+  const p = await monter({ whisper: () => reponse(200, { text: ' [BLANK_AUDIO]', language: 'icelandic' }) });
+  await attendre(() => p.bouton());
+  await dicter(p);
+  assert.equal(p.posts().length, 1);
+  assert.equal(p.msg(), 'Rien d’audible n’a été entendu.');
+  p.fermer();
+});
+
+test('repli : indice = DERNIÈRE langue correctement détectée (avant la langue de l’interface)', async () => {
+  const reps = [{ text: 'مرحبا', language: 'arabic' }, { text: 'x', language: 'icelandic' }, { text: 'نص', language: 'arabic' }];
+  const p = await monter({ lang: 'fr', whisper: (u, i, n) => reponse(200, reps[n - 1]) });
+  await attendre(() => p.bouton());
+  await dicter(p);
+  await dicter(p);
+  assert.equal(p.posts().length, 3);
+  assert.equal(champs(p.posts()[2]).language, 'ar', 'dernière langue détectée (ar) et non l’interface (fr)');
+  p.fermer();
+});
+
+test('événement eva-dictee:langue sans texte + dir posé sur la zone (rtl pour ar, ltr sinon)', async () => {
+  const reps = [{ text: 'مرحبا', language: 'arabic' }, { text: 'Bonjour', language: 'french' }];
+  const p = await monter({ whisper: (u, i, n) => reponse(200, reps[n - 1]) });
+  await attendre(() => p.bouton());
+  const recus = [];
+  p.d.addEventListener('eva-dictee:langue', (e) => recus.push(e.detail));
+  await dicter(p);
+  assert.deepEqual(JSON.parse(JSON.stringify(recus)), [{ langue: 'ar' }]);
+  assert.equal(p.d.getElementById('chatinput').getAttribute('dir'), 'rtl');
+  await dicter(p);
+  assert.deepEqual(JSON.parse(JSON.stringify(recus[1])), { langue: 'fr' });
+  assert.equal(p.d.getElementById('chatinput').getAttribute('dir'), 'ltr');
+  assert.ok(!JSON.stringify(recus).includes('مرحبا'), 'jamais le texte dans l’événement');
+  p.fermer();
+});
+
+test('meta : seule celle du <head> au chargement compte (ajout dans le body ou modification ultérieure ignorés)', async () => {
+  const p = await monter({ meta: null, metaCorps: URL_LOCALE });
+  await pause(40);
+  assert.equal(p.appels.length, 0, 'meta dans le body ignorée');
+  p.fermer();
+  const q = await monter();
+  await attendre(() => q.bouton());
+  q.d.querySelector('meta[name="eva-ai-dictation"]').setAttribute('content', 'http://localhost:9999/v1');
+  await dicter(q);
+  await q.w.EvaDictee.__test__.verifierStatut();
+  assert.ok(q.appels.every((a) => a.url.startsWith('http://localhost:8178/')), 'URL figée au chargement');
+  q.fermer();
+});
+
+test('M-1 : sans drapeau de test, EvaDictee n’expose ni transport ni internes, et est gelé', async () => {
+  const p = await monter({ drapeauTest: false });
+  await attendre(() => p.bouton());
+  const api = p.w.EvaDictee;
+  assert.deepEqual(Object.keys(api), ['version']);
+  assert.equal(api.definirTransport, undefined);
+  assert.equal(api.__test__, undefined);
+  assert.equal(Object.isFrozen(api), true);
+  p.fermer();
+});
+
+test('retour sur l’onglet (visibilitychange) : disponibilité revérifiée', async () => {
+  const p = await monter();
+  await attendre(() => p.bouton());
+  p.etat.dispo = false;
+  const avant = p.appels.length;
+  p.d.dispatchEvent(new p.w.Event('visibilitychange'));
+  await attendre(() => p.boutons().length === 0);
+  assert.ok(p.appels.length > avant);
+  p.fermer();
+});
+
+// ------------------------------------------------------------------ bascule de langue de l'interface
+// Forme RÉELLE de whisper-server 1.9.4 (mesurée le 28/09) : probabilités indexées par code.
+const AR_SUR = { text: 'مرحبا بكم', language: 'arabic', detected_language: 'arabic', detected_language_probability: 0.93, language_probabilities: { ar: 0.93, fa: 0.03 } };
+
+test('bascule : toutes conditions réunies ⇒ texte inséré, PUT OCS (langue seule), puis rechargement', async () => {
+  const p = await monter({ lang: 'fr', duree: 3, whisper: () => reponse(200, AR_SUR) });
+  await attendre(() => p.bouton());
+  p.d.getElementById('chatinput').value = 'Note :';
+  p.d.getElementById('chatinput').selectionStart = p.d.getElementById('chatinput').selectionEnd = 6;
+  await dicter(p);
+  await attendre(() => p.recharges.length === 1);
+  assert.equal(p.d.getElementById('chatinput').value, 'Note : مرحبا بكم', 'texte inséré AVANT la bascule');
+  assert.equal(p.appelsNc.length, 1, 'un seul appel vers Nextcloud');
+  const put = p.appelsNc[0];
+  assert.equal(put.url, '/workspace/ocs/v2.php/cloud/users/alice');
+  assert.equal(put.init.method, 'PUT');
+  assert.equal(put.init.credentials, 'same-origin');
+  assert.equal(put.init.headers['OCS-APIRequest'], 'true');
+  assert.equal(put.init.headers.requesttoken, 'JETON-NEXTCLOUD', 'meta requesttoken prioritaire');
+  assert.equal(put.init.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.equal(put.init.body, 'key=language&value=ar', 'le corps ne contient que la langue');
+  assert.ok(!JSON.stringify(put).includes('مرحبا'), 'jamais le texte dicté vers Nextcloud');
+  const sauve = JSON.parse(p.w.sessionStorage.getItem('eva-dictee-restaurer'));
+  assert.equal(sauve.texte, 'Note : مرحبا بكم');
+  assert.equal(sauve.curseur, 'Note : مرحبا بكم'.length);
+  p.fermer();
+});
+
+test('bascule : jamais si probabilité < 0,8 / absente, audio < 2 s, même langue, repli utilisé, < 30 s', async () => {
+  const cas = [
+    { nom: 'prob 0,7', o: { duree: 3, whisper: () => reponse(200, { ...AR_SUR, detected_language_probability: 0.7, language_probabilities: { ar: 0.7 } }) } },
+    { nom: 'prob absente', o: { duree: 3, whisper: () => reponse(200, { text: 'مرحبا', language: 'arabic' }) } },
+    { nom: 'audio 1,5 s', o: { duree: 1.5, whisper: () => reponse(200, AR_SUR) } },
+    { nom: 'même langue', o: { lang: 'ar', duree: 3, whisper: () => reponse(200, AR_SUR) } },
+    { nom: 'repli utilisé', o: { duree: 3, whisper: (u, i, n) => reponse(200, n === 1 ? { text: 'x', language: 'icelandic', language_probabilities: { icelandic: 0.9 } } : AR_SUR) } },
+    { nom: '< 30 s', o: { duree: 3, session: { 'eva-dictee-derniere-bascule': String(Date.now() - 10000) }, whisper: () => reponse(200, AR_SUR) } },
+  ];
+  for (const c of cas) {
+    const p = await monter(c.o);
+    await attendre(() => p.bouton());
+    await dicter(p);
+    await pause(20);
+    assert.equal(p.appelsNc.length, 0, c.nom);
+    assert.equal(p.recharges.length, 0, c.nom);
+    assert.ok(p.d.getElementById('chatinput').value.length > 0, c.nom + ' : texte inséré quand même');
+    assert.equal(p.w.sessionStorage.getItem('eva-dictee-restaurer'), null, c.nom);
+    p.fermer();
+  }
+});
+
+test('bascule refusée par Nextcloud (500) : pas de rechargement, message discret, texte conservé', async () => {
+  const p = await monter({ duree: 3, whisper: () => reponse(200, AR_SUR), nextcloud: () => reponse(500, {}) });
+  await attendre(() => p.bouton());
+  await dicter(p);
+  await attendre(() => p.msg() !== '');
+  assert.equal(p.recharges.length, 0);
+  assert.equal(p.msg(), 'Impossible de changer la langue de l’interface.');
+  assert.equal(p.d.getElementById('chatinput').value, 'مرحبا بكم');
+  assert.equal(p.w.sessionStorage.getItem('eva-dictee-restaurer'), null, 'rien à restaurer');
+  p.fermer();
+});
+
+test('restauration après rechargement : texte et curseur remis dès que la zone apparaît, clé supprimée ; clé expirée ignorée', async () => {
+  const cle = 'eva-dictee-restaurer';
+  const val = JSON.stringify({ texte: 'Note : مرحبا بكم', curseur: 4, t: Date.now() - 10000, langue: 'ar' });
+  const p = await monter({ lang: 'ar', corps: '<div id="vue"></div>', session: { [cle]: val } });
+  await pause(20);
+  assert.equal(p.w.sessionStorage.getItem(cle), null, 'clé supprimée');
+  p.d.getElementById('vue').innerHTML = FORM_MAIN.replace(/^<div id="vue">|<\/div>$/g, '');
+  await attendre(() => p.d.getElementById('chatinput') && p.d.getElementById('chatinput').value !== '');
+  const z = p.d.getElementById('chatinput');
+  assert.equal(z.value, 'Note : مرحبا بكم');
+  assert.equal(z.selectionStart, 4);
+  assert.equal(z.getAttribute('dir'), 'rtl');
+  p.fermer();
+
+  const q = await monter({ session: { [cle]: JSON.stringify({ texte: 'vieux', curseur: 0, t: Date.now() - 180000 }) } });
+  await attendre(() => q.bouton());
+  assert.equal(q.d.getElementById('chatinput').value, '', 'clé expirée : rien restauré');
+  assert.equal(q.w.sessionStorage.getItem(cle), null, 'clé expirée supprimée');
+  q.fermer();
+});
+
+test('bascule : un transport qui signale repli=true n’entraîne jamais de bascule, même probabilité haute', async () => {
+  const p = await monter({ duree: 3 });
+  await attendre(() => p.bouton());
+  await p.w.EvaDictee.definirTransport({
+    disponible: async () => true,
+    transcrire: async () => ({ text: 'مرحبا', language: 'ar', probabilite: 0.99, repli: true }),
+  });
+  await dicter(p);
+  await pause(20);
+  assert.equal(p.appelsNc.length, 0);
+  assert.equal(p.recharges.length, 0);
+  assert.equal(p.d.getElementById('chatinput').value, 'مرحبا');
   p.fermer();
 });
