@@ -76,6 +76,7 @@ class ActionExecutor {
         // Files / notes
         'create_file' => ['path', 'content'],
         'create_files' => ['files'],
+        'convert_file' => ['path', 'target_format'],
         'create_note' => ['title', 'content'],
         'create_folder' => ['path'],
         'rename_file' => ['path', 'new_name'],
@@ -217,6 +218,15 @@ class ActionExecutor {
                     'content' => ['type' => 'string', 'description' => 'Full UTF-8 text content.'],
                     'content_base64' => ['type' => 'string', 'description' => 'Optional strict base64-encoded binary content (mutually exclusive with content).'],
                 ], 'required' => ['path']],
+            ]],
+            ['type' => 'function', 'function' => [
+                'name' => 'convert_file',
+                'description' => 'Convert a document into another format: PDF to Word (docx), Word to PDF, Excel to PDF, Markdown or text to PDF/Word, PDF to text… Use this for any "convert / transform / export X to Y" request. The TEXT is kept (layout, images and fonts are not). The new file is written next to the source with the new extension, unless target_path is given. .doc is written as .docx.',
+                'parameters' => ['type' => 'object', 'properties' => [
+                    'path' => ['type' => 'string', 'description' => 'The file to convert, relative to the home folder, e.g. "Documents/Report.pdf".'],
+                    'target_format' => ['type' => 'string', 'enum' => self::CONVERT_TARGETS, 'description' => 'The format to produce.'],
+                    'target_path' => ['type' => 'string', 'description' => 'Optional name of the new file, e.g. "Documents/Report.docx".'],
+                ], 'required' => ['path', 'target_format']],
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_files',
@@ -1120,7 +1130,7 @@ class ActionExecutor {
         }
 
         $fileTools = [
-            'list_files', 'create_file', 'create_files', 'create_note', 'create_folder',
+            'list_files', 'create_file', 'create_files', 'convert_file', 'create_note', 'create_folder',
             'rename_file', 'move_file', 'copy_file', 'file_checksum', 'delete_file', 'read_file', 'read_files', 'inspect_file', 'search_files',
             'extract_file_text', 'create_sticker',
             'update_knowledge',
@@ -1129,11 +1139,20 @@ class ActionExecutor {
             return ['ok' => false, 'error' => 'File tools are not available in the background worker (CLI). Ask in the web chat instead.'];
         }
 
+        // Never replace an existing file silently (admin, 28/09): on the web surface a complete create_file runs at
+        // once, and create_file overwrites. The user confirms in the dialog, which runs the call again confirmed.
+        if (!$confirmed && $home !== null && ($existing = $this->existingWriteTargets($home, $name, $args)) !== []) {
+            return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
+                'risk' => ToolPolicy::RISK_MUTATING, 'existing' => $existing,
+                'error' => 'The file ' . implode(', ', $existing) . ' already exists and would be replaced: the user is asked to confirm. '
+                    . 'If they would rather keep it, write to a new file name.'];
+        }
         try {
             $result = match ($name) {
                 'list_files' => $this->listFiles($home, $args),
                 'create_file' => $this->createFile($home, $args),
                 'create_files' => $this->createFiles($home, $args),
+                'convert_file' => $this->convertFile($home, $args),
                 'create_note' => $this->createNote($home, $args),
                 'create_folder' => $this->createFolder($home, $args),
                 'rename_file' => $this->renameFile($home, $args),
@@ -2589,6 +2608,120 @@ class ActionExecutor {
     }
 
     /** @return array{ok:true,result:array} */
+    /** Formats whose text is read through the indexer (extract_file_text), never as raw bytes. */
+    private const EXTRACTED_FORMATS = ['pdf', 'docx', 'docm', 'dotx', 'xlsx', 'xlsm', 'xltx', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'rtf', 'doc', 'xls', 'ppt'];
+    /** Indexer::extractTextForAgent() cuts the extracted text at this length without saying so. */
+    private const INDEXER_MAX_CHARS = 100000;
+    /** Formats convert_file can write (the create_file generators). */
+    private const CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'md', 'txt'];
+
+    /**
+     * The existing files a write would replace (create_file, create_files, convert_file), relative to home.
+     * @return list<string>
+     */
+    private function existingWriteTargets(Folder $home, string $name, array $args): array {
+        $paths = match ($name) {
+            'create_file' => [(string)($args['path'] ?? '')],
+            'create_files' => array_map(static fn($f): string => is_array($f) ? (string)($f['path'] ?? '') : '', is_array($args['files'] ?? null) ? $args['files'] : []),
+            'convert_file' => [$this->convertTargetPath($args) ?? ''],
+            // Same path as createNote(): notes folder + title with ".md" (review of d889ebd: a note was replaced silently).
+            'create_note' => [trim((string)($args['title'] ?? '')) === '' ? '' : self::NOTES_FOLDER . '/'
+                . $this->cleanName(str_ends_with(strtolower(trim((string)$args['title'])), '.md') ? trim((string)$args['title']) : trim((string)$args['title']) . '.md')],
+            default => [],
+        };
+        $existing = [];
+        foreach ($paths as $path) {
+            $path = $this->cleanPath($path);
+            try {
+                if ($path !== '' && $home->nodeExists($path) && $home->get($path) instanceof File) {
+                    $existing[] = $path;
+                }
+            } catch (\Throwable) {
+            }
+        }
+        return array_values(array_unique($existing));
+    }
+
+    /** Target of convert_file: target_path, else the source path with the new extension (same folder). */
+    private function convertTargetPath(array $args): ?string {
+        $format = strtolower(ltrim(trim((string)($args['target_format'] ?? '')), '.'));
+        $format = ['doc' => 'docx', 'word' => 'docx', 'excel' => 'xlsx', 'xls' => 'xlsx', 'markdown' => 'md', 'text' => 'txt'][$format] ?? $format;
+        if (!in_array($format, self::CONVERT_TARGETS, true)) {
+            return null;
+        }
+        // target_path, else the source path; its extension is always the requested format (review of d889ebd:
+        // target_format pdf + target_path "x.docx" wrote a DOCX).
+        $given = trim((string)($args['target_path'] ?? ''));
+        // "Documents/" names a folder: the source file name goes inside it (not "Documents.pdf" at the root).
+        if ($given !== '' && str_ends_with($given, '/')) {
+            $source = $this->cleanPath((string)($args['path'] ?? ''));
+            $given = $given . substr($source, (int)strrpos('/' . $source, '/'));
+        }
+        $target = $this->cleanPath($given ?: (string)($args['path'] ?? ''));
+        if ($target === '') {
+            return null;
+        }
+        $dot = strrpos($target, '.');
+        $slash = strrpos($target, '/');
+        return ($dot !== false && ($slash === false || $dot > $slash) ? substr($target, 0, $dot) : $target) . '.' . $format;
+    }
+
+    /**
+     * Convert a document to another format (admin, 28/09: "pdf to doc et doc to pdf"). The model kept inventing a
+     * "convert_file" tool: it now exists. The TEXT of the source is extracted (PDF, Word, Excel, OpenDocument,
+     * Markdown, text) and written by the create_file generators (PDF, DOCX, XLSX, MD, TXT): layout, images and
+     * fonts are not kept. A scanned PDF has no text while OCR is off: said plainly, nothing is written.
+     */
+    private function convertFile(Folder $home, array $args): array {
+        $source = $this->cleanPath((string)($args['path'] ?? ''));
+        if ($source === '') {
+            return ['ok' => false, 'error' => 'path (the file to convert) is required'];
+        }
+        $target = $this->convertTargetPath($args);
+        if ($target === null) {
+            return ['ok' => false, 'error' => 'target_format must be one of: ' . implode(', ', self::CONVERT_TARGETS) . ' (a .doc is written as .docx).'];
+        }
+        if ($target === $source) {
+            return ['ok' => false, 'error' => 'The converted file must have a different name or format than the source.'];
+        }
+        $node = $this->resolve($home, $source);
+        if (!$node instanceof File) {
+            return ['ok' => false, 'error' => 'Not a file: ' . $source];
+        }
+        $ext = strtolower(pathinfo($source, PATHINFO_EXTENSION));
+        if (in_array($ext, self::EXTRACTED_FORMATS, true)) {
+            $read = $this->extractFileText($home, ['path' => $source, 'max_chars' => self::MAX_READ_CHUNK_CHARS]);
+            if (empty($read['ok'])) {
+                return $read;
+            }
+            $text = (string)($read['result']['content'] ?? '');
+            // The indexer cuts the extracted text at 100 000 characters without saying so (Indexer::extractTextForAgent):
+            // at that length the source may be longer, and a truncated conversion must never be reported as done.
+            if (!empty($read['result']['has_more']) || (int)($read['result']['total_chars'] ?? 0) >= self::INDEXER_MAX_CHARS) {
+                return ['ok' => false, 'error' => 'The source is too long to convert in one step (more than ' . self::MAX_READ_CHUNK_CHARS . ' characters). Nothing was written.'];
+            }
+        } else {
+            if ($node->getSize() > self::MAX_READ_FILE_BYTES) {
+                return ['ok' => false, 'error' => 'File too large to convert'];
+            }
+            $text = (string)$node->getContent();
+            if (strpos($text, "\0") !== false) {
+                return ['ok' => false, 'error' => 'This file type cannot be converted (no readable text). Nothing was written.'];
+            }
+        }
+        // Page markers of a PDF ("[Page 1]" from OCR, the " 1/1" footer of EVA's PDFs) are not content. PDF only: a line
+        // "12/20" in a Markdown or text file is content (review of d889ebd).
+        $text = trim($ext === 'pdf' ? (string)preg_replace(['/^\[Page \d+\]\s*$/mu', '/^\s*\d+\s*\/\s*\d+\s*$/mu'], '', $text) : $text);
+        if ($text === '') {
+            return ['ok' => false, 'error' => 'No text could be read from ' . $source . ' (a scanned PDF needs OCR, which is not enabled). Nothing was written.'];
+        }
+        $res = $this->createFile($home, ['path' => $target, 'content' => $text]);
+        if (!empty($res['ok'])) {
+            $res['result'] = (string)$res['result'] . ' (converted from ' . $source . ': text only — layout, images and fonts are not kept)';
+        }
+        return $res;
+    }
+
     private function readFile(Folder $home, array $args): array {
         $path = $this->cleanPath((string)($args['path'] ?? ''));
         if ($path === '') {
@@ -2600,6 +2733,11 @@ class ActionExecutor {
         }
         if ($node->getSize() > self::MAX_READ_FILE_BYTES) {
             return ['ok' => false, 'error' => 'File too large to read'];
+        }
+        // A PDF / Office file read as raw bytes is useless to the model (seen 28/09: "%PDF-1.4 …", then "the file is
+        // binary, I cannot"): its text is returned instead, as extract_file_text does.
+        if (in_array(strtolower(pathinfo($path, PATHINFO_EXTENSION)), self::EXTRACTED_FORMATS, true)) {
+            return $this->extractFileText($home, $args);
         }
         $content = (string)$node->getContent();
         if (strpos($content, "\0") !== false) {
