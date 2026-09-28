@@ -703,7 +703,7 @@ foreach (["traduis le fichier rapport_ar.docx en urdu", "translate this document
 foreach (["traduis le fichier en anglais", "ما هي عاصمة الإمارات؟", "crée un fichier excel", "de quelle couleur est le ciel ?"] as $q) {
     verifie('pas de consigne urdu : « ' . $q . ' »', $t->ourdou($q) === '');
 }
-verifie('consigne urdu : jamais écraser l\'original, pas de PDF pour l\'urdu', str_contains($t->ourdou('en urdu'), 'never overwrite the original') && str_contains($t->ourdou('en urdu'), 'A .pdf cannot hold Urdu'));
+verifie('consigne urdu : jamais écraser l\'original, PDF ourdou possible (via Office)', str_contains($t->ourdou('en urdu'), 'never overwrite the original') && str_contains($t->ourdou('en urdu'), 'A .pdf in Urdu is possible'));
 verifie('consigne urdu : nom « Infinity AI » en lettres latines + lieux en latin pour les outils', str_contains($t->ourdou('آپ کون ہیں؟'), 'میں Infinity AI ہوں') && str_contains($t->ourdou('آپ کون ہیں؟'), 'دبئی → Dubai'));
 verifie('consigne urdu branchée dans le prompt système', str_contains($source, '. $this->urduHint($message);'));
 foreach (["traduis le fichier rapport_ar.docx en urdu", "traduire ce document en ourdou", "translate the file notes.md into Urdu", "ترجم الملف إلى الأردية", "traduis Taux_de_chômage.md en urdu"] as $q) {
