@@ -18,6 +18,10 @@ SSH=(ssh -o UserKnownHostsFile="$HOME/.ssh/known_hosts_workspace4" -o StrictHost
 DOCKER='cd /home/ubuntu/docker && sudo docker compose --env-file .env exec -T'
 RACINE=/var/www/html/custom_apps/eva_ai
 REFERENCE=${REFERENCE:-8da7ef9}   # = production 4fe6752 (28/09 12:08) + instantané app/ ; surchargeable : REFERENCE=<sha> bash …
+# Fichiers de production versionnés APRÈS coup (absents de REFERENCE) : leur état attendu est la copie lue en production.
+COPIES_PROD=${COPIES_PROD:-fdb4562}   # routes, AppConfig, PageController, Application, ProviderCredentials (eva_ai 1.16.96, 28/09)
+# Tout autre fichier absent des deux = NOUVEAU : il doit être absent de la production (sinon arrêt, rien n'est écrasé) ;
+# il est noté dans <sauvegarde>/NOUVEAUX avec son empreinte, et le retour arrière le retire.
 h() { shasum -a 256 | cut -c1-64; }
 r() { "${SSH[@]}" "$@" </dev/null; }
 
@@ -36,14 +40,27 @@ git fetch -q origin
 echo "   dépôt et hôte OK — version déployée : $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD)), référence : $REFERENCE"
 
 echo "1) contrôle de dérive : la production doit être identique à $REFERENCE"
-MANQUE=$(for f in "${DEPOT[@]}"; do git cat-file -e "$REFERENCE:$f" 2>/dev/null || echo "$f"; done)
-[ -z "$MANQUE" ] || { echo "$MANQUE" | head -5; echo "ARRET : fichier(s) absent(s) de $REFERENCE — rien n'a été modifié"; exit 1; }
-ATTENDU=$(for i in "${!DEPOT[@]}"; do echo "$(git show "$REFERENCE:${DEPOT[$i]}" | h)  ${CIBLE[$i]}"; done)
-REEL=$(printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && xargs -d \"\\n\" sha256sum'") || true   # un absent : le diff le dit
+git cat-file -e "$COPIES_PROD^{commit}" 2>/dev/null || { echo "ARRET : COPIES_PROD=$COPIES_PROD introuvable dans le dépôt"; exit 1; }
+EXISTANTS=(); ATTENDU=''; NOUVEAUX=()
+for i in "${!DEPOT[@]}"; do
+  if git cat-file -e "$REFERENCE:${DEPOT[$i]}" 2>/dev/null; then ref=$REFERENCE
+  elif git cat-file -e "$COPIES_PROD:${DEPOT[$i]}" 2>/dev/null; then ref=$COPIES_PROD
+  else NOUVEAUX+=("${CIBLE[$i]}"); continue; fi
+  EXISTANTS+=("${CIBLE[$i]}")
+  ATTENDU+="$(git show "$ref:${DEPOT[$i]}" | h)  ${CIBLE[$i]}"$'\n'
+done
+ATTENDU=${ATTENDU%$'\n'}
+REEL=$(printf '%s\n' "${EXISTANTS[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && xargs -d \"\\n\" sha256sum'") || true   # un absent : le diff le dit
 ECARTS=$(diff <(sort -k2 <<< "$ATTENDU") <(sort -k2 <<< "$REEL") || true)
-[ -z "$ECARTS" ] || { echo "$ECARTS" | head -10; echo "ARRET : la production a changé depuis $REFERENCE — rien n'a été modifié"; exit 1; }
-echo "   $N fichiers identiques"
-NONINSCR=$(printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER -u www-data app sh -c 'cd $RACINE && while read -r f; do [ -w \"\$f\" ] && [ -w \"\$(dirname \"\$f\")\" ] || echo \"\$f\"; done'")
+[ -z "$ECARTS" ] || { echo "$ECARTS" | head -10; echo "ARRET : la production a changé depuis $REFERENCE/$COPIES_PROD — rien n'a été modifié"; exit 1; }
+echo "   ${#EXISTANTS[@]} fichiers identiques"
+if [ ${#NOUVEAUX[@]} -gt 0 ]; then
+  DEJA=$(printf '%s\n' "${NOUVEAUX[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && while read -r f; do [ ! -e \"\$f\" ] || echo \"\$f\"; done'")
+  [ -z "$DEJA" ] || { echo "$DEJA" | head -5; echo "ARRET : fichier(s) « nouveau(x) » déjà présent(s) en production — rien n'a été modifié"; exit 1; }
+  echo "   ${#NOUVEAUX[@]} nouveaux fichiers, absents de la production : $(printf '%s ' "${NOUVEAUX[@]}")"
+fi
+# Existant : fichier ET dossier inscriptibles ; nouveau : dossier existant et inscriptible.
+NONINSCR=$(printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER -u www-data app sh -c 'cd $RACINE && while read -r f; do { [ ! -e \"\$f\" ] || [ -w \"\$f\" ]; } && [ -w \"\$(dirname \"\$f\")\" ] || echo \"\$f\"; done'")
 [ -z "$NONINSCR" ] || { echo "$NONINSCR" | head -5; echo "ARRET : non inscriptible(s) par www-data — rien n'a été modifié"; exit 1; }
 echo "   tous inscriptibles par www-data"
 [ "${ESSAI:-0}" = 1 ] && { echo "ESSAI=1 : arrêt avant toute écriture."; exit 0; }
@@ -51,12 +68,18 @@ echo "   tous inscriptibles par www-data"
 echo "2) sauvegarde des fichiers de production"
 B=/srv/sauvegarde-eva_ai/avant-eva-$(date +%Y%m%d-%H%M%S)
 r "sudo mkdir -m 700 $B"
-printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && tar cf - -T -' | sudo tar xf - -C $B"
+printf '%s\n' "${EXISTANTS[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && tar cf - -T -' | sudo tar xf - -C $B"
 # Dossier en 700 root : tout se fait sous sudo, cd compris (échec du 28/09 06:38 : « cd: Permission denied »).
-printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "sudo sh -c 'cd $B && xargs -d \"\\n\" sha256sum > EMPREINTES && echo $REFERENCE > REFERENCE'"
+printf '%s\n' "${EXISTANTS[@]}" | "${SSH[@]}" "sudo sh -c 'cd $B && xargs -d \"\\n\" sha256sum > EMPREINTES && echo $REFERENCE > REFERENCE'"
 SAUVE=$(r "sudo cat $B/EMPREINTES")
 [ -z "$(diff <(sort -k2 <<< "$ATTENDU") <(sort -k2 <<< "$SAUVE") || true)" ] || { echo "ARRET : sauvegarde incomplète dans $B — rien n'a été modifié"; exit 1; }
-echo "   $B ($N fichiers + EMPREINTES, vérifiés)"
+if [ ${#NOUVEAUX[@]} -gt 0 ]; then
+  # Empreinte de la version déployée : le retour arrière ne retire un nouveau fichier que s'il n'a pas changé depuis.
+  NOUV_EMP=$(for i in "${!DEPOT[@]}"; do for c in "${NOUVEAUX[@]}"; do if [ "$c" = "${CIBLE[$i]}" ]; then echo "$(h < "${DEPOT[$i]}")  $c"; fi; done; done)
+  printf '%s\n' "$NOUV_EMP" | "${SSH[@]}" "sudo sh -c 'cat > $B/NOUVEAUX'"
+  [ "$(r "sudo cat $B/NOUVEAUX")" = "$NOUV_EMP" ] || { echo "ARRET : liste NOUVEAUX mal écrite dans $B — rien n'a été modifié"; exit 1; }
+fi
+echo "   $B (${#EXISTANTS[@]} fichiers + EMPREINTES, ${#NOUVEAUX[@]} nouveaux dans NOUVEAUX, vérifiés)"
 trap 'echo; echo "ÉCHEC après la sauvegarde — retour arrière : bash deploiement/retour-arriere-eva.sh $B"' ERR
 
 echo "3) dépôt des nouveaux fichiers en temporaire, puis contrôle"
