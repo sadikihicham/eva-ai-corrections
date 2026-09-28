@@ -241,7 +241,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_file',
-                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table) and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
+                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table), .pptx (a PowerPoint deck: each # or ## heading starts a new slide, then - bullets, **bold**, | tables |; a short first section becomes the title slide; write REAL titles, never labels such as "Slide 1: Title" or "Subtitle" — e.g. "# Cybersecurity at work\nA shared priority\n\n## Main threats\n- Phishing\n- Ransomware\n\n## Good practices\n- …") and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'path' => ['type' => 'string', 'description' => 'Relative path from the home folder, e.g. "Documents/Plan.md" or "Report.txt".'],
                     'content' => ['type' => 'string', 'description' => 'Full UTF-8 text content.'],
@@ -2003,10 +2003,10 @@ class ActionExecutor {
         // now has its own generator, buildPdf). Refuse clearly so the model offers
         // a format it can really produce.
         $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-        $noTextBuilder = ['doc', 'docm', 'xls', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'];
+        $noTextBuilder = ['doc', 'docm', 'xls', 'xlsm', 'ppt', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'];
         if (!$binary && in_array($ext, $noTextBuilder, true)) {
             return ['ok' => false, 'error' => 'Infinity AI cannot generate .' . $ext . ' files: nothing was created. '
-                . 'Tell the user, and offer a .pdf, .docx, .xlsx, .md or .txt file instead (Infinity AI generates these correctly).'];
+                . 'Tell the user, and offer a .pdf, .docx, .xlsx, .pptx, .md or .txt file instead (Infinity AI generates these correctly).'];
         }
         // Bytes passed in content_base64 must really be of the announced type: a model
         // asked for a PDF can otherwise base64-encode plain text and write a corrupt file.
@@ -2017,7 +2017,7 @@ class ActionExecutor {
         if ($binary && isset($signatures[$ext])) {
             $matches = array_filter($signatures[$ext], static fn(string $sig): bool => str_starts_with($content, $sig));
             if ($matches === []) {
-                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; pass the text in content instead (Infinity AI generates .pdf, .docx and .xlsx from text), or offer a .md or .txt file.'];
+                return ['ok' => false, 'error' => 'The content_base64 bytes are not a valid .' . $ext . ' file: nothing was created. Do not encode text as .' . $ext . '; pass the text in content instead (Infinity AI generates .pdf, .docx, .xlsx and .pptx from text), or offer a .md or .txt file.'];
             }
         }
         $warning = [];
@@ -2038,6 +2038,9 @@ class ActionExecutor {
         }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'docx') {
             try { $content = $this->buildDocx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'DOCX generation is unavailable on this server: ' . $e->getMessage()]; }
+        }
+        if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'pptx') {
+            try { $content = $this->buildPptx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'PPTX generation is unavailable on this server: ' . $e->getMessage()]; }
         }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'xlsx') {
             try { $content = $this->buildXlsx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'XLSX generation is unavailable on this server: ' . $e->getMessage()]; }
@@ -2181,6 +2184,255 @@ class ActionExecutor {
         $zip->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Infinity AI" sheetId="1" r:id="rId1"/></sheets></workbook>');
         $zip->addFromString('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
         $zip->addFromString('xl/worksheets/sheet1.xml', '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' . $sheet . '</sheetData></worksheet>');
+        $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
+    }
+
+    /**
+     * Build a PowerPoint deck (.pptx, 16:9) from simple Markdown, in pure PHP (ZipArchive), like buildDocx/buildXlsx
+     * (demande admin 28/09 : « Je ne peux pas créer directement un fichier PowerPoint »). A heading (#, ##, ###) or a
+     * "---" line starts a slide; a short first slide becomes the title slide; "- " / "* " / "1. " lines are bullets
+     * (two spaces = one level), **bold** is kept, a | table | becomes a real table; more than 7 lines continue on a
+     * "(suite)" slide instead of overflowing. Arabic paragraphs are right-to-left. Colours come from one palette
+     * ($pal), the only thing a branded version changes. Self-contained (closures only): tests/test_pptx.php extracts it.
+     */
+    private function buildPptx(string $text): string {
+        if (!class_exists(\ZipArchive::class)) throw new \RuntimeException('PHP ZipArchive extension is required');
+        $pal = ['dk1' => '1B2430', 'lt1' => 'FFFFFF', 'dk2' => '0B1F3A', 'lt2' => 'F4F7FB', 'accent1' => '1E6FFF', 'accent2' => '00B3A6',
+            'accent3' => 'F5A524', 'accent4' => '7C5CFF', 'accent5' => 'E5484D', 'accent6' => '6B7A90', 'hlink' => '1E6FFF', 'folHlink' => '7C5CFF'];
+        $W = 12192000; $H = 6858000; $emu = 914400;
+        $esc = static fn(string $v): string => htmlspecialchars((string)preg_replace(['/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '/[\x{FFFE}\x{FFFF}]/u'], '', $v), ENT_XML1 | ENT_COMPAT | ENT_SUBSTITUTE, 'UTF-8');
+        $isRtl = static fn(string $v): bool => preg_match('/\p{Arabic}|\p{Hebrew}/u', $v) === 1;
+        // One paragraph's runs, with **bold** kept.
+        $runs = static function (string $v, int $size, bool $bold, string $color) use ($esc, $isRtl): string {
+            $out = ''; $lang = $isRtl($v) ? 'ar-AE' : 'fr-FR';
+            foreach (preg_split('/(\*\*[^*]+\*\*)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [$v] as $part) {
+                $b = $bold || (str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4);
+                $t = $b && str_starts_with($part, '**') ? substr($part, 2, -2) : $part;
+                $out .= '<a:r><a:rPr lang="' . $lang . '" sz="' . $size . '"' . ($b ? ' b="1"' : '') . ' dirty="0"><a:solidFill><a:srgbClr val="' . $color . '"/></a:solidFill>'
+                    . '<a:latin typeface="Calibri"/><a:cs typeface="Arial"/></a:rPr><a:t>' . $esc($t) . '</a:t></a:r>';
+            }
+            return $out === '' ? '<a:endParaRPr lang="fr-FR" sz="' . $size . '"/>' : $out;
+        };
+        $para = static function (string $v, int $size, bool $bold, string $color, string $align = 'l', int $level = -1, bool $numbered = false) use ($runs, $isRtl, $pal): string {
+            $rtl = $isRtl($v);
+            $algn = $rtl ? ($align === 'ctr' ? 'ctr' : 'r') : $align;
+            $ppr = '<a:pPr algn="' . $algn . '"' . ($rtl ? ' rtl="1"' : '');
+            if ($level >= 0) {
+                $ppr .= ' marL="' . (342900 + $level * 457200) . '" lvl="' . min($level, 4) . '" indent="-342900"><a:spcBef><a:spcPts val="600"/></a:spcBef>'
+                    . '<a:buClr><a:srgbClr val="' . $pal['accent1'] . '"/></a:buClr>'
+                    . ($numbered ? '<a:buFont typeface="+mj-lt"/><a:buAutoNum type="arabicPeriod"/>' : '<a:buFont typeface="Arial"/><a:buChar char="' . ($level === 0 ? '•' : '–') . '"/>') . '</a:pPr>';
+            } else {
+                $ppr .= '><a:spcBef><a:spcPts val="600"/></a:spcBef><a:buNone/></a:pPr>';
+            }
+            return '<a:p>' . $ppr . $runs($v, $size, $bold, $color) . '</a:p>';
+        };
+        $id = 1;
+        $box = static function (string $name, int $x, int $y, int $w, int $h, string $paras, string $anchor = 't') use (&$id): string {
+            $id++;
+            return '<p:sp><p:nvSpPr><p:cNvPr id="' . $id . '" name="' . $name . '"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
+                . '<p:spPr><a:xfrm><a:off x="' . $x . '" y="' . $y . '"/><a:ext cx="' . $w . '" cy="' . $h . '"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>'
+                . '<p:txBody><a:bodyPr wrap="square" lIns="91440" tIns="45720" rIns="91440" bIns="45720" anchor="' . $anchor . '"><a:normAutofit/></a:bodyPr><a:lstStyle/>' . $paras . '</p:txBody></p:sp>';
+        };
+        $rect = static function (string $name, int $x, int $y, int $w, int $h, string $color) use (&$id): string {
+            $id++;
+            return '<p:sp><p:nvSpPr><p:cNvPr id="' . $id . '" name="' . $name . '"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="' . $x . '" y="' . $y . '"/>'
+                . '<a:ext cx="' . $w . '" cy="' . $h . '"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="' . $color . '"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>';
+        };
+        $table = static function (array $rows, int $x, int $y, int $w) use (&$id, $esc, $pal, $isRtl): string {
+            $cols = max(array_map('count', $rows)); $colW = intdiv($w, max(1, $cols)); $rowH = 411480;
+            $id++;
+            $xml = '<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="' . $id . '" name="Tableau ' . $id . '"/><p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr>'
+                . '<p:xfrm><a:off x="' . $x . '" y="' . $y . '"/><a:ext cx="' . ($colW * $cols) . '" cy="' . ($rowH * count($rows)) . '"/></p:xfrm>'
+                . '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table"><a:tbl><a:tblPr firstRow="1" bandRow="1"/><a:tblGrid>'
+                . str_repeat('<a:gridCol w="' . $colW . '"/>', $cols) . '</a:tblGrid>';
+            foreach ($rows as $r => $cells) {
+                $xml .= '<a:tr h="' . $rowH . '">';
+                for ($c = 0; $c < $cols; $c++) {
+                    $v = (string)($cells[$c] ?? ''); $head = $r === 0;
+                    $v = (string)preg_replace('/^\*\*(.*)\*\*$/s', '$1', $v);
+                    $xml .= '<a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:pPr' . ($isRtl($v) ? ' algn="r" rtl="1"' : '') . '/><a:r><a:rPr lang="fr-FR" sz="1600"' . ($head ? ' b="1"' : '') . ' dirty="0">'
+                        . '<a:solidFill><a:srgbClr val="' . ($head ? $pal['lt1'] : $pal['dk1']) . '"/></a:solidFill><a:latin typeface="Calibri"/><a:cs typeface="Arial"/></a:rPr><a:t>' . $esc($v) . '</a:t></a:r></a:p></a:txBody>'
+                        . '<a:tcPr marL="91440" marR="91440" marT="45720" marB="45720" anchor="ctr">'
+                        . '<a:lnL w="6350"><a:solidFill><a:srgbClr val="D5DCE6"/></a:solidFill></a:lnL><a:lnR w="6350"><a:solidFill><a:srgbClr val="D5DCE6"/></a:solidFill></a:lnR>'
+                        . '<a:lnT w="6350"><a:solidFill><a:srgbClr val="D5DCE6"/></a:solidFill></a:lnT><a:lnB w="6350"><a:solidFill><a:srgbClr val="D5DCE6"/></a:solidFill></a:lnB>'
+                        . '<a:solidFill><a:srgbClr val="' . ($head ? $pal['dk2'] : ($r % 2 === 0 ? $pal['lt2'] : $pal['lt1'])) . '"/></a:solidFill></a:tcPr></a:tc>';
+                }
+                $xml .= '</a:tr>';
+            }
+            return $xml . '</a:tbl></a:graphicData></a:graphic></p:graphicFrame>';
+        };
+
+        // ---- 1. Markdown -> slides: [title, [items]] ; item = ['p'|'b'|'n', level, text] or ['t', rows]
+        $lines = preg_split('/\R/u', trim(str_replace("\t", '    ', $text)));
+        if ($lines === false) throw new \RuntimeException('invalid UTF-8 text');
+        $slides = []; $cur = null; $inCode = false;
+        $push = static function (?array $s) use (&$slides): void { if ($s !== null && ($s[0] !== '' || $s[1] !== [])) $slides[] = $s; };
+        foreach ($lines as $raw) {
+            $line = rtrim($raw);
+            if (preg_match('/^\s*```/', $line)) { $inCode = !$inCode; continue; }
+            if (!$inCode && preg_match('/^\s{0,3}(#{1,3})\s+(.+?)\s*#*$/u', $line, $m)) { $push($cur); $cur = [trim($m[2]), [], strlen($m[1])]; continue; }
+            if (!$inCode && preg_match('/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/', $line)) { $push($cur); $cur = ['', [], 0]; continue; }
+            $cur ??= ['', [], 0];
+            if (trim($line) === '') continue;
+            if (!$inCode && preg_match('/^\s*\|(.+)\|\s*$/u', $line, $m)) {
+                $cells = array_map('trim', preg_split('/(?<!\\\\)\|/', $m[1]) ?: [$m[1]]);
+                if (array_filter($cells, static fn(string $c): bool => preg_match('/^:?-{2,}:?$/', $c) !== 1) === []) continue;   // |---|---|
+                $last = count($cur[1]) - 1;
+                if ($last >= 0 && $cur[1][$last][0] === 't') { $cur[1][$last][1][] = $cells; } else { $cur[1][] = ['t', [$cells]]; }
+                continue;
+            }
+            if (!$inCode && preg_match('/^(\s*)([-*+•]|\d+[.)])\s+(.+)$/u', $line, $m)) {
+                $cur[1][] = [ctype_digit(rtrim($m[2], '.)')) ? 'n' : 'b', min(4, intdiv(strlen($m[1]), 2)), trim($m[3])];
+                continue;
+            }
+            $cur[1][] = ['p', -1, trim($line)];
+        }
+        $push($cur);
+        if ($slides === []) $slides[] = ['Présentation', [], 1];
+        // Models write structure labels as titles (prod 28/09: "## Diapositive 1: Titre", "## Sous-titre", "## Diapositive 2:
+        // Introduction…"): the "Diapositive N :" prefix goes, a "Titre" slide becomes the real title slide (its first line
+        // is the title) and a "Sous-titre" slide right after it becomes its subtitle.
+        $unbold = static fn(string $v): string => trim((string)preg_replace('/^\*\*(.*)\*\*$/s', '$1', trim($v)));
+        foreach ($slides as $k => $sl) {
+            $t = trim((string)preg_replace('/^(?:diapositive|diapo|slide|folie|شريحة)\s*\d+\s*(?:[:.\-–—]\s*|$)/iu', '', $sl[0]));
+            if (preg_match('/^(?:titre(?:\s+principal)?|page\s+de\s+titre|title(?:\s+slide)?|titel|عنوان)$/iu', $t) === 1 && ($sl[1][0][0] ?? '') === 'p') {
+                $t = $unbold($sl[1][0][2]); array_shift($sl[1]); $sl[2] = 1;
+            }
+            $sl[0] = $t; $slides[$k] = $sl;
+        }
+        if (count($slides) > 1 && $slides[0][2] === 1 && preg_match('/^(?:sous-titre|subtitle|untertitel|عنوان\s+فرعي)$/iu', $slides[1][0]) === 1
+            && array_filter($slides[1][1], static fn(array $it): bool => $it[0] !== 'p') === []) {
+            foreach ($slides[1][1] as $it) $slides[0][1][] = ['p', -1, $unbold($it[2])];
+            array_splice($slides, 1, 1);
+        }
+        // Too long: at most 7 lines per slide (a paragraph counts one line per ~75 characters, a table 3 plus one per
+        // row over 3; a table longer than 10 data rows is cut, its header repeated), the rest on "(suite)" slides.
+        $split = [];
+        foreach ($slides as [$title, $items, $level]) {
+            $cut = [];
+            foreach ($items as $it) {
+                if ($it[0] !== 't' || count($it[1]) <= 11) { $cut[] = $it; continue; }
+                foreach (array_chunk(array_slice($it[1], 1), 10) as $rows) $cut[] = ['t', array_merge([$it[1][0]], $rows)];
+            }
+            $chunk = []; $weight = 0; $part = 0;
+            foreach ($cut as $it) {
+                $w = $it[0] === 't' ? 3 + max(0, count($it[1]) - 3) : max(1, (int)ceil(mb_strlen($it[2]) / 75));
+                if ($chunk !== [] && $weight + $w > 7) { $split[] = [$part++ === 0 ? $title : ($title !== '' ? $title . ' (suite)' : ''), $chunk, $level]; $chunk = []; $weight = 0; }
+                $chunk[] = $it; $weight += $w;
+            }
+            $split[] = [$part === 0 ? $title : ($title !== '' ? $title . ' (suite)' : ''), $chunk, $level];
+        }
+        // A deck no viewer can use (100 000 characters of "# a" = 25 000 slides): at most 200, the cut is said on the last one.
+        if (count($split) > 200) {
+            $dropped = count($split) - 199;
+            $split = array_merge(array_slice($split, 0, 199), [['…', [['p', -1, $dropped . ' diapositive(s) non incluse(s) : présentation limitée à 200 diapositives.']], 2]]);
+        }
+        $slides = $split;
+
+        // ---- 2. slide XML
+        $ns = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
+        $slideXml = [];
+        foreach ($slides as $i => [$title, $items, $level]) {
+            $id = 1; $shapes = '';
+            $plain = array_filter($items, static fn(array $it): bool => $it[0] === 'p');
+            // Title slide: a first "# " heading with at most two plain lines (a "## Objectifs" with bullets stays a content slide).
+            if ($i === 0 && $title !== '' && $level === 1 && count($items) <= 2 && count($plain) === count($items)) {
+                // Title slide: dark band, big title, subtitle lines.
+                $shapes .= $rect('Fond', 0, 0, $W, $H, $pal['dk2']) . $rect('Accent', $isRtl($title) ? $W - (int)($emu * 2.5) : (int)($emu * 0.9), (int)($emu * 4.35), (int)($emu * 1.6), 60000, $pal['accent2']);
+                $shapes .= $box('Titre', (int)($emu * 0.9), (int)($emu * 1.9), (int)($emu * 11.5), (int)($emu * 2.3), $para($title, 4400, true, $pal['lt1']), 'b');
+                $sub = implode('', array_map(static fn(array $it): string => $para($it[2], 2200, false, 'C9D6EA'), $items));
+                if ($sub !== '') $shapes .= $box('Sous-titre', (int)($emu * 0.9), (int)($emu * 4.55), (int)($emu * 11.5), (int)($emu * 1.6), $sub);
+            } else {
+                $top = (int)($emu * 0.35);
+                if ($title !== '') {
+                    $shapes .= $box('Titre', (int)($emu * 0.6), $top, (int)($emu * 12.1), (int)($emu * 0.95), $para($title, 3000, true, $pal['dk2']), 'b');
+                    // Under a right-to-left title the accent bar sits on the right.
+                    $shapes .= $rect('Accent', $isRtl($title) ? $W - (int)($emu * 1.9) : (int)($emu * 0.7), (int)($emu * 1.36), (int)($emu * 1.2), 45720, $pal['accent1']);
+                }
+                $y = (int)($emu * 1.6); $body = ''; $bodyLines = 0;
+                // Text before a table gets the height of its lines (~0.5" per line of ~75 characters) and pushes the table
+                // down (review of 2be8964: the table was drawn over it); the last text block runs to the bottom.
+                $flush = static function (bool $last = false) use (&$body, &$bodyLines, &$shapes, &$y, $box, $emu, $H): void {
+                    if ($body === '') return;
+                    $h = $last ? max((int)($emu * 0.6), $H - $y - (int)($emu * 0.5)) : (int)($emu * (0.5 * $bodyLines + 0.2));
+                    $shapes .= $box('Contenu', (int)($emu * 0.6), $y, (int)($emu * 12.1), $h, $body);
+                    $y += $h; $body = ''; $bodyLines = 0;
+                };
+                foreach ($items as $it) {
+                    if ($it[0] === 't') {
+                        $flush();
+                        $shapes .= $table($it[1], (int)($emu * 0.7), $y + (int)($emu * 0.1), (int)($emu * 11.9));
+                        $y += (int)($emu * 0.1) + 411480 * count($it[1]) + (int)($emu * 0.2);
+                        continue;
+                    }
+                    $body .= $para($it[2], $it[0] === 'p' ? 2400 : ($it[1] > 0 ? 2000 : 2400), false, $pal['dk1'], 'l', $it[0] === 'p' ? -1 : $it[1], $it[0] === 'n');
+                    $bodyLines += max(1, (int)ceil(mb_strlen($it[2]) / 75));
+                }
+                $flush(true);
+            }
+            $slideXml[] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld ' . $ns . '><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+                . '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>' . $shapes
+                . '</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>';
+        }
+
+        // ---- 3. package: master, layout, theme, presentation
+        $zip = new \ZipArchive(); $tmp = tempnam(sys_get_temp_dir(), 'eva_pptx_');
+        if ($tmp === false || $zip->open($tmp, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) throw new \RuntimeException('could not create archive');
+        $n = count($slideXml);
+        $rel = static fn(string $items): string => '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' . $items . '</Relationships>';
+        $R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/';
+        $ct = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            . '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+            . '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>'
+            . '<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>'
+            . '<Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>'
+            . '<Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>'
+            . '<Override PartName="/ppt/presProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presProps+xml"/>'
+            . '<Override PartName="/ppt/viewProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.viewProps+xml"/>'
+            . '<Override PartName="/ppt/tableStyles.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.tableStyles+xml"/>'
+            . '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+            . '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>';
+        for ($i = 1; $i <= $n; $i++) $ct .= '<Override PartName="/ppt/slides/slide' . $i . '.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>';
+        $zip->addFromString('[Content_Types].xml', $ct . '</Types>');
+        $zip->addFromString('_rels/.rels', $rel('<Relationship Id="rId1" Type="' . $R . 'officeDocument" Target="ppt/presentation.xml"/>'
+            . '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+            . '<Relationship Id="rId3" Type="' . $R . 'extended-properties" Target="docProps/app.xml"/>'));
+        $zip->addFromString('docProps/core.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+            . '<dc:title>' . $esc($slides[0][0] !== '' ? $slides[0][0] : 'Présentation') . '</dc:title><dc:creator>Infinity AI</dc:creator></cp:coreProperties>');
+        $zip->addFromString('docProps/app.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Infinity AI</Application><Slides>' . $n . '</Slides></Properties>');
+        $sldIds = ''; $presRels = '<Relationship Id="rId1" Type="' . $R . 'slideMaster" Target="slideMasters/slideMaster1.xml"/>'
+            . '<Relationship Id="rId2" Type="' . $R . 'theme" Target="theme/theme1.xml"/><Relationship Id="rId3" Type="' . $R . 'presProps" Target="presProps.xml"/>'
+            . '<Relationship Id="rId4" Type="' . $R . 'viewProps" Target="viewProps.xml"/><Relationship Id="rId5" Type="' . $R . 'tableStyles" Target="tableStyles.xml"/>';
+        foreach ($slideXml as $k => $xml) {
+            $i = $k + 1;
+            $zip->addFromString('ppt/slides/slide' . $i . '.xml', $xml);
+            $zip->addFromString('ppt/slides/_rels/slide' . $i . '.xml.rels', $rel('<Relationship Id="rId1" Type="' . $R . 'slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'));
+            $sldIds .= '<p:sldId id="' . (255 + $i) . '" r:id="rId' . (10 + $i) . '"/>';
+            $presRels .= '<Relationship Id="rId' . (10 + $i) . '" Type="' . $R . 'slide" Target="slides/slide' . $i . '.xml"/>';
+        }
+        $zip->addFromString('ppt/_rels/presentation.xml.rels', $rel($presRels));
+        $zip->addFromString('ppt/presentation.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation ' . $ns . ' saveSubsetFonts="1">'
+            . '<p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst><p:sldIdLst>' . $sldIds . '</p:sldIdLst>'
+            . '<p:sldSz cx="' . $W . '" cy="' . $H . '"/><p:notesSz cx="6858000" cy="9144000"/><p:defaultTextStyle><a:lvl1pPr marL="0" algn="l" defTabSz="914400"><a:defRPr sz="1800"><a:solidFill><a:schemeClr val="tx1"/></a:solidFill><a:latin typeface="+mn-lt"/><a:ea typeface="+mn-ea"/><a:cs typeface="+mn-cs"/></a:defRPr></a:lvl1pPr></p:defaultTextStyle></p:presentation>');
+        $zip->addFromString('ppt/presProps.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentationPr ' . $ns . '/>');
+        $zip->addFromString('ppt/viewProps.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:viewPr ' . $ns . '><p:normalViewPr><p:restoredLeft sz="15620"/><p:restoredTop sz="94660"/></p:normalViewPr><p:gridSpacing cx="76200" cy="76200"/></p:viewPr>');
+        $zip->addFromString('ppt/tableStyles.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:tblStyleLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" def="{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}"/>');
+        $spTreeEmpty = '<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree>';
+        $zip->addFromString('ppt/slideMasters/slideMaster1.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldMaster ' . $ns . '><p:cSld><p:bg><p:bgRef idx="1001"><a:schemeClr val="bg1"/></p:bgRef></p:bg>' . $spTreeEmpty . '</p:cSld>'
+            . '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>'
+            . '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst><p:txStyles><p:titleStyle><a:lvl1pPr><a:defRPr sz="3000"/></a:lvl1pPr></p:titleStyle><p:bodyStyle><a:lvl1pPr><a:defRPr sz="2000"/></a:lvl1pPr></p:bodyStyle><p:otherStyle><a:lvl1pPr><a:defRPr sz="1800"/></a:lvl1pPr></p:otherStyle></p:txStyles></p:sldMaster>');
+        $zip->addFromString('ppt/slideMasters/_rels/slideMaster1.xml.rels', $rel('<Relationship Id="rId1" Type="' . $R . 'slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="' . $R . 'theme" Target="../theme/theme1.xml"/>'));
+        $zip->addFromString('ppt/slideLayouts/slideLayout1.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sldLayout ' . $ns . ' type="blank" preserve="1"><p:cSld name="Vide">' . $spTreeEmpty . '</p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>');
+        $zip->addFromString('ppt/slideLayouts/_rels/slideLayout1.xml.rels', $rel('<Relationship Id="rId1" Type="' . $R . 'slideMaster" Target="../slideMasters/slideMaster1.xml"/>'));
+        $clr = ''; foreach ($pal as $k => $v) $clr .= '<a:' . $k . '><a:srgbClr val="' . $v . '"/></a:' . $k . '>';
+        $fill3 = '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>';
+        $zip->addFromString('ppt/theme/theme1.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Infinity AI"><a:themeElements>'
+            . '<a:clrScheme name="Infinity AI">' . $clr . '</a:clrScheme>'
+            . '<a:fontScheme name="Infinity AI"><a:majorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface="Arial"/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface="Arial"/></a:minorFont></a:fontScheme>'
+            . '<a:fmtScheme name="Infinity AI"><a:fillStyleLst>' . str_repeat($fill3, 3) . '</a:fillStyleLst>'
+            . '<a:lnStyleLst>' . str_repeat('<a:ln w="9525">' . $fill3 . '</a:ln>', 3) . '</a:lnStyleLst>'
+            . '<a:effectStyleLst>' . str_repeat('<a:effectStyle><a:effectLst/></a:effectStyle>', 3) . '</a:effectStyleLst>'
+            . '<a:bgFillStyleLst>' . str_repeat($fill3, 3) . '</a:bgFillStyleLst></a:fmtScheme></a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>');
         $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
     }
 
@@ -2698,7 +2950,7 @@ class ActionExecutor {
     /** Indexer::extractTextForAgent() cuts the extracted text at this length without saying so. */
     private const INDEXER_MAX_CHARS = 100000;
     /** Formats convert_file can write (the create_file generators). */
-    private const CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'md', 'txt'];
+    private const CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'pptx', 'md', 'txt'];
 
     /**
      * The existing files a write would replace (create_file, create_files, convert_file), relative to home.
@@ -2730,7 +2982,7 @@ class ActionExecutor {
     /** Target of convert_file: target_path, else the source path with the new extension (same folder). */
     private function convertTargetPath(array $args): ?string {
         $format = strtolower(ltrim(trim((string)($args['target_format'] ?? '')), '.'));
-        $format = ['doc' => 'docx', 'word' => 'docx', 'excel' => 'xlsx', 'xls' => 'xlsx', 'markdown' => 'md', 'text' => 'txt'][$format] ?? $format;
+        $format = ['doc' => 'docx', 'word' => 'docx', 'excel' => 'xlsx', 'xls' => 'xlsx', 'powerpoint' => 'pptx', 'ppt' => 'pptx', 'markdown' => 'md', 'text' => 'txt'][$format] ?? $format;
         if (!in_array($format, self::CONVERT_TARGETS, true)) {
             return null;
         }

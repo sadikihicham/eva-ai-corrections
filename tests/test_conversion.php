@@ -84,7 +84,11 @@ $t->conv($home3, ['path' => 'score.md', 'target_format' => 'pdf']);
 verifie('ligne « 12/20 » d\'un Markdown gardée (marqueurs retirés des PDF seulement)', ($t->ecrit[0]['content'] ?? '') === "Résultat\n12/20\nFin", $j($t->ecrit));
 $t = new ConvSousTest();
 verifie('même fichier en sortie → refus', empty($t->conv($home, ['path' => 'notes.md', 'target_format' => 'md'])['ok']) && $t->ecrit === []);
-verifie('format de sortie non géré → refus', empty($t->conv($home, ['path' => 'notes.md', 'target_format' => 'pptx'])['ok']));
+verifie('format de sortie non géré → refus', empty($t->conv($home, ['path' => 'notes.md', 'target_format' => 'odt'])['ok']) && $t->ecrit === []);
+$t = new ConvSousTest();
+$r = $t->conv($home, ['path' => 'notes.md', 'target_format' => 'powerpoint']);
+verifie('Markdown → PowerPoint (« powerpoint » → .pptx, 28/09)', !empty($r['ok']) && ($t->ecrit[0]['path'] ?? '') === 'notes.pptx', $j($r) . ' ' . $j($t->ecrit));
+$t = new ConvSousTest();
 $home2 = new Folder(['image.bin' => new File("\x89PNG\0\0")]);
 verifie('fichier binaire sans texte → refus', empty($t->conv($home2, ['path' => 'image.bin', 'target_format' => 'pdf'])['ok']) && $t->ecrit === []);
 
