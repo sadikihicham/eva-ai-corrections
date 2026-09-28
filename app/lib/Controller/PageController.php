@@ -163,17 +163,35 @@ class PageController extends Controller {
      * (on localhost) transcribes, and only the text reaches Nextcloud when the user
      * sends it. The audio never leaves the machine.
      *
-     * Enabled by the admin with `occ config:app:set eva_ai dictation_local_url
-     * --value=http://localhost:8178/v1`. The URL is accepted ONLY for the hosts
-     * localhost and 127.0.0.1: any other value keeps dictation off, so the page can
-     * never be told to send a recording to another machine. When accepted, the
-     * micro script is loaded, the URL is given to it in a meta tag, and the page's
-     * CSP allows connections to that local origin only.
+     * Two switches, both required:
+     * - `occ config:app:set eva_ai dictation_local_url --value=http://127.0.0.1:8178/v1`
+     *   (instance-wide). The URL is accepted ONLY for the hosts localhost and
+     *   127.0.0.1: any other value keeps dictation off, so the page can never be
+     *   told to send a recording to another machine;
+     * - `occ user:setting <uid> eva_ai dictation_enabled yes` (per user): only the
+     *   people who actually run Whisper on their computer get the script, so the
+     *   browsers of everyone else never probe localhost.
+     * When both hold, the micro script is loaded, the URL is given to it in a meta
+     * tag, and the page's CSP allows connections to that local origin only.
+     *
+     * Any error while reading the settings keeps dictation off: an optional feature
+     * must never break the app's pages.
      *
      * @return string|null the origin (scheme://host:port) to allow, or null when off
      */
     private function localDictationOrigin(): ?string {
-        $url = trim(\OCP\Server::get(\OCP\IAppConfig::class)->getValueString('eva_ai', 'dictation_local_url', ''));
+        try {
+            if ($this->userId === null || $this->userId === '') {
+                return null;
+            }
+            $config = \OCP\Server::get(\OCP\IConfig::class);
+            if ($config->getUserValue($this->userId, 'eva_ai', 'dictation_enabled', 'no') !== 'yes') {
+                return null;
+            }
+            $url = trim((string)$config->getAppValue('eva_ai', 'dictation_local_url', ''));
+        } catch (\Throwable $e) {
+            return null;
+        }
         $origin = self::localOrigin($url);
         if ($origin === null) {
             return null;
