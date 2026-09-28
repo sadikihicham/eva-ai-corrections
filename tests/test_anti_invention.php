@@ -330,6 +330,14 @@ verifie('les appels récupérés sont marqués « recovered »', ($t->recupere("
 verifie('garde du mode autonome présente dans ask() (contrôle de source)', preg_match('~!\$autonomousActions && \(\$recovered = \$this->recoverTextToolCalls\(~', $source) === 1);
 verifie('garde d\'écrasement branchée dans les DEUX boucles (contrôle de source)', substr_count($source, "!empty(\$tc['recovered']) ? \$this->recoveredOverwrite(") === 2);
 verifie('réponse normale → rien', $t->recupere('Bonjour, voici la réponse.', $tous) === null);
+// Test admin 28/09 ~07:15 : « convertir ce fichier doc en fichier pdf » → convert_file inventé, puis « converti avec succès » sans rien créer.
+foreach (['convertir ce fichier doc en fichier pdf', 'convertis le fichier en pdf', 'convert this file to pdf', 'transforme ce document en excel'] as $qc) {
+    verifie('conversion = demande de fichier : ' . $qc, $t->fichier($qc));
+}
+verifie('« Comment convertir un fichier en pdf ? » reste une question', !$t->fichier('Comment convertir un fichier en pdf ?'));
+verifie('« Le fichier X.md a été converti en fichier PDF avec succès » = affirmation', $t->affirme('Le fichier Taux_de_chômage.md a été converti en fichier PDF avec succès. Vous pouvez le consulter ici : Taux_de_chômage.pdf.'));
+verifie('« The file has been converted » / « I converted » = affirmation', $t->affirme('Your file has been converted to PDF.') && $t->affirme("I've converted the document."));
+verifie('conversion affirmée sans outil d\'écriture → relance création', $t->relance('convertir ce fichier doc en fichier pdf', 'Le fichier Taux_de_chômage.md a été converti en fichier PDF avec succès.', $tous));
 verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
 $r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
 verifie('« Would you like me to create a new PDF…? » en réponse à une demande de PDF → relance création', $r === RagSousTest::CREATION_NUDGE, (string)$r);

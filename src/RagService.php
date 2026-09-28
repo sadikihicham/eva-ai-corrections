@@ -825,7 +825,7 @@ $this->executor->setUserId($userId);
         if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
             return false;
         }
-        $verb = '(cr[eé]+r?[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
+        $verb = '(cr[eé]+r?[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|convert\p{L}*|transform\p{L}*|umwandel\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل|حوّل|حول)';
         // Not "tableau / table / markdown / note" alone: "fais un tableau comparatif" is an in-chat answer (second review, 28/09).
         $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|datei|ملف|مستند|اكسل)';
         // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
@@ -837,6 +837,8 @@ $this->executor->setUserId($userId);
         return preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})[^.?!\n]{0,60}' . $intro . $existing . $object . '(?!\p{L})~u', $m) === 1
             // "crée pdf", "creat pdf", "export excel": a format right after the verb, no article needed.
             || preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})\s+(moi\s+|me\s+|nous\s+|it\s+|this\s+|ça\s+|cela\s+|le\s+tout\s+)?(en\s+|as\s+|to\s+|au\s+format\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
+            // "convert this file to pdf": a conversion names its target format, no "new" article (test 28/09 ~07:15).
+            || preg_match('~(?<!\p{L})(convert\p{L}*|transform\p{L}*|umwandel\p{L}*|حوّل|حول)(?!\p{L})[^.?!\n]{0,60}(?<!\p{L})(en|to|into|in|as|vers|au\s+format|إلى|الى)\s+(\p{L}+\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
             || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})[^.?!\n]{0,40}(ملف|مستند|اكسل)~u', $m) === 1;
     }
 
@@ -858,11 +860,11 @@ $this->executor->setUserId($userId);
         if (preg_match('~/(?:index\.php/)?f/\d+|/remote\.php/(?:dav/files|webdav)/|\[eva:[^\]]*(created|cr[ée]{1,2})|\(file\s+created:~u', $a) === 1) {
             return true;
         }
-        $past = '~(j[\'’]ai\s+(bien\s+)?(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée]|pr[ée]par[ée]|export[ée]|sauvegard[ée]|r[ée]dig[ée])'
+        $past = '~(j[\'’]ai\s+(bien\s+)?(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée]|pr[ée]par[ée]|export[ée]|sauvegard[ée]|r[ée]dig[ée]|converti)'
             . '|je\s+(vous|t)[\'’]?\s*ai\s+(cr[ée]{1,2}|g[ée]n[ée]r[ée]|pr[ée]par[ée]|enregistr[ée])'
-            . '|(votre|ton|le)\s+(nouveau\s+)?(fichier|document|classeur|tableur)\s+(\S+\s+){0,2}(est|a\s+[ée]t[ée])\s+(bien\s+)?(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée]|pr[êe]t)|(fichier|document)\s+cr[ée]{1,2}\s*:'
-            . '|(?<!\p{L})i(\s+have|[\'’]ve)?\s+(just\s+|successfully\s+)?(created|generated|saved|exported|prepared)'
-            . '|(your|the)\s+(new\s+)?(file|document|spreadsheet|workbook)\s+(\S+\s+){0,2}(has|have)\s+been\s+(successfully\s+)?(created|generated|saved)|here[\'’]?s?\s+(is\s+)?(your|the)\s+(new\s+)?(file|document|spreadsheet|workbook)'
+            . '|(votre|ton|le)\s+(nouveau\s+)?(fichier|document|classeur|tableur)\s+(\S+\s+){0,2}(est|a\s+[ée]t[ée])\s+(bien\s+)?(cr[ée]{1,2}|g[ée]n[ée]r[ée]|enregistr[ée]|pr[êe]t|converti)|(fichier|document)\s+cr[ée]{1,2}\s*:'
+            . '|(?<!\p{L})i(\s+have|[\'’]ve)?\s+(just\s+|successfully\s+)?(created|generated|saved|exported|prepared|converted)'
+            . '|(your|the)\s+(new\s+)?(file|document|spreadsheet|workbook)\s+(\S+\s+){0,2}(has|have)\s+been\s+(successfully\s+)?(created|generated|saved|converted)|here[\'’]?s?\s+(is\s+)?(your|the)\s+(new\s+)?(file|document|spreadsheet|workbook)'
             . '|voici\s+(votre|ton|le)\s+(nouveau\s+)?(fichier|document|classeur)|أنشأت|(تم|قمت\s+ب)\s*(إنشاء|انشاء)\s+(ال)?(ملف|مستند)|habe\s+(\p{L}+\s+)?erstellt|(datei|dokument)\s+wurde\s+(\p{L}+\s+)?erstellt)~u';
         if (preg_match($past, $a) === 1) {
             return true;
