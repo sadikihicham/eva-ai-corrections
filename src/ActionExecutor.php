@@ -2108,28 +2108,132 @@ class ActionExecutor {
         }
     }
 
-    /** Build a minimal standards-compliant Word document without external services. */
+    /**
+     * Build a Word document (.docx) from plain text or simple Markdown, in pure PHP (ZipArchive), without external
+     * services. Understands # / ## / ### headings, - / * / 1. lists (two spaces = one level, real Word lists that
+     * restart per list), **bold**, | tables | (real Word tables, header row shaded), ``` code blocks (Courier New) and
+     * skips --- rules and blank lines (paragraph spacing comes from the default style, Calibri 11). Before 28/09 every
+     * line was a raw paragraph: « # Titre » and « - point » were printed as such. A paragraph whose first letter is
+     * Arabic-script (Arabic, Urdu) is right-to-left with its language (ur-PK when Urdu-only letters appear, else ar-SA).
+     * Self-contained (closures only): tests/test_docx.php extracts it.
+     */
     private function buildDocx(string $text): string {
         if (!class_exists(\ZipArchive::class)) throw new \RuntimeException('PHP ZipArchive extension is required');
+        $esc = static fn(string $v): string => htmlspecialchars((string)preg_replace(['/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '/[\x{FFFE}\x{FFFF}]/u'], '', $v), ENT_XML1 | ENT_COMPAT | ENT_SUBSTITUTE, 'UTF-8');
+        $rtl = static fn(string $v): bool => preg_match('/\p{L}/u', $v, $f) === 1 && preg_match('/\p{Arabic}/u', $f[0]) === 1;
+        // Runs of one paragraph, **bold** kept. rPr children in schema order: rFonts, b, bCs, color, sz, szCs, rtl, lang.
+        $runs = static function (string $v, bool $bold = false, int $size = 0, string $color = '', string $font = '') use ($esc, $rtl): string {
+            $isRtl = $rtl($v); $out = '';
+            foreach (preg_split('/(\*\*[^*]+\*\*)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [$v] as $part) {
+                $b = $bold || (str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4);
+                $t = str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4 ? substr($part, 2, -2) : $part;
+                $rpr = ($font !== '' ? '<w:rFonts w:ascii="' . $font . '" w:hAnsi="' . $font . '" w:cs="' . $font . '"/>' : ($isRtl ? '<w:rFonts w:cs="Arial"/>' : ''))
+                    . ($b ? '<w:b/><w:bCs/>' : '') . ($color !== '' ? '<w:color w:val="' . $color . '"/>' : '')
+                    . ($size > 0 ? '<w:sz w:val="' . $size . '"/><w:szCs w:val="' . $size . '"/>' : '')
+                    . ($isRtl ? '<w:rtl/><w:lang w:bidi="' . (preg_match('/[ٹڈڑںےہ]/u', $v) === 1 ? 'ur-PK' : 'ar-SA') . '"/>' : '');
+                $out .= '<w:r>' . ($rpr !== '' ? '<w:rPr>' . $rpr . '</w:rPr>' : '') . '<w:t xml:space="preserve">' . $esc($t) . '</w:t></w:r>';
+            }
+            return $out;
+        };
+        // pPr children in schema order: keepNext, numPr, bidi, spacing, ind, shd…
+        $para = static fn(string $v, string $ppr = '', string $runsXml = ''): string => '<w:p>'
+            . ($ppr !== '' || $rtl($v) ? '<w:pPr>' . str_replace('<!--bidi-->', $rtl($v) ? '<w:bidi/>' : '', $ppr === '' ? '<!--bidi-->' : $ppr) . '</w:pPr>' : '')
+            . $runsXml . '</w:p>';
+        $table = static function (array $rows) use ($runs): string {
+            $cols = max(1, max(array_map('count', $rows))); $w = intdiv(9000, $cols);
+            $b = '<w:top w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/><w:left w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/>'
+                . '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/><w:right w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/>'
+                . '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/>';
+            $xml = '<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="pct"/><w:tblBorders>' . $b . '</w:tblBorders><w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr><w:tblGrid>'
+                . str_repeat('<w:gridCol w:w="' . $w . '"/>', $cols) . '</w:tblGrid>';
+            foreach ($rows as $r => $cells) {
+                $xml .= '<w:tr>';
+                for ($c = 0; $c < $cols; $c++) {
+                    $v = trim((string)preg_replace('/^\*\*(.*)\*\*$/s', '$1', (string)($cells[$c] ?? '')));
+                    $xml .= '<w:tc><w:tcPr><w:tcW w:w="' . $w . '" w:type="dxa"/>' . ($r === 0 ? '<w:shd w:val="clear" w:color="auto" w:fill="1F2A37"/>' : '') . '</w:tcPr>'
+                        . '<w:p><w:pPr><w:spacing w:before="40" w:after="40"/></w:pPr>' . $runs($v, $r === 0, 0, $r === 0 ? 'FFFFFF' : '') . '</w:p></w:tc>';
+                }
+                $xml .= '</w:tr>';
+            }
+            return $xml . '</w:tbl>';
+        };
+
+        $lines = preg_split('/\R/u', str_replace("\t", '    ', $text));
+        if ($lines === false) throw new \RuntimeException('invalid UTF-8 text');
+        $body = ''; $inCode = false; $rows = []; $numId = 2; $listKind = ''; $lastTable = false;
+        $flushTable = static function () use (&$rows, &$body, &$lastTable, $table): void {
+            if ($rows !== []) { $body .= $table($rows); $rows = []; $lastTable = true; }
+        };
+        foreach ($lines as $raw) {
+            $line = rtrim($raw);
+            if (preg_match('/^\s*```/', $line)) { $flushTable(); $inCode = !$inCode; $listKind = ''; continue; }
+            if ($inCode) {
+                $body .= $para('', '<w:spacing w:before="0" w:after="0"/><w:shd w:val="clear" w:color="auto" w:fill="F2F4F7"/>', $runs($line, false, 19, '', 'Courier New')); $lastTable = false;
+                continue;
+            }
+            if (preg_match('/^\s*\|(.+)\|\s*$/u', $line, $m)) {
+                $cells = array_map('trim', preg_split('/(?<!\\\\)\|/', $m[1]) ?: [$m[1]]);
+                if (array_filter($cells, static fn(string $c): bool => preg_match('/^:?-{2,}:?$/', $c) !== 1) !== []) $rows[] = $cells;
+                $listKind = '';
+                continue;
+            }
+            $flushTable();
+            if (trim($line) === '' || preg_match('/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/', $line)) { $listKind = ''; continue; }
+            $lastTable = false;
+            if (preg_match('/^\s{0,3}(#{1,6})\s+(.+?)\s*#*$/u', $line, $m)) {
+                $level = strlen($m[1]); $size = [1 => 36, 2 => 30, 3 => 26][$level] ?? 24;
+                $body .= $para($m[2], '<w:keepNext/><!--bidi--><w:spacing w:before="' . ($level === 1 ? 360 : 240) . '" w:after="120"/>', $runs($m[2], true, $size, '1F2A37'));
+                $listKind = '';
+                continue;
+            }
+            if (preg_match('/^(\s*)([-*+•]|\d+[.)])\s+(.+)$/u', $line, $m)) {
+                $kind = ctype_digit(rtrim($m[2], '.)')) ? 'n' : 'b';
+                if ($kind === 'n' && $listKind !== 'n') $numId++;   // each numbered list restarts at 1
+                $listKind = $kind;
+                $ilvl = min(2, intdiv(strlen($m[1]), 2));
+                $body .= $para($m[3], '<w:numPr><w:ilvl w:val="' . $ilvl . '"/><w:numId w:val="' . ($kind === 'n' ? $numId : 1) . '"/></w:numPr><!--bidi--><w:spacing w:after="60"/>', $runs($m[3]));
+                continue;
+            }
+            $listKind = '';
+            $body .= $para($line, '', $runs($line));
+        }
+        $flushTable();
+        if ($body === '' || $lastTable) $body .= '<w:p/>';   // Word wants a paragraph before sectPr
+
+        // numbering.xml: abstract 0 = bullets, 1 = decimal ; num 1 = bullets, num 3.. = one per numbered list (restart at 1)
+        $lvls = static function (bool $bullet): string {
+            $x = '';
+            foreach ([0, 1, 2] as $i) {
+                $x .= '<w:lvl w:ilvl="' . $i . '"><w:start w:val="1"/><w:numFmt w:val="' . ($bullet ? 'bullet' : ['decimal', 'lowerLetter', 'lowerRoman'][$i]) . '"/>'
+                    . '<w:lvlText w:val="' . ($bullet ? ['•', '–', '▪'][$i] : '%' . ($i + 1) . '.') . '"/><w:lvlJc w:val="left"/>'
+                    . '<w:pPr><w:ind w:left="' . (720 + 360 * $i) . '" w:hanging="360"/></w:pPr>' . ($bullet ? '<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/></w:rPr>' : '') . '</w:lvl>';
+            }
+            return $x;
+        };
+        $W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+        $numbering = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:numbering ' . $W . '>'
+            . '<w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="hybridMultilevel"/>' . $lvls(true) . '</w:abstractNum>'
+            . '<w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="hybridMultilevel"/>' . $lvls(false) . '</w:abstractNum>'
+            . '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>';
+        for ($i = 3; $i <= $numId; $i++) $numbering .= '<w:num w:numId="' . $i . '"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>';
+        $numbering .= '</w:numbering>';
+        $styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles ' . $W . '><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Arial"/>'
+            . '<w:sz w:val="22"/><w:szCs w:val="22"/><w:lang w:val="fr-FR"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>'
+            . '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style></w:styles>';
+
         $zip = new \ZipArchive(); $tmp = tempnam(sys_get_temp_dir(), 'eva_docx_');
         if ($tmp === false || $zip->open($tmp, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) throw new \RuntimeException('could not create archive');
-        $esc = static fn(string $v): string => htmlspecialchars($v, ENT_XML1 | ENT_COMPAT, 'UTF-8');
-        $lines = preg_split("/\\R/u", $text) ?: [];
-        // Arabic-script lines (Arabic, Urdu, Persian) are right-to-left paragraphs with their language (Urdu 28/09: Word
-        // showed them left-aligned, punctuation on the wrong side). Urdu is told apart by letters Arabic does not have.
-        $paras = '';
-        foreach ($lines as $line) {
-            // Direction from the first letter: « Le mot اردو signifie… » stays a left-to-right paragraph.
-            if (preg_match('/\p{L}/u', $line, $first) === 1 && preg_match('/\p{Arabic}/u', $first[0]) === 1) {
-                $lang = preg_match('/[ٹڈڑںےہ]/u', $line) === 1 ? 'ur-PK' : 'ar-SA';
-                $paras .= '<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rFonts w:cs="Arial"/><w:rtl/><w:lang w:bidi="' . $lang . '"/></w:rPr><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
-            } else {
-                $paras .= '<w:p><w:r><w:t xml:space="preserve">' . $esc($line) . '</w:t></w:r></w:p>';
-            }
-        }
-        $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+        $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+            . '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            . '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>'
+            . '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>');
         $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>');
-        $zip->addFromString('word/document.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' . $paras . '<w:sectPr/></w:body></w:document>');
+        $zip->addFromString('word/_rels/document.xml.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            . '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>'
+            . '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>');
+        $zip->addFromString('word/numbering.xml', $numbering);
+        $zip->addFromString('word/styles.xml', $styles);
+        $zip->addFromString('word/document.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ' . $W . '><w:body>' . $body . '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1417" w:right="1417" w:bottom="1417" w:left="1417" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>');
         $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
     }
 
