@@ -44,7 +44,9 @@ for f in "${FICHIERS[@]}"; do
   [ "$(r "sudo sha256sum $B/$f" | cut -c1-64)" = "$(git show "$REFERENCE:src/$f" | h)" ] \
     || { echo "ARRET : sauvegarde de $f incomplète — rien n'a été modifié"; exit 1; }
 done
-r "cd $B && sudo sh -c 'sha256sum ${FICHIERS[*]} > EMPREINTES && echo $REFERENCE > REFERENCE'"
+# Dossier en 700 root : tout se fait sous sudo, cd compris (échec du 28/09 06:38 : « cd: Permission denied »).
+r "sudo sh -c 'cd $B && sha256sum ${FICHIERS[*]} > EMPREINTES && echo $REFERENCE > REFERENCE'"
+[ "$(r "sudo cat $B/EMPREINTES" | wc -l | tr -d ' ')" = "${#FICHIERS[@]}" ] || { echo "ARRET : EMPREINTES incomplet dans $B — rien n'a été modifié"; exit 1; }
 echo "   $B (${#FICHIERS[@]} fichiers + EMPREINTES, vérifiés)"
 
 echo "3) dépôt des nouveaux fichiers en temporaire, puis contrôle"
