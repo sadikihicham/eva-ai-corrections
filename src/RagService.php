@@ -961,7 +961,7 @@ $this->executor->setUserId($userId);
             . 'Urdu (اردو) is NOT Arabic: write real Urdu (Urdu words and letters such as ٹ ڈ ڑ ں ے ہ ھ گ چ پ, e.g. "یہ ایک مثال ہے"), never Arabic. '
             . 'To translate a file into Urdu: read it (read_file), translate ALL of its text into Urdu, then save it with create_file under a NEW name '
             . 'in the same format (e.g. "Rapport.docx" → "Rapport_ur.docx"); never overwrite the original. '
-            . 'A .pdf cannot hold Urdu script: for Urdu use .docx, .pptx, .md or .txt (say so if a PDF was asked for). '
+            . 'A .pdf in Urdu is possible (produced through Nextcloud Office); .docx, .pptx, .md and .txt work too. '
             // Prod 28/09 14:20: « میں انسائیکلوپیڈیا AI ہوں » and weather("دبئی") → « Place not found ».
             . 'Your name stays exactly "Infinity AI" in Latin letters (« میں Infinity AI ہوں »). '
             . 'Pass place names to tools in English Latin letters (دبئی → Dubai, کراچی → Karachi, لاہور → Lahore).';

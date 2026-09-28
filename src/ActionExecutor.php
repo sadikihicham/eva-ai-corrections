@@ -241,7 +241,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_file',
-                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table), .pptx (a PowerPoint deck: each # or ## heading starts a new slide, then - bullets, **bold**, | tables |; a short first section becomes the title slide; write REAL titles, never labels such as "Slide 1: Title" or "Subtitle" — e.g. "# Cybersecurity at work\nA shared priority\n\n## Main threats\n- Phishing\n- Ransomware\n\n## Good practices\n- …") and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
+                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table), .pptx (a PowerPoint deck: each # or ## heading starts a new slide, then - bullets, **bold**, | tables |; a short first section becomes the title slide; write REAL titles, never labels such as "Slide 1: Title" or "Subtitle" — e.g. "# Cybersecurity at work\nA shared priority\n\n## Main threats\n- Phishing\n- Ransomware\n\n## Good practices\n- …") and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf also works in Arabic and Urdu (right-to-left, produced through Nextcloud Office); if Office is unavailable the tool says so, then offer a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'path' => ['type' => 'string', 'description' => 'Relative path from the home folder, e.g. "Documents/Plan.md" or "Report.txt".'],
                     'content' => ['type' => 'string', 'description' => 'Full UTF-8 text content.'],
@@ -2025,18 +2025,30 @@ class ActionExecutor {
         }
         $warning = [];
         if (!$binary && $ext === 'pdf') {
+            $latin = null;
+            $replaced = 0;
             try {
-                $replaced = 0;
-                $content = $this->buildPdf($content, $replaced);
-                if ($replaced > 0) {
+                $latin = $this->buildPdf($content, $replaced);
+            } catch (\Throwable $e) {
+                if ($e->getMessage() !== 'non-Latin text') {
+                    return ['ok' => false, 'error' => 'PDF generation failed: ' . $e->getMessage()];
+                }
+            }
+            if ($latin !== null && $replaced === 0) {
+                $content = $latin;
+            } else {
+                // Arabic, Urdu or another script the built-in fonts cannot print (admin 28/09: « PDF arabe »):
+                // Nextcloud Office renders it. Without Office, the previous behaviour stays.
+                $office = $this->pdfViaOffice($content);
+                if ($office !== null) {
+                    $content = $office;
+                } elseif ($latin === null) {
+                    return ['ok' => false, 'error' => 'This PDF needs Nextcloud Office (Collabora) for its Arabic or other non-Latin text, and Office did not answer. Nothing was created. Offer a .docx file instead (fully supported, right-to-left included).'];
+                } else {
+                    $content = $latin;
                     // Tell the model (and so the user) instead of silently printing "?" (review, 28/09).
                     $warning = ['warning' => $replaced . ' character(s) of a non-Latin script could not be printed in the PDF and were replaced by "?". Tell the user; offer a .docx if that text matters.'];
                 }
-            } catch (\Throwable $e) {
-                if ($e->getMessage() === 'non-Latin text') {
-                    return ['ok' => false, 'error' => 'Infinity AI can generate PDF files only for Latin-script text (French, English, German…). Nothing was created. For Arabic or other scripts, offer a .docx file instead (fully supported).'];
-                }
-                return ['ok' => false, 'error' => 'PDF generation failed: ' . $e->getMessage()];
             }
         }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'docx') {
@@ -2145,19 +2157,22 @@ class ActionExecutor {
         $para = static fn(string $v, string $ppr = '', string $runsXml = ''): string => '<w:p>'
             . ($ppr !== '' || $rtl($v) ? '<w:pPr>' . str_replace('<!--bidi-->', $rtl($v) ? '<w:bidi/>' : '', $ppr === '' ? '<!--bidi-->' : $ppr) . '</w:pPr>' : '')
             . $runsXml . '</w:p>';
-        $table = static function (array $rows) use ($runs): string {
+        $table = static function (array $rows) use ($runs, $rtl): string {
             $cols = max(1, max(array_map('count', $rows))); $w = intdiv(9000, $cols);
             $b = '<w:top w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/><w:left w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/>'
                 . '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/><w:right w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/>'
                 . '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="C9D1DC"/>';
-            $xml = '<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="pct"/><w:tblBorders>' . $b . '</w:tblBorders><w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr><w:tblGrid>'
+            // Arabic / Urdu table (first letter of its cells): columns mirrored, first column on the right (seen in the
+            // Arabic PDF of 28/09, where « البند » stood on the left). tblPr order: bidiVisual before tblW.
+            $tableRtl = $rtl(implode(' ', array_map(static fn(array $c): string => implode(' ', $c), $rows)));
+            $xml = '<w:tbl><w:tblPr>' . ($tableRtl ? '<w:bidiVisual/>' : '') . '<w:tblW w:w="5000" w:type="pct"/><w:tblBorders>' . $b . '</w:tblBorders><w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr><w:tblGrid>'
                 . str_repeat('<w:gridCol w:w="' . $w . '"/>', $cols) . '</w:tblGrid>';
             foreach ($rows as $r => $cells) {
                 $xml .= '<w:tr>';
                 for ($c = 0; $c < $cols; $c++) {
                     $v = trim((string)preg_replace('/^\*\*(.*)\*\*$/s', '$1', (string)($cells[$c] ?? '')));
                     $xml .= '<w:tc><w:tcPr><w:tcW w:w="' . $w . '" w:type="dxa"/>' . ($r === 0 ? '<w:shd w:val="clear" w:color="auto" w:fill="1F2A37"/>' : '') . '</w:tcPr>'
-                        . '<w:p><w:pPr><w:spacing w:before="40" w:after="40"/></w:pPr>' . $runs($v, $r === 0, 0, $r === 0 ? 'FFFFFF' : '') . '</w:p></w:tc>';
+                        . '<w:p><w:pPr>' . ($rtl($v) ? '<w:bidi/>' : '') . '<w:spacing w:before="40" w:after="40"/></w:pPr>' . $runs($v, $r === 0, 0, $r === 0 ? 'FFFFFF' : '') . '</w:p></w:tc>';
                 }
                 $xml .= '</w:tr>';
             }
@@ -2588,6 +2603,36 @@ class ActionExecutor {
             . '<a:effectStyleLst>' . str_repeat('<a:effectStyle><a:effectLst/></a:effectStyle>', 3) . '</a:effectStyleLst>'
             . '<a:bgFillStyleLst>' . str_repeat($fill3, 3) . '</a:bgFillStyleLst></a:fmtScheme></a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>');
         $zip->close(); $data = file_get_contents($tmp); @unlink($tmp); if (!is_string($data) || $data === '') throw new \RuntimeException('archive was empty'); return $data;
+    }
+
+    /**
+     * PDF for text the built-in generator cannot print (Arabic, Urdu, Cyrillic…): the same content is written as a
+     * .docx (right-to-left paragraphs, headings, lists, tables — buildDocx) and converted by Nextcloud Office
+     * (Collabora) through richdocuments' own client, which knows Collabora's address and TLS settings (they change
+     * with the HTTPS switch, https/DOSSIER-HTTPS.md). Nothing is written in the user's files on the way. Null when
+     * Office is missing, fails or returns anything but a PDF: the caller keeps its previous behaviour.
+     */
+    private function pdfViaOffice(string $text): ?string {
+        $service = 'OCA\\Richdocuments\\Service\\RemoteService';
+        try {
+            // Classes of a disabled app are not autoloaded; the method is checked because it is not a public API.
+            if (!class_exists($service) || !method_exists($service, 'convertTo')) {
+                return null;
+            }
+            $stream = fopen('php://temp', 'w+b');
+            if ($stream === false) {
+                return null;
+            }
+            fwrite($stream, $this->buildDocx($text, !$this->docxPlain));
+            rewind($stream);
+            $pdf = Server::get($service)->convertTo('document.docx', $stream, 'pdf');
+            if (is_resource($pdf)) {
+                $pdf = stream_get_contents($pdf);
+            }
+            return is_string($pdf) && str_starts_with($pdf, '%PDF-') ? $pdf : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     /**
