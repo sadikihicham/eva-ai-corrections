@@ -31,7 +31,7 @@ if (!preg_match('/private const CREATION_NUDGE = .*?;\n/s', $source, $nudge)) { 
 if (!preg_match('/private const RECOVERABLE_TOOLS = .*?;\n/s', $source, $recup)) { fwrite(STDERR, "RECOVERABLE_TOOLS absente\n"); exit(2); }
 if (!preg_match('/private const WRITE_TOOLS = .*?;\n/s', $source, $ecriture)) { fwrite(STDERR, "WRITE_TOOLS absente\n"); exit(2); }
 $autres = '';
-foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE', 'PERSONAL_DATA_READERS', 'PERSONAL_DATA_NUDGE'] as $c) {
+foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE', 'WRITE_AFTER_READ_NUDGE', 'PERSONAL_DATA_READERS', 'PERSONAL_DATA_NUDGE'] as $c) {
     if (!preg_match('/private const ' . $c . ' = .*?;\n/s', $source, $x)) { fwrite(STDERR, "$c absente\n"); exit(2); }
     $autres .= str_replace('private const', 'public const', $x[0]);
 }
@@ -40,7 +40,7 @@ foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE', 'PERSONAL_DATA_READERS', 'PERSONAL_DA
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
     'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
     'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool', 'recoverTextToolCalls', 'recoveredOverwrite',
-    'forcedCompetitionSearch', 'inventionGuard', 'personalDataKinds', 'unreadPersonalData', 'personalDataWriteGuard', 'personalDataNudge', 'weatherPlaceGuard', 'placeKey'];
+    'forcedCompetitionSearch', 'inventionGuard', 'personalDataKinds', 'unreadPersonalData', 'personalDataWriteGuard', 'personalDataNudge', 'weatherPlaceGuard', 'placeKey', 'asksForPlace', 'needsWriteAfterRead'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -629,6 +629,30 @@ $t = new RagSousTest();
 verifie('relance toujours là pour « quels sont mes rendez-vous de cette semaine »', $t->relanceGenerale('quels sont mes rendez-vous de cette semaine', "Je ne trouve pas de rendez-vous dans vos fichiers.", $lecteurs) !== null);
 verifie('« Tell us who won the last presidential election in Brazil » → pas de requête « us »', !str_contains((string)json_encode($t->web('Tell us who won the last presidential election in Brazil')), 'us presidential'));
 verifie('« Qu\'a dit Jo lors de la dernière réunion ? » → pas de recherche JO', !str_contains((string)json_encode($t->web("Qu'a dit Jo lors de la dernière réunion ?")), 'olympic'));
+
+// H.2 (prod 28/09 11:30) : écriture refusée par la garde, agenda lu, puis simple liste sans fichier → relance d'écriture
+$h2 = "crée un fichier excel avec mes rendez-vous de la semaine";
+$t = new RagSousTest();
+verifie('H.2 avant lecture : garde d\'écriture', $t->gardeEcriture($h2, 'create_file', $perso) !== null);
+$t->collecter('list_calendar_events', ['ok' => true, 'result' => ['events' => []]]);
+verifie('H.2 après lecture, réponse = liste sans fichier → WRITE_AFTER_READ_NUDGE', $t->relanceGenerale($h2, "Voici vos rendez-vous : 1. hicham, 29/09 06:00.", $perso) === RagSousTest::WRITE_AFTER_READ_NUDGE);
+$t->createdFiles = ['Documents/Rendezvous.xlsx' => 1];
+verifie('H.2 fichier créé → plus de relance', $t->relanceGenerale($h2, "Le fichier a été créé.", $perso) === null);
+$t = new RagSousTest();
+$t->collecter('list_calendar_events', ['ok' => true, 'result' => ['events' => []]]);
+verifie('lecture sans refus préalable (pas de garde déclenchée) → pas de relance d\'écriture', $t->relanceGenerale("quels sont mes rendez-vous de la semaine ?", "Voici vos rendez-vous.", $perso) === null);
+$t = new RagSousTest();
+verifie('H.2 garde déclenchée mais agenda PAS encore lu → pas de relance d\'écriture', ($t->gardeEcriture($h2, 'create_file', $perso) !== null) && $t->relanceGenerale($h2, "Je ne peux pas.", $perso) !== RagSousTest::WRITE_AFTER_READ_NUDGE);
+verifie('la relance d\'écriture interdit d\'inventer', str_contains(RagSousTest::WRITE_AFTER_READ_NUDGE, 'nothing invented'));
+
+// G.2 (prod 28/09 11:30) : « je n'ai pas accès à la météo… voulez-vous que je vous aide à trouver une source ? »
+$t = new RagSousTest();
+verifie('G.2 refus + question sans demander la ville → relance météo', $t->relanceGenerale("Quel temps fera-t-il demain ?", "Je ne peux pas fournir des prévisions météorologiques en temps réel. Voulez-vous que je vous aide à trouver une source fiable ?", $tous) === RagSousTest::WEATHER_NUDGE);
+foreach (["Pour quelle ville ?", "Dans quelle ville êtes-vous ?", "Which city do you mean?", "Où êtes-vous ?", "في أي مدينة؟"] as $rep) {
+    $t = new RagSousTest();
+    verifie('G.2 eva demande le lieu : « ' . $rep . ' » → pas de relance', $t->relanceGenerale("Quel temps fera-t-il demain ?", $rep, $tous) === null);
+}
+verifie('relance météo : « never guess » + « ask … which city »', str_contains(RagSousTest::WEATHER_NUDGE, 'never guess') && str_contains(RagSousTest::WEATHER_NUDGE, 'which city'));
 
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
