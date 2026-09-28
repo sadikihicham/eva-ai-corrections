@@ -141,6 +141,7 @@ class RagService {
 		// the model must never receive mutating tools for a read-only run.
 		$tools = $allowActions && $this->actionsEnabled() ? $this->executor->tools() : [];
 		$messages = $this->buildMessages($userId, $message, $history, $context, count($results), $tools !== [], $instructions, $persona, $this->dateContext($userId), $extraContext);
+		$intent = $this->requestIntent($message, $history);
 		$seenToolCalls = [];
 		$nudges = 0;
 		$forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
@@ -163,7 +164,7 @@ class RagService {
 			}
 			$toolCalls = $chat['tool_calls'] ?? [];
 			if ($toolCalls === []) {
-				$nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($message, (string)($chat['answer'] ?? ''), $tools) : null;
+				$nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($intent, (string)($chat['answer'] ?? ''), $tools) : null;
 				if ($nudge !== null) {
 					$nudges++;
 					$messages[] = ['role' => 'assistant', 'content' => (string)($chat['answer'] ?? '')];
@@ -171,7 +172,7 @@ class RagService {
 					continue;
 				}
 				$answer = $chat['answer'] ?? '';
-				$answer = $this->finishAnswer($userId, $message, (string)$answer, $messages);
+				$answer = $this->finishAnswer($userId, $intent, (string)$answer, $messages);
 				return [
 					'answer' => $answer,
 					'sources' => $this->answerSources($byDoc),
@@ -205,6 +206,7 @@ class RagService {
 					'result' => $this->safeToolResult($res['result'] ?? null),
 					'elapsed_ms' => max(0, (int)round((microtime(true) - $toolStartedAt) * 1000)),
 				]);
+				$res = $this->explainUnknownTool($res);
 				$this->collectToolSources($tc['name'], $res);
 				if (!empty($res['confirmation_required'])) {
 					$confirmationName = (string)($res['tool'] ?? $tc['name'] ?? '');
@@ -238,7 +240,7 @@ class RagService {
         // tool chain into an empty reply was the worst possible outcome.
         $final = $this->ollama->chat($messages, []);
         $answer = trim((string)($final['answer'] ?? ''));
-        $answer = $this->finishAnswer($userId, $message, $answer, $messages);
+        $answer = $this->finishAnswer($userId, $intent, $answer, $messages);
         if ($answer !== '') {
             return [
                 'answer' => $answer,
@@ -288,6 +290,7 @@ class RagService {
 $this->executor->setUserId($userId);
             $tools = $this->actionsEnabled() ? $this->executor->tools() : [];
             $messages = $this->buildMessages($userId, $message, $history, $context, count($results), $tools !== [], $instructions, $persona, $this->dateContext($userId));
+            $intent = $this->requestIntent($message, $history);
 
             $answer = '';
             $model = $this->ollama->selectedChatModel();
@@ -297,7 +300,7 @@ $this->executor->setUserId($userId);
             $nudges = 0;
             // When a file is requested, the model's text is not streamed live: if it only claims the file, the
             // retry replaces it, and the browser never shows the invented text (it gets `done.answer`).
-            $holdText = $this->isFileCreationRequest($message) || $this->isWeatherQuestion($message);
+            $holdText = $this->isFileCreationRequest($intent) || $this->isWeatherQuestion($intent);
 			$requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
             $forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
             if ($forced !== null && !$this->clientDisconnected()) {
@@ -345,7 +348,7 @@ $this->executor->setUserId($userId);
                     return;
                 }
                 if ($toolCalls === []) {
-                    $nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($message, $answer, $tools) : null;
+                    $nudge = $nudges < 2 && $round + 1 < $maxToolRounds ? $this->nudgeFor($intent, $answer, $tools) : null;
                     if ($nudge !== null) {
                         // Not streamed (see $holdText): the browser never shows the invented text.
                         $nudges++;
@@ -377,6 +380,7 @@ $this->executor->setUserId($userId);
                     $res = $seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
                         ? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
                         : $this->executor->run($userId, $toolName, $toolArgs);
+                    $res = $this->explainUnknownTool($res);
                     $this->collectToolSources($toolName, $res);
                     $toolFailure = $toolFailure || empty($res['ok']);
 					if (!empty($res['confirmation_required'])) {
@@ -426,7 +430,7 @@ $this->executor->setUserId($userId);
                 yield json_encode(['type' => 'error', 'message' => 'No text response received from Ollama.']) . "\n";
                 return;
             }
-            $answer = $this->finishAnswer($userId, $message, $answer, $messages);
+            $answer = $this->finishAnswer($userId, $intent, $answer, $messages);
             yield json_encode([
                 'type' => 'done',
                 'answer' => $answer,
@@ -627,6 +631,8 @@ $this->executor->setUserId($userId);
      */
     private function finishAnswer(string $userId, string $message, string $answer, array $messages): string {
         $this->removedFileLinks = false;
+        // The history marker is internal: a model copying it (seen 28/09) must not show it to the user.
+        $answer = trim((string)preg_replace('~^[ \t]*\[EVA: file created in an earlier turn:[^\]\n]*\][ \t]*\R?~mu', '', $answer));
         $answer = $this->removeUnbackedFileLinks($userId, $answer, $messages);
         $lang = substr($this->uiLanguage(), 0, 2);
         if ($this->removedFileLinks) {
@@ -761,6 +767,23 @@ $this->executor->setUserId($userId);
         }
     }
 
+    /**
+     * What the user is asking, for the intent checks (file request, weather). A short confirmation ("oui", "ok",
+     * "go", "vas-y", "yes", "نعم") answers EVA's previous question: it is read together with the previous user
+     * message (seen 28/09: "oui" after "créer un pdf…" was not seen as a file request, so no retry).
+     */
+    private function requestIntent(string $message, array $history): string {
+        if (preg_match('~^\s*(oui|ouais|ok|okay|go|vas-?y|allez|d[\'’]accord|daccord|yes|yep|sure|please|stp|svp|نعم|أجل|ja)(?!\p{L})[\s!.,]*([\p{L}\'’-]{0,12}[\s!.,]*){0,2}$~iu', $message) !== 1) {
+            return $message;
+        }
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            if (($history[$i]['role'] ?? '') === 'user' && trim((string)($history[$i]['content'] ?? '')) !== '') {
+                return trim((string)$history[$i]['content']) . "\n" . $message;
+            }
+        }
+        return $message;
+    }
+
     /** True when the user asks EVA to produce a file (not how to make one). */
     private function isFileCreationRequest(string $message): bool {
         $m = mb_strtolower(trim($message));
@@ -771,7 +794,7 @@ $this->executor->setUserId($userId);
         if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
             return false;
         }
-        $verb = '(cr[eé]+[rsz]?|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
+        $verb = '(cr[eé]+[rsz]?|creat\p{L}*|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
         // Not "tableau / table / markdown / note" alone: "fais un tableau comparatif" is an in-chat answer (second review, 28/09).
         $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|datei|ملف|مستند|اكسل)';
         // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),
@@ -781,6 +804,8 @@ $this->executor->setUserId($userId);
         // les fichiers PDF » is text). Arabic has no such article: its objects stay direct.
         $intro = '(?<!\p{L})(un|une|a|an|en|as|au\s+format|new|nouveau|nouvelle|neue?s?|ein|eine)\s+(\p{L}+\s+)?';
         return preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})[^.?!\n]{0,60}' . $intro . $existing . $object . '(?!\p{L})~u', $m) === 1
+            // "crée pdf", "creat pdf", "export excel": a format right after the verb, no article needed.
+            || preg_match('~(?<!\p{L})' . $verb . '(?!\p{L})\s+(moi\s+|me\s+|nous\s+|it\s+|this\s+|ça\s+|cela\s+|le\s+tout\s+)?(en\s+|as\s+|to\s+|au\s+format\s+)?(pdf|docx|word|excel|xlsx|csv)(?!\p{L})~u', $m) === 1
             || preg_match('~(?<!\p{L})(أنشئ|انشئ|اصنع|اكتب|اعمل)(?!\p{L})[^.?!\n]{0,40}(ملف|مستند|اكسل)~u', $m) === 1;
     }
 
@@ -827,7 +852,9 @@ $this->executor->setUserId($userId);
      *    "38 °C demain à Dubaï" invented).
      */
     private function nudgeFor(string $message, string $answer, array $tools): ?string {
-        if ($this->needsCreationNudge($message, $answer, $tools)) {
+        if ($this->needsCreationNudge($message, $answer, $tools)
+            || ($this->createdFiles === [] && !$this->fileToolAttempted && $this->hasTool($tools, 'create_file')
+                && $this->isFileCreationRequest($message) && $this->offersCreationInstead($answer))) {
             return self::CREATION_NUDGE;
         }
         if (!isset($this->calledTools['web_search']) && $this->hasTool($tools, 'web_search') && $this->offersSearchInstead($answer)) {
@@ -838,6 +865,34 @@ $this->executor->setUserId($userId);
             return self::WEATHER_NUDGE;
         }
         return null;
+    }
+
+    /**
+     * The user asked for a file and the answer OFFERS to make it ("Would you like me to create a new PDF?", seen
+     * 28/09) instead of making it: the request already is the answer to that question.
+     */
+    private function offersCreationInstead(string $answer): bool {
+        $a = mb_strtolower(trim($answer));
+        return $a !== '' && preg_match('~(would\s+you\s+like|do\s+you\s+want|shall\s+i|should\s+i|voulez-vous|souhaitez-vous|veux-tu|dois-je)'
+            . '(\s+(me|que\s+je|que\s+j[\'’]))?(\s+to)?\s+(create|cr[ée]e|g[ée]n[èe]re|generate|make|faire|fasse|proceed|proc[èe]de|produce|prepare|pr[ée]pare)~u', $a) === 1;
+    }
+
+    /**
+     * A call to a tool that does not exist (seen 28/09: the model invented "convert_file", failed twice, then gave
+     * up). The error now says what exists, so the next step is the real one instead of a retry or a surrender.
+     *
+     * @param array<string,mixed> $res
+     * @return array<string,mixed>
+     */
+    private function explainUnknownTool(array $res): array {
+        $error = (string)($res['error'] ?? $res['reason'] ?? '');
+        if (!empty($res['ok']) || !str_starts_with($error, 'Unknown tool')) {
+            return $res;
+        }
+        $res['error'] = $error . '. This tool does not exist: use only the tools you were given, never invent one. To turn an existing '
+            . 'file into a PDF, DOCX or XLSX: read it with extract_file_text (or read_file; use search_files first if you are not sure of '
+            . 'its folder), then call create_file with the new path (e.g. "Documents/name.pdf") and the content (a Markdown table for tabular data).';
+        return $res;
     }
 
     /** The answer offers a web search, or claims it cannot reach the web / real-time news, instead of searching. */

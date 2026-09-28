@@ -38,7 +38,7 @@ foreach (['SEARCH_NUDGE', 'WEATHER_NUDGE'] as $c) {
 // eval() ne charge que du code extrait de NOTRE fichier versionné src/RagService.php (voir test_liens_fichiers.php).
 $methodes = ['forcedWebSearch', 'isFileCreationRequest', 'claimsCreation', 'needsCreationNudge', 'hasTool', 'citesUrl',
     'removeUnbackedFileLinks', 'stripFileLinkLines', 'finishAnswer', 'collectToolSources', 'addCreatedFile', 'appendFileLinks',
-    'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion'];
+    'isPrivateOrInventedHost', 'nudgeFor', 'offersSearchInstead', 'isWeatherQuestion', 'requestIntent', 'offersCreationInstead', 'explainUnknownTool'];
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), $methodes));
 eval('class RagSousTest {
     ' . str_replace('private const', 'public const', $nudge[0]) . '
@@ -67,6 +67,8 @@ eval('class RagSousTest {
     public function affirme(string $a): bool { return $this->claimsCreation($a); }
     public function relanceGenerale(string $q, string $a, array $outils): ?string { return $this->nudgeFor($q, $a, $outils); }
     public function meteo(string $q): bool { return $this->isWeatherQuestion($q); }
+    public function intention(string $m, array $h): string { return $this->requestIntent($m, $h); }
+    public function inconnu(array $r): array { return $this->explainUnknownTool($r); }
     public function fichier(string $q): bool { return $this->isFileCreationRequest($q); }
     public function relance(string $q, string $reponse, array $outils): bool { return $this->needsCreationNudge($q, $reponse, $outils); }
     public function collecter(string $outil, array $res): void { $this->collectToolSources($outil, $res); }
@@ -259,6 +261,25 @@ foreach (["donne moi la temperature de demin a dubai", "Quelle est la météo à
 foreach (["Quelle température pour cuire un poulet ?", "La température du serveur est élevée", "Explique le climat de Dubaï en été", "La température du four à 180 degrés"] as $qm) {
     verifie('pas une question météo : ' . $qm, !$t->meteo($qm));
 }
+
+// ── 4 ter. Conversation réelle du 28/09 04:20 : « creer un pdf a partir du fichier excel » → outil inventé, proposition, « oui »
+$t = new RagSousTest();
+$h = [['role' => 'user', 'content' => 'creer un pdf a partir du fichier excel'], ['role' => 'assistant', 'content' => 'Would you like me to create a new PDF document for you?']];
+verifie('« oui » après une proposition → lu avec la demande précédente', $t->fichier($t->intention('oui', $h)), $t->intention('oui', $h));
+verifie('« go » / « ok vas-y » / « نعم » aussi', $t->fichier($t->intention('go', $h)) && $t->fichier($t->intention('ok vas-y', $h)) && $t->fichier($t->intention('نعم', $h)));
+verifie('message normal → inchangé', $t->intention('Quelle heure est-il ?', $h) === 'Quelle heure est-il ?');
+foreach (["creat pdf", "creer pdf", "crée moi pdf", "exporte en pdf", "export excel", "creer un pdf a partir du fichier excel"] as $qc) {
+    verifie('création demandée : ' . $qc, $t->fichier($qc));
+}
+verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
+$r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
+verifie('« Would you like me to create a new PDF…? » en réponse à une demande de PDF → relance création', $r === RagSousTest::CREATION_NUDGE, (string)$r);
+$r = $t->inconnu(['ok' => false, 'error' => 'Unknown tool: convert_file']);
+verifie('outil inventé (convert_file) → l\'erreur explique la vraie marche (extract_file_text puis create_file)', str_contains($r['error'], 'extract_file_text') && str_contains($r['error'], 'create_file') && str_contains($r['error'], 'never invent'));
+verifie('autre erreur → inchangée', $t->inconnu(['ok' => false, 'error' => 'Folder not found'])['error'] === 'Folder not found');
+$t = new RagSousTest();
+$r = $t->finir("I have created a new PDF document named \"Rendez_vous.pdf\".\n\n[EVA: file created in an earlier turn: Rendez_vous.pdf]", [], "creat pdf");
+verifie('marqueur interne recopié par le modèle → retiré de l\'affichage, note « aucun fichier » ajoutée', !str_contains($r, '[EVA:') && str_contains($r, 'ℹ️'), $r);
 
 // ── 5. Faux liens : le cas réel du 28/09 (Excel), recopié tel quel
 $t = new RagSousTest();
