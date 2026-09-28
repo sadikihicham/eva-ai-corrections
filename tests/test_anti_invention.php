@@ -680,5 +680,9 @@ $rag3 = ['role' => 'user', 'content' => "<file_context>\nx\n</file_context>\n\nU
 verifie('ville dans la question après le contexte → acceptée', $t->gardeMeteo(['location' => 'Dubai'], [$rag3]) === null);
 verifie('relance météo : « never guess » + « ask … which city »', str_contains(RagSousTest::WEATHER_NUDGE, 'never guess') && str_contains(RagSousTest::WEATHER_NUDGE, 'which city'));
 
+// Identité (prod 28/09 : « من أنت؟ » → « أنا هشام ») : règles dans le prompt système, bloc KNOWLEDGE.md = l'utilisateur
+verifie('prompt : nom Infinity AI en lettres latines + من أنت / من أنا', str_contains($source, 'always written in Latin letters exactly') && str_contains($source, 'من أنت') && str_contains($source, 'أنت …'));
+verifie('bloc KNOWLEDGE.md présenté comme faits sur l\'UTILISATEUR (« me »/« I » = l\'utilisateur)', str_contains($source, 'Personal facts about the USER from their KNOWLEDGE.md') && str_contains($source, '<personal_knowledge>'));
+
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
