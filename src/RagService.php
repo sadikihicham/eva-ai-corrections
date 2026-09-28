@@ -1324,8 +1324,8 @@ $this->executor->setUserId($userId);
     /**
      * A `weather` call for a place the user never gave (recette 28/09, G.2: "Quel temps fera-t-il demain ?" → weather
      * "Abu Dhabi", invented): not run, the model must ask. The place must appear in what the user wrote (this message,
-     * earlier ones), in the context EVA gave (files, KNOWLEDGE.md, Talk history: all in the user turn), or in a tool
-     * result of this answer (e.g. an event's location). Compared without case or accents, with common exonyms
+     * earlier ones, their custom instructions, their KNOWLEDGE.md facts) or in a tool result of this answer (e.g. an
+     * event's location). File excerpts and Talk history the RAG adds are NOT the user naming a place (prod 28/09 12:05). Compared without case or accents, with common exonyms
      * (Londres/London, دبي/Dubaï/Dubai). A place typed as "à Xxx / in Xxx" in the current message is trusted too, so a
      * model translating a city not in the list is not refused. Assistant turns never count: the model cannot vouch for
      * itself.
@@ -1359,7 +1359,10 @@ $this->executor->setUserId($userId);
             // demain ?" ran weather("Abu Dhabi") because an indexed document named the city). The user's own
             // KNOWLEDGE.md facts ("I live in Sharjah") still count.
             if ($role === 'user' && ($q = mb_strrpos($content, 'User question: ')) !== false) {
-                $facts = preg_match('~<personal_knowledge>(.*?)</personal_knowledge>~s', $content, $k) === 1 ? $k[1] : '';
+                // Only EVA's own block, after the file excerpts: a document holding "<personal_knowledge>…" must not
+                // pass for the user's facts (review of d127780).
+                $afterFiles = ($f = mb_strrpos($content, '</file_context>')) !== false ? mb_substr($content, $f) : '';
+                $facts = preg_match('~<personal_knowledge>(.*?)</personal_knowledge>~s', $afterFiles, $k) === 1 ? $k[1] : '';
                 $said .= ' ' . $facts . ' ' . mb_substr($content, $q + 15);
             } else {
                 $said .= ' ' . $content;
