@@ -113,3 +113,21 @@ merge a été reverté n'apporte rien — il faut alors « revert du revert ».
   4 merges (supprimer `corrige-outils-vllm` avant d'avoir re-ciblé #2 fermerait/re-ciblerait #2 d'office).
 - Sort de `PROBLEMES.md` non commité (§2.2).
 - Mettre une CI minimale (aucun check sur les 4 PR aujourd'hui).
+
+## 7. Merges et déploiement du 28/09 (mode autonome, GO admin « merge, pousse et déploie »)
+
+| PR | Contenu | Merge |
+|---|---|---|
+| #6 | convert_file, confirmation d'écrasement, lecture des PDF (déjà en production 2f83b99) | 54df298 |
+| #5 | recette fonctionnelle (42 tests) + résultats du 28/09 | fdfdaad |
+| #7 | corrections de la recette : données perso, suppressions confirmées, xlsx, recherche/météo | fac9497 |
+
+- **Production = 6d7455e** (fichiers `src/` identiques à fac9497), déployée le 28/09 à 11:24 par `appliquer-eva.sh`.
+- Sauvegarde : `/srv/sauvegarde-eva_ai/avant-eva-20260928-112356` (état 2f83b99).
+  Retour arrière : `bash deploiement/retour-arriere-eva.sh /srv/sauvegarde-eva_ai/avant-eva-20260928-112356`.
+- Vérifié en production (vrai vLLM) : H.1 ✅ lit l'agenda · H.2 ◐ (écriture inventée refusée, agenda lu, mais le
+  fichier n'est pas créé ensuite) · B.1 ✅ colonnes · F.4 ✅ recherche web · G.2 ◐ (plus de ville inventée, mais
+  ne demande pas la ville) · I.1 ✅ garde vérifiée directement (web = confirmation, autonome = refus) · dépannage
+  « mon email ne marche plus » ✅ sans lecture de la boîte.
+- Branches `recette-eva`, `conversion-et-ecrasement`, `fix-recette-*`, `corrections-recette` : gardées (suppression
+  sur ordre nommé seulement).
