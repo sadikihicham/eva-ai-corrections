@@ -108,6 +108,13 @@ class ToolPolicy {
             'requiresConfirmation' => true,
             'description' => 'Create or overwrite several bounded text files',
         ],
+        // Added 28/09 (admin): PDF ↔ Word/Excel/Markdown conversion; same rules as create_file.
+        'convert_file' => [
+            'risk' => self::RISK_MUTATING,
+            'surfaces' => [self::SURFACE_WEB, self::SURFACE_TASKPROCESSING_CONFIRMED],
+            'requiresConfirmation' => true,
+            'description' => 'Convert a document into another format (text kept)',
+        ],
         'create_note' => [
             'risk' => self::RISK_MUTATING,
             'surfaces' => [self::SURFACE_WEB, self::SURFACE_TASKPROCESSING_CONFIRMED],

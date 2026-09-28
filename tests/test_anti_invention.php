@@ -338,6 +338,21 @@ verifie('« Comment convertir un fichier en pdf ? » reste une question', !$t->f
 verifie('« Le fichier X.md a été converti en fichier PDF avec succès » = affirmation', $t->affirme('Le fichier Taux_de_chômage.md a été converti en fichier PDF avec succès. Vous pouvez le consulter ici : Taux_de_chômage.pdf.'));
 verifie('« The file has been converted » / « I converted » = affirmation', $t->affirme('Your file has been converted to PDF.') && $t->affirme("I've converted the document."));
 verifie('conversion affirmée sans outil d\'écriture → relance création', $t->relance('convertir ce fichier doc en fichier pdf', 'Le fichier Taux_de_chômage.md a été converti en fichier PDF avec succès.', $tous));
+// Test admin 28/09 06:14 : modification d'un fichier existant affirmée sans outil (« a été mis à jour »), sans aucune note.
+foreach (['ajoute la date d. aujourdhui dans le fichier  Taux_de_chômage.pdf.', 'ajoute du text dans le fichier pdf ajoute la date daujourd hui',
+          'tu peux editer le fichier  Taux_de_chômage.pdf et ajoute la date d aujourduit dans le fichier ? puis l ouvrir',
+          'modifie le document Rapport.docx', 'add a line to the file notes.md', 'أضف التاريخ في الملف'] as $qc) {
+    verifie('modification de fichier = demande d\'écriture : ' . $qc, $t->fichier($qc));
+}
+foreach (['ajoute une tâche : appeler le fournisseur demain à 10h', 'Comment modifier un fichier pdf ?', 'ajoute 2 et 3', 'mets à jour mon agenda'] as $qc) {
+    verifie('pas une modification de fichier : ' . $qc, !$t->fichier($qc));
+}
+verifie('« Le fichier `X.pdf` a été mis à jour » = affirmation', $t->affirme("Le fichier `Taux_de_chômage.pdf` a été mis à jour avec la date d'aujourd'hui."));
+verifie('« The file has been updated » / « j\'ai modifié » = affirmation', $t->affirme('The file has been updated.') && $t->affirme("J'ai modifié le fichier."));
+verifie('modification affirmée sans outil → relance', $t->relance('ajoute la date d. aujourdhui dans le fichier  Taux_de_chômage.pdf.', "Le fichier `Taux_de_chômage.pdf` a été mis à jour avec la date d'aujourd'hui.", $tous));
+verifie('« Voulez-vous que je procède à cette extraction ? » → relance création', $t->relanceGenerale('convertir le fichier Taux_de_chômage.pdf en document doc', "Pour cela, nous devons d'abord extraire le texte du fichier PDF. Voulez-vous que je procède à cette extraction ?", $tous) === RagSousTest::CREATION_NUDGE);
+verifie('« Shall I proceed? » seul reste une clarification (pas de relance)', $t->relanceGenerale('creer un pdf a partir du fichier excel', 'Which Excel file do you mean? Shall I proceed?', $tous) !== RagSousTest::CREATION_NUDGE);
+verifie('outil inventé → l\'erreur oriente vers convert_file', str_contains((string)($t->inconnu(['ok' => false, 'error' => 'Unknown tool: transform_file'])['error'] ?? ''), 'convert_file'));
 verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
 $r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
 verifie('« Would you like me to create a new PDF…? » en réponse à une demande de PDF → relance création', $r === RagSousTest::CREATION_NUDGE, (string)$r);
