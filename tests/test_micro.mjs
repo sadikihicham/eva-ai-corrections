@@ -628,6 +628,18 @@ test('dictée juste au-dessus du seuil (1,6 s de voix) : transcrite et insérée
   p.fermer();
 });
 
+test('seuil au plus près (revue M3) : 1,48 s de voix refusée, 1,52 s transcrite', async () => {
+  // Garde contre un décalage d'une fenêtre (rééchantillonnage, arrondi) qui ferait basculer le seuil.
+  for (const [voix, posts] of [[1.48, 0], [1.52, 1]]) {
+    const p = await monter({ duree: 4, voix });
+    await attendre(() => p.bouton());
+    await dicter(p);
+    assert.equal(p.posts().length, posts, voix + ' s de voix');
+    assert.equal(p.d.getElementById('chatinput').value, posts ? TEXTE_SECRET : '');
+    p.fermer();
+  }
+});
+
 test('dureeVoix : compte les fenêtres de 20 ms au-dessus de -40 dBFS, même dispersées', async () => {
   const p = await monter();
   const { dureeVoix } = p.w.EvaDictee.__test__;
