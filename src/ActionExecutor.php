@@ -1970,6 +1970,9 @@ class ActionExecutor {
     }
 
     /** @return array{ok:true,result:string} */
+    /** Set by convertFile() around its createFile() call: the .docx is written as plain lines, not Markdown. */
+    private bool $docxPlain = false;
+
     private function createFile(Folder $home, array $args): array {
         $path = $this->cleanPath((string)($args['path'] ?? ''));
         $binary = array_key_exists('content_base64', $args);
@@ -2037,7 +2040,7 @@ class ActionExecutor {
             }
         }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'docx') {
-            try { $content = $this->buildDocx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'DOCX generation is unavailable on this server: ' . $e->getMessage()]; }
+            try { $content = $this->buildDocx($content, !$this->docxPlain); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'DOCX generation failed: ' . $e->getMessage()]; }
         }
         if (!$binary && strtolower(pathinfo($name, PATHINFO_EXTENSION)) === 'pptx') {
             try { $content = $this->buildPptx($content); } catch (\Throwable $e) { return ['ok' => false, 'error' => 'PPTX generation is unavailable on this server: ' . $e->getMessage()]; }
@@ -2115,18 +2118,21 @@ class ActionExecutor {
      * skips --- rules and blank lines (paragraph spacing comes from the default style, Calibri 11). Before 28/09 every
      * line was a raw paragraph: « # Titre » and « - point » were printed as such. A paragraph whose first letter is
      * Arabic-script (Arabic, Urdu) is right-to-left with its language (ur-PK when Urdu-only letters appear, else ar-SA).
+     * $markdown = false (convert_file from a PDF, text or Word source, review of 469ba22): one line = one paragraph, blank
+     * lines kept, nothing interpreted (« - 12 - », « ____ », « 3. Résultats » stay as written).
      * Self-contained (closures only): tests/test_docx.php extracts it.
      */
-    private function buildDocx(string $text): string {
+    private function buildDocx(string $text, bool $markdown = true): string {
         if (!class_exists(\ZipArchive::class)) throw new \RuntimeException('PHP ZipArchive extension is required');
         $esc = static fn(string $v): string => htmlspecialchars((string)preg_replace(['/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '/[\x{FFFE}\x{FFFF}]/u'], '', $v), ENT_XML1 | ENT_COMPAT | ENT_SUBSTITUTE, 'UTF-8');
         $rtl = static fn(string $v): bool => preg_match('/\p{L}/u', $v, $f) === 1 && preg_match('/\p{Arabic}/u', $f[0]) === 1;
         // Runs of one paragraph, **bold** kept. rPr children in schema order: rFonts, b, bCs, color, sz, szCs, rtl, lang.
-        $runs = static function (string $v, bool $bold = false, int $size = 0, string $color = '', string $font = '') use ($esc, $rtl): string {
+        $runs = static function (string $v, bool $bold = false, int $size = 0, string $color = '', string $font = '', bool $md = true) use ($esc, $rtl): string {
             $isRtl = $rtl($v); $out = '';
-            foreach (preg_split('/(\*\*[^*]+\*\*)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [$v] as $part) {
-                $b = $bold || (str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4);
-                $t = str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4 ? substr($part, 2, -2) : $part;
+            foreach ($md ? (preg_split('/(\*\*[^*]+\*\*)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [$v]) : [$v] as $part) {
+                $isBold = $md && str_starts_with($part, '**') && str_ends_with($part, '**') && strlen($part) > 4;
+                $b = $bold || $isBold;
+                $t = $isBold ? substr($part, 2, -2) : $part;
                 $rpr = ($font !== '' ? '<w:rFonts w:ascii="' . $font . '" w:hAnsi="' . $font . '" w:cs="' . $font . '"/>' : ($isRtl ? '<w:rFonts w:cs="Arial"/>' : ''))
                     . ($b ? '<w:b/><w:bCs/>' : '') . ($color !== '' ? '<w:color w:val="' . $color . '"/>' : '')
                     . ($size > 0 ? '<w:sz w:val="' . $size . '"/><w:szCs w:val="' . $size . '"/>' : '')
@@ -2135,7 +2141,7 @@ class ActionExecutor {
             }
             return $out;
         };
-        // pPr children in schema order: keepNext, numPr, bidi, spacing, ind, shd…
+        // pPr children in schema order: keepNext, numPr, shd, bidi, spacing, ind…
         $para = static fn(string $v, string $ppr = '', string $runsXml = ''): string => '<w:p>'
             . ($ppr !== '' || $rtl($v) ? '<w:pPr>' . str_replace('<!--bidi-->', $rtl($v) ? '<w:bidi/>' : '', $ppr === '' ? '<!--bidi-->' : $ppr) . '</w:pPr>' : '')
             . $runsXml . '</w:p>';
@@ -2160,7 +2166,13 @@ class ActionExecutor {
 
         $lines = preg_split('/\R/u', str_replace("\t", '    ', $text));
         if ($lines === false) throw new \RuntimeException('invalid UTF-8 text');
-        $body = ''; $inCode = false; $rows = []; $numId = 2; $listKind = ''; $lastTable = false;
+        $body = ''; $inCode = false; $rows = []; $numId = 2; $listKind = ''; $lastTable = false; $starts = [];
+        if (!$markdown) {
+            foreach ($lines as $line) {
+                $body .= trim($line) === '' ? '<w:p/>' : $para($line, '', $runs($line, false, 0, '', '', false));
+            }
+            $lines = [];
+        }
         $flushTable = static function () use (&$rows, &$body, &$lastTable, $table): void {
             if ($rows !== []) { $body .= $table($rows); $rows = []; $lastTable = true; }
         };
@@ -2168,7 +2180,7 @@ class ActionExecutor {
             $line = rtrim($raw);
             if (preg_match('/^\s*```/', $line)) { $flushTable(); $inCode = !$inCode; $listKind = ''; continue; }
             if ($inCode) {
-                $body .= $para('', '<w:spacing w:before="0" w:after="0"/><w:shd w:val="clear" w:color="auto" w:fill="F2F4F7"/>', $runs($line, false, 19, '', 'Courier New')); $lastTable = false;
+                $body .= $para('', '<w:shd w:val="clear" w:color="auto" w:fill="F2F4F7"/><w:spacing w:before="0" w:after="0"/>', $runs($line, false, 19, '', 'Courier New')); $lastTable = false;
                 continue;
             }
             if (preg_match('/^\s*\|(.+)\|\s*$/u', $line, $m)) {
@@ -2178,9 +2190,10 @@ class ActionExecutor {
                 continue;
             }
             $flushTable();
-            if (trim($line) === '' || preg_match('/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/', $line)) { $listKind = ''; continue; }
+            if (trim($line) === '') continue;   // a blank line does not end a list (« 1. a ⏎⏎ 2. b » = one list)
+            if (preg_match('/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/', $line)) { $listKind = ''; continue; }
             $lastTable = false;
-            if (preg_match('/^\s{0,3}(#{1,6})\s+(.+?)\s*#*$/u', $line, $m)) {
+            if (preg_match('/^\s{0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$/u', $line, $m)) {
                 $level = strlen($m[1]); $size = [1 => 36, 2 => 30, 3 => 26][$level] ?? 24;
                 $body .= $para($m[2], '<w:keepNext/><!--bidi--><w:spacing w:before="' . ($level === 1 ? 360 : 240) . '" w:after="120"/>', $runs($m[2], true, $size, '1F2A37'));
                 $listKind = '';
@@ -2188,9 +2201,10 @@ class ActionExecutor {
             }
             if (preg_match('/^(\s*)([-*+•]|\d+[.)])\s+(.+)$/u', $line, $m)) {
                 $kind = ctype_digit(rtrim($m[2], '.)')) ? 'n' : 'b';
-                if ($kind === 'n' && $listKind !== 'n') $numId++;   // each numbered list restarts at 1
-                $listKind = $kind;
                 $ilvl = min(2, intdiv(strlen($m[1]), 2));
+                // A new numbered list starts at the number written (« 3. » stays 3); a sub-bullet does not end it.
+                if ($kind === 'n' && $listKind !== 'n' && $ilvl === 0) { $numId++; $starts[$numId] = max(1, (int)rtrim($m[2], '.)')); }
+                if ($ilvl === 0) $listKind = $kind;
                 $body .= $para($m[3], '<w:numPr><w:ilvl w:val="' . $ilvl . '"/><w:numId w:val="' . ($kind === 'n' ? $numId : 1) . '"/></w:numPr><!--bidi--><w:spacing w:after="60"/>', $runs($m[3]));
                 continue;
             }
@@ -2215,7 +2229,7 @@ class ActionExecutor {
             . '<w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="hybridMultilevel"/>' . $lvls(true) . '</w:abstractNum>'
             . '<w:abstractNum w:abstractNumId="1"><w:multiLevelType w:val="hybridMultilevel"/>' . $lvls(false) . '</w:abstractNum>'
             . '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>';
-        for ($i = 3; $i <= $numId; $i++) $numbering .= '<w:num w:numId="' . $i . '"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>';
+        for ($i = 3; $i <= $numId; $i++) $numbering .= '<w:num w:numId="' . $i . '"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="' . ($starts[$i] ?? 1) . '"/></w:lvlOverride></w:num>';
         $numbering .= '</w:numbering>';
         $styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles ' . $W . '><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Arial"/>'
             . '<w:sz w:val="22"/><w:szCs w:val="22"/><w:lang w:val="fr-FR"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>'
@@ -3167,7 +3181,9 @@ class ActionExecutor {
         if ($text === '') {
             return ['ok' => false, 'error' => 'No text could be read from ' . $source . ' (a scanned PDF needs OCR, which is not enabled). Nothing was written.'];
         }
-        $res = $this->createFile($home, ['path' => $target, 'content' => $text]);
+        // Text from a PDF / text / Word source is not Markdown: written line by line (review of 469ba22).
+        $this->docxPlain = !in_array($ext, ['md', 'markdown'], true);
+        try { $res = $this->createFile($home, ['path' => $target, 'content' => $text]); } finally { $this->docxPlain = false; }
         if (!empty($res['ok'])) {
             $res['result'] = (string)$res['result'] . ' (converted from ' . $source . ': text only — layout, images and fonts are not kept)';
         }

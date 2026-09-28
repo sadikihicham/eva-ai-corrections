@@ -33,7 +33,7 @@ $corps = implode("\n", array_map(fn($m) => extraire($source, $m), ['convertFile'
 $consts = implode('', array_map(fn($c) => constante($source, $c), ['EXTRACTED_FORMATS', 'CONVERT_TARGETS', 'MAX_READ_CHARS', 'MAX_READ_CHUNK_CHARS', 'MAX_READ_FILE_BYTES', 'NOTES_FOLDER', 'INDEXER_MAX_CHARS']));
 eval('class ConvSousTest {
     ' . $consts . '
-    public array $ecrit = []; public array $extraits = []; public string $texte = "";  public bool $encore = false; public ?int $total = null;
+    public array $ecrit = []; public bool $docxPlain = false; public array $extraits = []; public string $texte = "";  public bool $encore = false; public ?int $total = null;
     private function resolve(Folder $home, string $p) { return $home->get($p); }
     private function extractFileText(Folder $home, array $args): array { $this->extraits[] = $args["path"]; return ["ok" => true, "result" => ["path" => $args["path"], "content" => $this->texte, "has_more" => $this->encore, "total_chars" => $this->total ?? mb_strlen($this->texte)]]; }
     private function createFile(Folder $home, array $args): array { $this->ecrit[] = $args; return ["ok" => true, "result" => "Created " . $args["path"]]; }

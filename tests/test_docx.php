@@ -11,7 +11,7 @@ function extraire(string $src, string $nom): string {
     for ($i = $ouv, $n = strlen($src); $i < $n; $i++) { if ($src[$i] === '{') $niv++; elseif ($src[$i] === '}' && --$niv === 0) return substr($src, $debut, $i - $debut + 1); }
     exit(2);
 }
-eval('class DocxSousTest { ' . extraire($source, 'buildDocx') . ' public function x(string $t): string { return $this->buildDocx($t); } }');
+eval('class DocxSousTest { ' . extraire($source, 'buildDocx') . ' public function x(string $t, bool $md = true): string { return $this->buildDocx($t, $md); } }');
 $echecs = 0; $total = 0;
 function verifie(string $nom, bool $ok, string $d = ''): void { global $echecs, $total; $total++; echo ($ok ? '✅ ' : '❌ ') . $nom . ($ok ? '' : " → $d") . "\n"; if (!$ok) $echecs++; }
 function doc(string $docx): string { $f = tempnam(sys_get_temp_dir(), 'dx'); file_put_contents($f, $docx); $z = new ZipArchive(); $z->open($f); $x = (string)$z->getFromName('word/document.xml'); $z->close(); unlink($f); return $x; }
@@ -44,5 +44,14 @@ verifie('police par défaut Calibri (styles.xml)', str_contains($p['word/styles.
 $p = parts($g->x("| a | b |\n|---|---|\n| 1 | 2 |")); verifie('document qui finit par un tableau : paragraphe final ajouté', str_ends_with(explode('<w:sectPr>', $p['word/document.xml'])[0], '<w:p/>'));
 $p = parts($g->x("")); verifie('document vide → XML valide', (new DOMDocument())->loadXML($p['word/document.xml']) === true);
 $p = parts($g->x("## العنوان\n- نقطة أولى")); verifie('titre et puce arabes : bidi dans pPr', substr_count($p['word/document.xml'], '<w:bidi/>') === 2);
+// Revue de 469ba22
+$x = doc($g->x("1. Audit\n\n2. Formation\n   - sous-point\n3. Bilan"));
+verifie('liste aérée + sous-puce = UNE seule liste numérotée (pas 1., 1., 1.)', substr_count($x, '<w:numId w:val="3"/>') === 3 && !str_contains($x, '<w:numId w:val="4"/>'));
+$p = parts($g->x("3. Résultats\n4. Suite")); verifie('liste qui commence à 3 → startOverride 3', str_contains($p['word/numbering.xml'], '<w:startOverride w:val="3"/>'));
+$x = doc($g->x("## Langage C#")); verifie('« ## Langage C# » garde son #', str_contains($x, '>Langage C#<'));
+$x = doc($g->x("```\ncode\n```")); verifie('bloc de code : shd AVANT spacing (ordre du schéma)', str_contains($x, '<w:shd w:val="clear" w:color="auto" w:fill="F2F4F7"/><w:spacing'));
+$x = doc($g->x("- 12 -\n# Titre PDF\n\n______\n**pas du gras**\n| a | b |", false));
+verifie('mode texte (PDF → Word) : rien d\'interprété, lignes vides gardées', !str_contains($x, 'w:numPr') && !str_contains($x, '<w:tbl>') && !str_contains($x, '<w:b/>') && str_contains($x, '>- 12 -<') && str_contains($x, '># Titre PDF<') && str_contains($x, '>______<') && str_contains($x, '>**pas du gras**<') && substr_count($x, '<w:p/>') === 1);
+verifie('convert_file : mode texte sauf source Markdown', str_contains($source, "\$this->docxPlain = !in_array(\$ext, ['md', 'markdown'], true);") && str_contains($source, '$this->buildDocx($content, !$this->docxPlain)'));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
