@@ -12,7 +12,12 @@
     private function marksFile(string $userId): \OCP\Files\SimpleFS\ISimpleFile {
         // IAppDataFactory wird lazy geholt statt per Konstruktor injiziert:
         // die Aufloesung blockiert im CLI/taskprocessing-Worker.
-        $appdata = \OC::$server->get(\OCP\AppFramework\Services\IAppDataFactory::class)->get('eva_ai');
+        // CORRIGÉ 28/09/2026 : mauvais espace de noms (la classe
+        // OCP\AppFramework\Services\IAppDataFactory n'existe pas dans
+        // Nextcloud 34 → "Could not resolve …" à chaque create_file/mark).
+        // Le bon espace de noms, déjà utilisé ailleurs dans eva_ai
+        // (UserDataService.php, DirtyIndexStore.php) :
+        $appdata = \OC::$server->get(\OCP\Files\AppData\IAppDataFactory::class)->get('eva_ai');
         try {
             $dir = $appdata->getFolder('ai-marks');
         } catch (\OCP\Files\NotFoundException $e) {
