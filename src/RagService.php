@@ -71,6 +71,24 @@ class RagService {
         . 'mails, tasks, contacts, files), FIRST call the tool that reads that data (e.g. list_calendar_events for appointments) - never write '
         . 'data you have not read with a tool; (2) then call create_file with that real content (to convert a file into another format, call convert_file; to change an existing file, read it, then write the changed version with create_file under a NEW name such as "Name (modifié).pdf" — never replace the original unless the user asked for it). Answer in the language of the user\'s request.';
 
+    /**
+     * Tools that read the user's OWN data, by kind. Recette 28/09: H.2 "crée un fichier excel de mes rendez-vous de la
+     * semaine" wrote invented appointments with no calendar read; H.1 "quels sont mes rendez-vous de cette semaine ?"
+     * was answered with no tool at all. See personalDataKinds(), personalDataWriteGuard(), personalDataNudge().
+     */
+    private const PERSONAL_DATA_READERS = [
+        'calendar' => ['list_calendar_events', 'find_free_slots'],
+        'mail' => ['search_mails', 'list_mails', 'read_mail', 'summarize_emails', 'unread_mail_count'],
+        'contacts' => ['list_contacts', 'find_contact'],
+        'tasks' => ['list_tasks'],
+    ];
+    /** %s = the reader tool(s) to call. */
+    private const PERSONAL_DATA_NUDGE = '[Automatic check by EVA, not written by the user] The user asked about their own data and you answered without '
+        . 'reading it: nothing you said about it comes from their account. Call %s now, then answer only from its result (if it returns '
+        . 'nothing, say so plainly - never invent entries), in the language of the user\'s request.';
+    /** @var array<string,true> write tools already refused once by personalDataWriteGuard() in this answer */
+    private array $personalWriteBlocked = [];
+
     public function __construct(
         private AppConfig $config,
         private Ollama $ollama,
@@ -127,6 +145,7 @@ class RagService {
         $this->fileToolAttempted = false;
         $this->writeToolSucceeded = false;
         $this->calledTools = [];
+        $this->personalWriteBlocked = [];
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -199,6 +218,7 @@ class RagService {
                 if ($onProgress !== null) $onProgress('tool', (string)($tc['name'] ?? ''), is_array($toolArgs) ? $toolArgs : []);
 				$toolStartedAt = microtime(true);
 				$overwrite = !empty($tc['recovered']) ? $this->recoveredOverwrite($userId, $tc) : null;
+				$overwrite ??= $this->inventionGuard($intent, (string)($tc['name'] ?? ''), is_array($toolArgs) ? $toolArgs : [], $tools, $messages);
 				$res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
 					? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
 						: ($autonomousActions
@@ -281,6 +301,7 @@ class RagService {
             $this->fileToolAttempted = false;
             $this->writeToolSucceeded = false;
             $this->calledTools = [];
+            $this->personalWriteBlocked = [];
         try {
             if ($this->clientDisconnected()) {
                 return;
@@ -308,7 +329,8 @@ $this->executor->setUserId($userId);
             $nudges = 0;
             // When a file is requested, the model's text is not streamed live: if it only claims the file, the
             // retry replaces it, and the browser never shows the invented text (it gets `done.answer`).
-            $holdText = $this->isFileCreationRequest($intent) || $this->isWeatherQuestion($intent);
+            // Same for the user's own data (recette 28/09, H.1): an answer given without reading it is retried.
+            $holdText = $this->isFileCreationRequest($intent) || $this->isWeatherQuestion($intent) || $this->personalDataKinds($intent) !== [];
 			$requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
             $forced = $this->webSearchAvailable() && $this->hasTool($tools, 'web_search') ? $this->forcedWebSearch($message) : null;
             if ($forced !== null && !$this->clientDisconnected()) {
@@ -389,6 +411,7 @@ $this->executor->setUserId($userId);
                     $fingerprint = hash('sha256', $toolName . ':' . json_encode($toolArgs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
                     $seenToolCalls[$fingerprint] = ($seenToolCalls[$fingerprint] ?? 0) + 1;
                     $overwrite = !empty($tc['recovered']) ? $this->recoveredOverwrite($userId, $tc) : null;
+                    $overwrite ??= $this->inventionGuard($intent, (string)$toolName, is_array($toolArgs) ? $toolArgs : [], $tools, $messages);
                     $res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
                         ? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
                         : $this->executor->run($userId, $toolName, $toolArgs));
@@ -692,8 +715,9 @@ $this->executor->setUserId($userId);
      *    ("php latest version", "gold price today"): the user's words never
      *    leave the instance, even when the detector is wrong (second review,
      *    28/09: every blocklist of "work words" could be walked around).
-     *    Only two such cases: latest version / release of a NAMED product, and
-     *    the price or rate of a market asset. News, office holders and weather
+     *    Only three such cases: latest version / release of a NAMED product,
+     *    the price or rate of a market asset, and the winner / result of a NAMED
+     *    competition (forcedCompetitionSearch). News, office holders and weather
      *    are left to the model (weather has its own tool).
      * Always mode "web": "all"/"news" also query the Bing/Google News feeds
      * whatever provider the admin chose.
@@ -755,7 +779,84 @@ $this->executor->setUserId($userId);
                 return ['query' => implode(' ', array_keys($tokens)) . ($rate ? ' exchange rate today' : ' price today'), 'mode' => 'web'];
             }
         }
-        return null;
+        return $this->forcedCompetitionSearch($m);
+    }
+
+    /**
+     * Winner / result of a NAMED public competition or event (recette 28/09, F.4: "qui a gagné la dernière Coupe du
+     * monde de football ?" answered "2022" from memory on 28/09/2026). Same rule as forcedWebSearch(): the query is
+     * REBUILT from recognised tokens only ("football world cup winner"), never the user's words; a match, final or
+     * election without a recognised name is left to the model. Called after the work-words filter.
+     *
+     * @param string $m the lower-cased message
+     * @return array{query:string,mode:string}|null
+     */
+    private function forcedCompetitionSearch(string $m): ?array {
+        $winner = '(?<!\p{L})(gagn[ée]\p{L}*|remport[ée]\p{L}*|gagnant\p{L}*|vainqueur\p{L}*|champion\p{L}*|won|wins?|winners?|palmar[èe]s)(?!\p{L})|فاز|الفائز|بطل';
+        $result = '(?<!\p{L})(r[ée]sultats?|results?|derni[eè]re?s?|latest|last|most\s+recent|plus\s+r[ée]cente?s?)(?!\p{L})|أحدث|آخر|الأخيرة|الأخير|نتيجة|نتائج';
+        $isWinner = preg_match('~' . $winner . '~u', $m) === 1;
+        if (!$isWinner && preg_match('~' . $result . '~u', $m) !== 1) {
+            return null;
+        }
+        $events = [
+            '~(?<!\p{L})(ligue\s+des\s+champions|champions\s+league)(?!\p{L})|دوري\s+(ال)?أبطال~u' => 'uefa champions league',
+            '~(?<!\p{L})(ligue\s+europa|europa\s+league)(?!\p{L})~u' => 'uefa europa league',
+            '~(?<!\p{L})(coupe\s+d[\'’]afrique|africa\s+cup\s+of\s+nations|afcon)(?!\p{L})~u' => 'africa cup of nations',
+            '~(?<!\p{L})(coupe\s+d[\'’]asie|asian\s+cup)(?!\p{L})|كأس\s+آسيا~u' => 'afc asian cup',
+            '~(?<!\p{L})(euro\s+(de\s+)?(football|foot)|uefa\s+euro|championnat\s+d[\'’]europe\s+de\s+football)(?!\p{L})~u' => 'uefa euro',
+            '~(?<!\p{L})(coupe\s+du\s+monde|world\s+cup|mondial)(?!\p{L})|كأس\s+العالم|(?<!\p{L})champion\p{L}*\s+du\s+monde\s+de\s+(football|foot)(?!\p{L})~u' => 'world cup',
+            '~(?<!\p{L})ballon\s+d[\'’]\s*or(?!\p{L})~u' => 'ballon d\'or',
+            '~(?<!\p{L})(jeux\s+olympiques|olympics?|olympiques?|jo)(?!\p{L})|الألعاب\s+الأولمبية~u' => 'olympic games',
+            '~(?<!\p{L})(oscars?|academy\s+awards?)(?!\p{L})~u' => 'oscars',
+            '~(?<!\p{L})nobel(?!\p{L})~u' => 'nobel prize',
+            '~(?<!\p{L})super\s+bowl(?!\p{L})~u' => 'super bowl',
+            '~(?<!\p{L})tour\s+de\s+france(?!\p{L})~u' => 'tour de france',
+            '~(?<!\p{L})(roland[\s-]garros|french\s+open)(?!\p{L})~u' => 'roland garros',
+            '~(?<!\p{L})wimbledon(?!\p{L})~u' => 'wimbledon',
+            '~(?<!\p{L})(formule\s*1|formula\s*(1|one)|f1)(?![\p{L}\d])~u' => 'formula 1 world championship',
+            '~(?<!\p{L})eurovision(?!\p{L})~u' => 'eurovision',
+            '~(?<!\p{L})([ée]lections?\s+pr[ée]sidentielles?|pr[ée]sidentielles?|presidential\s+elections?)(?!\p{L})|الانتخابات\s+الرئاسية~u' => 'presidential election',
+        ];
+        $token = null;
+        foreach ($events as $re => $name) {
+            if (preg_match($re, $m) === 1) {
+                $token = $name;
+                break;
+            }
+        }
+        if ($token === null) {
+            return null;
+        }
+        if ($token === 'world cup') {
+            $sport = 'football';
+            foreach (['rugby' => 'rugby', 'cricket' => 'cricket', 'handball' => 'handball', 'basket(ball)?' => 'basketball', 'volley(ball)?' => 'volleyball'] as $re => $name) {
+                if (preg_match('~(?<!\p{L})' . $re . '(?!\p{L})~u', $m) === 1) {
+                    $sport = $name;
+                    break;
+                }
+            }
+            $token = $sport . ' world cup';
+        } elseif ($token === 'presidential election') {
+            // Which country: only a recognised one, else it cannot be rebuilt.
+            $country = null;
+            foreach (['~(?<!\p{L})(am[ée]ricaines?|[ée]tats-unis|usa|us|american|united\s+states)(?!\p{L})|الأمريكية~u' => 'us',
+                      '~(?<!\p{L})(fran[çc]aises?|france|french)(?!\p{L})|الفرنسية~u' => 'france'] as $re => $name) {
+                if (preg_match($re, $m) === 1) {
+                    $country = $name;
+                    break;
+                }
+            }
+            if ($country === null) {
+                return null;
+            }
+            $token = $country . ' ' . $token;
+        } elseif ($token === 'nobel prize') {
+            $token = preg_match('~(?<!\p{L})(paix|peace)(?!\p{L})~u', $m) === 1 ? 'nobel peace prize'
+                : (preg_match('~(?<!\p{L})(litt[ée]rature|literature)(?!\p{L})~u', $m) === 1 ? 'nobel prize in literature' : 'nobel prize');
+        }
+        // A year is a public token too ("coupe du monde 2018").
+        $year = preg_match('~(?<!\d)(19[5-9]\d|20\d\d)(?!\d)~', $m, $y) === 1 ? ' ' . $y[1] : '';
+        return ['query' => $token . $year . ($isWinner ? ' winner' : ' latest results'), 'mode' => 'web'];
     }
 
     /**
@@ -901,13 +1002,19 @@ $this->executor->setUserId($userId);
      *    impossible instead of being done (seen 28/09: "appel news ?"). The
      *    model then writes its own query, as when it searches by itself;
      *  - a weather question answered without the weather tool (seen 28/09:
-     *    "38 °C demain à Dubaï" invented).
+     *    "38 °C demain à Dubaï" invented);
+     *  - the user's own data (agenda, mail, contacts, tasks) asked for and
+     *    answered without reading it (recette 28/09, H.1: PERSONAL_DATA_NUDGE).
      */
     private function nudgeFor(string $message, string $answer, array $tools): ?string {
         if ($this->needsCreationNudge($message, $answer, $tools)
             || ($this->createdFiles === [] && !$this->fileToolAttempted && $this->hasTool($tools, 'create_file')
                 && $this->isFileCreationRequest($message) && $this->offersCreationInstead($answer))) {
             return self::CREATION_NUDGE;
+        }
+        // Before the search nudge: "voulez-vous que je cherche…" about the user's agenda is no web search.
+        if (($personal = $this->personalDataNudge($message, $answer, $tools)) !== null) {
+            return $personal;
         }
         if (!isset($this->calledTools['web_search']) && $this->hasTool($tools, 'web_search') && $this->offersSearchInstead($answer)) {
             return self::SEARCH_NUDGE;
@@ -1012,6 +1119,215 @@ $this->executor->setUserId($userId);
             return 'Could not check whether the file already exists. Nothing was written.';
         }
         return null;
+    }
+
+    /**
+     * Checks run before ANY tool call (real or recovered) in both loops: the error to give back instead of running
+     * it, or null. Wired next to recoveredOverwrite().
+     *
+     * @param array<string,mixed> $args
+     * @param list<array<string,mixed>> $tools
+     * @param list<array<string,mixed>> $messages
+     */
+    private function inventionGuard(string $intent, string $toolName, array $args, array $tools, array $messages): ?string {
+        return $this->personalDataWriteGuard($intent, $toolName, $tools) ?? $this->weatherPlaceGuard($toolName, $args, $messages);
+    }
+
+    /**
+     * Kinds of the user's OWN data the request is about: 'calendar', 'mail', 'contacts', 'tasks' (or []).
+     * Only with a possessive ("mes rendez-vous", "my tasks"), a time frame ("réunions demain", "rendez-vous de la
+     * semaine", "today's meetings") or "ai-je / do I have": "écris un mail à Marc pour lui proposer un rendez-vous"
+     * (writing, not reading) and "un modèle Excel vide pour noter des rendez-vous" do not count, nor how-to questions
+     * ("comment créer un rendez-vous dans Nextcloud ?"). "un/a + noun" is never a time-framed read ("un rendez-vous
+     * la semaine prochaine" is one to propose).
+     *
+     * @return list<string>
+     */
+    private function personalDataKinds(string $message): array {
+        $m = mb_strtolower(trim((string)preg_replace('/\s+/u', ' ', $message)));
+        if ($m === '' || mb_strlen($m) > 2000
+            || preg_match('~(?<!\p{L})(comment(?!\s+(se\s+pr[ée]sente|va|vont|sont|est)(?!\p{L}))|how\s+(do|does|can|could|should|to)|explique|explain)(?!\p{L})|كيف~u', $m) === 1) {
+            return [];
+        }
+        $strong = [
+            'calendar' => 'r[eo]nd[eé]?z?[-\s]?vous|rdv|agenda|calendrier|r[ée]unions?|meetings?|appointments?|calendar|مواعيد|موعد|اجتماعات|اجتماع|تقويم',
+            'mail' => 'e-?mails?|mails?|courriels?|messages?\s+(re[çc]us|non\s+lus)|unread\s+messages?|bo[iî]te\s+de\s+r[ée]ception|inbox|بريد|رسائل',
+            'contacts' => 'contacts?|carnet\s+d[\'’]adresses?|address\s+book|جهات\s+الاتصال',
+            'tasks' => 't[âa]ches?|tasks?|to-?dos?|مهام|مهمة',
+        ];
+        // Only with a possessive: "les événements de la semaine à Dubaï" is public, "mes événements" is not.
+        $weak = ['calendar' => '[ée]v[ée]nements?|events?|planning|schedule|emploi\s+du\s+temps'];
+        // Arabic possessive suffix (-ي).
+        $arabicOwn = ['calendar' => 'مواعيدي|اجتماعاتي|تقويمي', 'mail' => 'بريدي|رسائلي', 'contacts' => 'جهات\s+اتصالي', 'tasks' => 'مهامي'];
+        $time = '(aujourd[\'’\s]?hui|auj|demain|demin|apr[èe]s-demain|ce\s+matin|cet\s+apr[èe]s-midi|ce\s+soir|cette\s+semaine|de\s+la\s+semaine|semaine\s+prochaine'
+            . '|du\s+jour|ce\s+mois|du\s+mois|ce\s+week-?end|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|non\s+lus|re[çc]us'
+            . '|today|tomorrow|tonight|this\s+(week|morning|afternoon|evening|month|weekend)|next\s+(week|month)|of\s+the\s+week'
+            . '|monday|tuesday|wednesday|thursday|friday|saturday|sunday|unread|received|اليوم|غدا|غدًا|غداً|هذا\s+الأسبوع)';
+        $ask = '(ai-je|avons-nous|est-ce\s+que\s+j[\'’]ai|do\s+i\s+have|have\s+i\s+(got|any)|did\s+i\s+(get|receive)|any\s+new|لدي|عندي)';
+        // "mes prochains rendez-vous" / "my upcoming team meetings", not "mon compte rendu de réunion".
+        $own = '(?<!\p{L})(mes|mon|ma|my|nos|notre|our)\s+(?:(?!(?:de|du|des|d|of)(?!\p{L}))\p{L}+\s+){0,2}';
+        $kinds = [];
+        foreach (array_keys(self::PERSONAL_DATA_READERS) as $kind) {
+            $noun = '(?:' . $strong[$kind] . ')';
+            $anyNoun = isset($weak[$kind]) ? '(?:' . $strong[$kind] . '|' . $weak[$kind] . ')' : $noun;
+            $bare = (string)preg_replace('~(?<!\p{L})(un|une|a|an)\s+(\p{L}+\s+)?' . $noun . '(?!\p{L})~u', ' ', $m);
+            if (preg_match('~' . $own . $anyNoun . '(?!\p{L})~u', $m) === 1
+                || preg_match('~(?<!\p{L})' . $noun . '(?!\p{L})[^.?!؟\n]{0,30}?(?<!\p{L})' . $time . '(?!\p{L})~u', $bare) === 1
+                || preg_match('~(?<!\p{L})' . $time . '(?:[\'’]s)?\s+(\p{L}+\s+)?' . $noun . '(?!\p{L})~u', $bare) === 1
+                || preg_match('~(?<!\p{L})' . $ask . '(?!\p{L})[^.?!؟\n]{0,40}?(?<!\p{L})' . $noun . '(?!\p{L})|(?<!\p{L})' . $noun . '(?!\p{L})[^.?!؟\n]{0,40}?(?<!\p{L})' . $ask . '(?!\p{L})~u', $bare) === 1
+                || preg_match('~' . $arabicOwn[$kind] . '~u', $m) === 1) {
+                $kinds[] = $kind;
+            }
+        }
+        return $kinds;
+    }
+
+    /**
+     * For each kind of the user's own data the request is about and that no tool has read yet in this answer, the
+     * first reader offered to the model (none offered: nothing better can be asked, so the kind is skipped).
+     *
+     * @param list<array<string,mixed>> $tools
+     * @return list<string>
+     */
+    private function unreadPersonalData(string $message, array $tools): array {
+        $missing = [];
+        foreach ($this->personalDataKinds($message) as $kind) {
+            $readers = self::PERSONAL_DATA_READERS[$kind];
+            if (array_intersect_key($this->calledTools, array_flip($readers)) !== []) {
+                continue;
+            }
+            foreach ($readers as $reader) {
+                if ($this->hasTool($tools, $reader)) {
+                    $missing[] = $reader;
+                    break;
+                }
+            }
+        }
+        return $missing;
+    }
+
+    /**
+     * A file write about the user's own data while nothing read that data (recette 28/09, H.2: create_file with
+     * invented appointments, no calendar read): not run, the model is told which reader to call first. Refused ONCE per
+     * write tool: a second attempt runs (the read may have failed, the data may be empty), so this can never lock a
+     * request; a write after a read always runs.
+     *
+     * @param list<array<string,mixed>> $tools
+     */
+    private function personalDataWriteGuard(string $intent, string $toolName, array $tools): ?string {
+        if (!in_array($toolName, ['create_file', 'create_files'], true) || isset($this->personalWriteBlocked[$toolName])) {
+            return null;
+        }
+        $missing = $this->unreadPersonalData($intent, $tools);
+        if ($missing === []) {
+            return null;
+        }
+        $this->personalWriteBlocked[$toolName] = true;
+        return 'Nothing was written: this file must hold the user\'s own data and you have not read it. Call ' . implode(' and ', $missing)
+            . ' first, then write only what it returns (if it returns nothing, say so instead of inventing entries).';
+    }
+
+    /**
+     * The user asked for their own data (recette 28/09, H.1: "quels sont mes rendez-vous de cette semaine ?" answered
+     * "je ne trouve pas dans les fichiers… voulez-vous que je crée un fichier ?" with no tool) and the answer came with
+     * no read: the retry to send, or null. Not for a file request (CREATION_NUDGE and the write guard cover it), nor
+     * for a real clarification (ends with "?" without saying "not found" or offering to act).
+     *
+     * @param list<array<string,mixed>> $tools
+     */
+    private function personalDataNudge(string $message, string $answer, array $tools): ?string {
+        if ($this->isFileCreationRequest($message)) {
+            return null;
+        }
+        $missing = $this->unreadPersonalData($message, $tools);
+        if ($missing === []) {
+            return null;
+        }
+        $a = mb_strtolower(trim($answer));
+        if (preg_match('~[?؟]\s*$~u', $a) === 1 && preg_match('~je\s+ne\s+(trouve|vois|dispose)|n[\'’]ai\s+pas\s+(acc[èe]s|trouv)|pas\s+(d[\'’]information|acc[èe]s)'
+            . '|aucun\p{L}*\s+(rendez|rdv|r[ée]union|mail|e-?mail|courriel|message|information|donn[ée]e|t[âa]che|contact|[ée]v[ée]nement)'
+            . '|voulez-vous\s+que|souhaitez-vous\s+que|veux-tu\s+que|dois-je|would\s+you\s+like\s+me|do\s+you\s+want\s+me|shall\s+i|should\s+i'
+            . '|i\s+(can(no|[\'’])t|could\s+not|couldn[\'’]t|don[\'’]t|do\s+not)\s+(find|see|have)|no\s+(information|appointments?|meetings?|events?|e-?mails?|tasks?|contacts?)'
+            . '|لا\s+(يمكنني|أستطيع|أجد)~u', $a) !== 1) {
+            return null;
+        }
+        return sprintf(self::PERSONAL_DATA_NUDGE, implode(' and ', $missing));
+    }
+
+    /**
+     * A `weather` call for a place the user never gave (recette 28/09, G.2: "Quel temps fera-t-il demain ?" → weather
+     * "Abu Dhabi", invented): not run, the model must ask. The place must appear in what the user wrote (this message,
+     * earlier ones), in the context EVA gave (files, KNOWLEDGE.md, Talk history: all in the user turn), or in a tool
+     * result of this answer (e.g. an event's location). Compared without case or accents, with common exonyms
+     * (Londres/London, دبي/Dubaï/Dubai). A place typed as "à Xxx / in Xxx" in the current message is trusted too, so a
+     * model translating a city not in the list is not refused. Assistant turns never count: the model cannot vouch for
+     * itself.
+     *
+     * @param array<string,mixed> $args
+     * @param list<array<string,mixed>> $messages
+     */
+    private function weatherPlaceGuard(string $toolName, array $args, array $messages): ?string {
+        if ($toolName !== 'weather') {
+            return null;
+        }
+        $place = $this->placeKey(explode(',', (string)($args['location'] ?? ''))[0]);
+        if ($place === '') {
+            return null;   // the tool itself refuses an empty location
+        }
+        $said = '';
+        $current = '';
+        foreach ($messages as $msg) {
+            $role = (string)($msg['role'] ?? '');
+            if ($role === 'system' && is_string($msg['content'] ?? null)
+                && preg_match('~<user_instructions>(.*?)</user_instructions>~s', $msg['content'], $own) === 1) {
+                // The user's own custom instructions ("I live in Sharjah", a briefing's city) are the user speaking.
+                $said .= ' ' . $own[1];
+                continue;
+            }
+            if ($role !== 'user' && $role !== 'tool') {
+                continue;
+            }
+            $content = is_string($msg['content'] ?? null) ? $msg['content'] : (string)json_encode($msg['content'] ?? '', JSON_UNESCAPED_UNICODE);
+            $said .= ' ' . $content;
+            if ($role === 'user' && !str_starts_with($content, '[Automatic check by EVA')) {
+                $current = $content;
+            }
+        }
+        if (str_contains(' ' . $this->placeKey($said) . ' ', ' ' . $place . ' ')) {
+            return null;
+        }
+        // Only the question itself: the file context in the same turn is not the user naming a place.
+        $question = ($p = mb_strrpos($current, 'User question: ')) !== false ? mb_substr($current, $p + 15) : $current;
+        // Not "pour": "demain pour Marc" names a person, not a place.
+        if (preg_match('~(?<!\p{L})(à|au|aux|en|in|at|near|près\s+de|sur)\s+(l[ae]\s+|l[\'’]\s*)?\p{Lu}\p{L}{2,}~u', $question) === 1) {
+            return null;
+        }
+        return 'The user gave no place: ask which city (never guess one). Nothing was fetched.';
+    }
+
+    /** Lower case, no accents, letters and digits only, common exonyms mapped to one name (weatherPlaceGuard). */
+    private function placeKey(string $text): string {
+        $t = mb_strtolower($text);
+        if (class_exists(\Normalizer::class) && is_string($n = \Normalizer::normalize($t, \Normalizer::FORM_D))) {
+            $t = (string)preg_replace('/\p{Mn}+/u', '', $n);
+        } else {
+            // Without intl: the Latin accents that matter for place names.
+            $t = strtr($t, ['à' => 'a', 'â' => 'a', 'ä' => 'a', 'á' => 'a', 'é' => 'e', 'è' => 'e', 'ê' => 'e', 'ë' => 'e', 'î' => 'i', 'ï' => 'i', 'í' => 'i',
+                'ô' => 'o', 'ö' => 'o', 'ó' => 'o', 'ù' => 'u', 'û' => 'u', 'ü' => 'u', 'ú' => 'u', 'ç' => 'c', 'ñ' => 'n', 'أ' => 'ا', 'إ' => 'ا', 'آ' => 'ا']);
+        }
+        $t = ' ' . trim((string)preg_replace('/[^\p{L}\p{N}]+/u', ' ', $t)) . ' ';
+        $aliases = ['doubai' => 'dubai', 'dubay' => 'dubai', 'دبي' => 'dubai', 'abou dhabi' => 'abu dhabi', 'abou dabi' => 'abu dhabi', 'abu dabi' => 'abu dhabi',
+            'ابو ظبي' => 'abu dhabi', 'ابوظبي' => 'abu dhabi', 'charjah' => 'sharjah', 'الشارقة' => 'sharjah', 'عجمان' => 'ajman', 'العين' => 'al ain',
+            'ras el khaimah' => 'ras al khaimah', 'راس الخيمة' => 'ras al khaimah', 'الفجيرة' => 'fujairah', 'الرياض' => 'riyadh', 'riyad' => 'riyadh', 'جدة' => 'jeddah', 'djeddah' => 'jeddah',
+            'الدوحة' => 'doha', 'مسقط' => 'muscat', 'mascate' => 'muscat', 'المنامة' => 'manama', 'الكويت' => 'kuwait', 'koweit' => 'kuwait', 'القاهرة' => 'cairo', 'le caire' => 'cairo', 'caire' => 'cairo',
+            'بيروت' => 'beirut', 'beyrouth' => 'beirut', 'الرباط' => 'rabat', 'الدار البيضاء' => 'casablanca', 'مراكش' => 'marrakech', 'marrakesh' => 'marrakech', 'تونس' => 'tunis', 'alger' => 'algiers',
+            'مكة' => 'mecca', 'la mecque' => 'mecca', 'makkah' => 'mecca', 'باريس' => 'paris', 'لندن' => 'london', 'londres' => 'london', 'geneve' => 'geneva', 'geneva' => 'geneva', 'bruxelles' => 'brussels',
+            'lisbonne' => 'lisbon', 'moscou' => 'moscow', 'pekin' => 'beijing', 'varsovie' => 'warsaw', 'vienne' => 'vienna', 'athenes' => 'athens', 'copenhague' => 'copenhagen',
+            'munchen' => 'munich', 'venise' => 'venice', 'edimbourg' => 'edinburgh', 'le cap' => 'cape town', 'new york city' => 'new york', 'nyc' => 'new york'];
+        foreach ($aliases as $from => $to) {
+            $t = (string)preg_replace('~(?<= )' . preg_quote($from, '~') . '(?= )~u', $to, $t);
+        }
+        return trim($t);
     }
 
     /** The question shown before a write replaces existing files, in the interface language. */
