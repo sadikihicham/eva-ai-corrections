@@ -52,7 +52,7 @@ class TalkBotRegistrar {
 			return;
 		}
 		$bot = new BotServer();
-		$bot->setName('Eva');
+		$bot->setName('Infinity AI');
 		$bot->setUrl(self::BOT_URL);
 		$bot->setUrlHash(sha1(self::BOT_URL));
 		$bot->setSecret($this->random->generate(64));
