@@ -1,4 +1,4 @@
-# Contrat de la dictée (bouton micro d'Infinity AI) — v2, 28/09/2026
+# Contrat de la dictée (bouton micro d'Infinity AI) — v2.1, 28/09/2026
 
 Remplace la v1 (route audio côté serveur, ABANDONNÉE). Toute modification = décision de l'intégrateur.
 
@@ -7,7 +7,9 @@ Remplace la v1 (route audio côté serveur, ABANDONNÉE). Toute modification = d
   et seulement quand l'utilisateur l'envoie lui-même.
 - Transcription par Whisper installé **sur l'ordinateur de l'utilisateur** (test : le Mac de l'admin).
   Les autres postes n'ont rien : le bouton n'apparaît simplement pas chez eux.
-- Langue de la voix : **« Automatique » par défaut + choix manuel** (fr / ar / en), mémorisé.
+- Langue de la voix : **détection automatique SEULE**, aucun choix manuel (décision admin, v2.1).
+- **L'interface bascule automatiquement dans la langue parlée** (fr / ar / en) : changement de la langue
+  du compte Nextcloud puis rechargement, le texte dicté étant conservé (voir « Bascule de langue »).
 - Le texte est inséré dans la **zone de saisie** ; l'utilisateur relit et envoie. Jamais d'envoi automatique.
 - Enregistrement : **120 s maximum**.
 
@@ -25,16 +27,32 @@ Aucune route audio dans eva_ai. Le serveur ne reçoit que le message tapé/dict�
 - `GET /` → 200 (sert à tester la disponibilité).
 
 ## Règle de langue (faite dans le NAVIGATEUR)
-- Choix manuel fr/ar/en ⇒ envoyer `language=<code>` (un seul appel).
-- « Automatique » ⇒ appel en `verbose_json` sans `language` ; si la langue détectée ∉ {french, arabic,
-  english} ⇒ **UN SEUL** second appel avec `language=<langue de l'interface Nextcloud, 2 lettres>` si elle
-  est fr/ar/en, sinon `fr`. (Mesuré : la détection a rendu « islandais » sur une vraie dictée courte ;
+- Toujours `verbose_json` sans `language` ; texte = `segments[].text` recollés SANS séparateur (un segment
+  peut commencer au milieu d'un mot arabe, mesuré).
+- Si la langue détectée ∉ {french, arabic, english} ⇒ **UN SEUL** second appel avec `language=` la dernière
+  langue bien détectée pendant la session, sinon la langue de l'interface (fr/ar/en), sinon `fr`.
+  Pas de seuil de probabilité pour ce repli (mesuré : un seuil casse l'arabe court).
+- Silence / `[BLANK_AUDIO]` testé AVANT le repli (pas de second appel sur un silence). (Mesuré : la détection a rendu « islandais » sur une vraie dictée courte ;
   imposer une MAUVAISE langue produit du charabia, d'où le choix manuel.)
 - Réponse `[BLANK_AUDIO]` / vide ⇒ message « rien d'audible », rien inséré.
 
+## Bascule de langue de l'interface (décision admin : automatique)
+- Conditions, TOUTES requises : langue ∈ {fr, ar, en} ; probabilité de détection ≥ 0,80 ; audio ≥ 2 s ;
+  langue ≠ langue actuelle de la page ; pas de bascule dans les 30 dernières secondes ; repli non utilisé.
+  (Garde-fou d'implémentation : un mot court mal reconnu — « Non » lu vietnamien le 28/09 — ne bascule rien.)
+- Action : texte inséré, sauvegardé en sessionStorage (≤ 2 min, effacé à la restauration), puis
+  `PUT /ocs/v2.php/cloud/users/<uid>` `language=<code>` (OCS-APIRequest + requesttoken), puis rechargement.
+  C'est le SEUL appel du script vers Nextcloud ; il ne contient jamais le texte.
+- Effet : c'est la langue du COMPTE, donc tout Nextcloud (Fichiers, Talk…) change de langue.
+- **[non vérifié]** eva_ai ne livre dans ce dépôt que les traductions `de` et `en` : en `ar`/`fr`, les textes
+  propres à Infinity AI peuvent rester en anglais (repli Nextcloud) ; à constater en recette.
+
 ## Serveur eva_ai (PageController seulement)
-- Réglage app `eva_ai` / `dictation_local_url` (ex. `http://localhost:8178/v1`), posé par
-  `occ config:app:set eva_ai dictation_local_url --value=…`. Vide/absent ⇒ fonction ÉTEINTE (rien chargé).
+- Deux interrupteurs, tous deux requis (revue sécurité I-1 : sinon TOUS les navigateurs sondent localhost) :
+  - `occ config:app:set eva_ai dictation_local_url --value=http://127.0.0.1:8178/v1` (préférer 127.0.0.1 à
+    localhost : pas de résolution de nom, pas de `::1`) ;
+  - `occ user:setting <uid> eva_ai dictation_enabled yes` (par utilisateur ayant Whisper sur son poste).
+  Vide/absent/erreur de lecture ⇒ fonction ÉTEINTE (rien chargé, jamais d'erreur 500).
 - **Garde-fou** : l'URL n'est acceptée que si son hôte est exactement `localhost` ou `127.0.0.1`
   (schéma http/https, port facultatif, pas d'utilisateur/mot de passe). Toute autre valeur ⇒ éteinte.
   C'est ce qui garantit que la page ne peut pas envoyer l'audio ailleurs que sur la machine de l'utilisateur.
@@ -49,6 +67,12 @@ Aucune route audio dans eva_ai. Le serveur ne reçoit que le message tapé/dict�
 - `transcrire(wav, langue)` : seule fonction qui parle à Whisper.
 - Insertion au curseur + événement `input` ; textes fr/en/ar/de/ur ; RTL ; accessibilité ; Échap = annuler ;
   compteur 2 min. Jamais de texte dicté dans la console. Jamais d'appel à un autre hôte que celui de la meta.
+
+## Limite assumée
+- L'invariant « l'audio reste sur le poste » tient contre la CONFIGURATION (garde-fous serveur + navigateur +
+  CSP), pas contre du code hostile déjà présent dans la page (il pourrait appeler getUserMedia lui-même).
+- whisper-server répond `CORS *` : un site ouvert sur le poste peut l'utiliser (pas lire les dictées).
+  Durcissement possible : proxy local qui n'accepte que l'origine Nextcloud (à décider par l'admin).
 
 ## Prérequis navigateur (hors code)
 - Micro = contexte sécurisé : **HTTPS obligatoire** pour la page Nextcloud (phase 1 HTTPS). Avant cela,

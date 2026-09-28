@@ -41,6 +41,12 @@ $cas = [
     ['http://localhost:8178/v1" onerror="x', null],            // caractères interdits (meta)
     ['http://0.0.0.0:8178/v1', null],
     ['http://127.0.0.2:8178/v1', null],
+    ['http://127.1:8178/v1', null],                            // forme courte d'IPv4
+    ['http://0x7f000001:8178/v1', null],                       // IPv4 hexadécimale
+    ['http://0x7f.0.0.1:8178/v1', null],
+    ['http://localhost.:8178/v1', null],                       // point final
+    ['http://@localhost:8178/v1', null],                       // utilisateur vide
+    ['https://localhost:443/v1', 'https://localhost:443'],
 ];
 foreach ($cas as [$url, $attendu]) {
     $total++;
