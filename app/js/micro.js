@@ -32,9 +32,10 @@
  *  - Enregistrement quasi muet (aucune fenêtre de 20 ms au-dessus de -40 dBFS) ⇒ « rien d'audible »
  *    SANS appeler Whisper : sur du silence, Whisper invente du texte (mesuré le 28/09 : 40 s de
  *    silence ⇒ « Thank you. Thank you. »).
- *  - Moins d'1 s de voix au total (fenêtres de 20 ms au-dessus de -40 dBFS) ⇒ « dictée trop courte »
+ *  - Moins de 1,5 s de voix au total (fenêtres de 20 ms au-dessus de -40 dBFS) ⇒ « dictée trop courte »
  *    SANS appeler Whisper : sur un énoncé si bref il se trompe même en langue forcée (mesuré le 28/09 :
- *    0,8 s de voix en français ⇒ « Washington, MZN. »).
+ *    0,8 s de voix en français ⇒ « Washington, MZN. » ; sur 8 vraies dictées, 0,82 à 1,10 s de voix
+ *    ⇒ texte faux, 2,34 s et plus ⇒ juste).
  *  - 1er appel en verbose_json sans `language`. Jetons [BLANK_AUDIO]/[silence] retirés partout ;
  *    réponse vide ⇒ « rien d'audible », aucun second appel.
  *  - Langue détectée ∉ {french, arabic, english} ⇒ UN SEUL 2e appel avec `language` = dernière langue
@@ -59,7 +60,7 @@
       failed: 'La transcription a échoué. Réessayez.',
       empty: 'Rien d’audible n’a été entendu.', limit: 'Durée maximale atteinte : enregistrement arrêté.',
       too_long: 'Enregistrement trop long : raccourcissez-le.',
-      too_short: 'Dictée trop courte : parlez au moins une seconde.',
+      too_short: 'Dictée trop courte : dites une phrase complète.',
       invalid_audio: 'Enregistrement illisible. Réessayez.',
       network: 'Service de dictée injoignable sur cet ordinateur.', nozone: 'Zone de saisie introuvable : texte non inséré.',
       switched: 'Dictée annulée : vous avez changé de conversation.', cancelled: 'Dictée annulée.' },
@@ -70,7 +71,7 @@
       failed: 'Transcription failed. Please try again.',
       empty: 'Nothing audible was heard.', limit: 'Maximum length reached: recording stopped.',
       too_long: 'Recording too long: please make it shorter.',
-      too_short: 'Dictation too short: speak for at least one second.',
+      too_short: 'Dictation too short: please say a full sentence.',
       invalid_audio: 'The recording could not be read. Please try again.',
       network: 'Dictation service unreachable on this computer.', nozone: 'Input field not found: text not inserted.',
       switched: 'Dictation cancelled: you switched conversations.', cancelled: 'Dictation cancelled.' },
@@ -81,7 +82,7 @@
       failed: 'تعذّر التحويل إلى نص. حاول مرة أخرى.',
       empty: 'لم يُسمع أي كلام.', limit: 'بلغ التسجيل المدة القصوى فتوقف.',
       too_long: 'التسجيل طويل جدًا: اختصره.',
-      too_short: 'الإملاء قصير جدًا: تكلّم ثانية واحدة على الأقل.',
+      too_short: 'الإملاء قصير جدًا: قل جملة كاملة.',
       invalid_audio: 'تعذّرت قراءة التسجيل. حاول مرة أخرى.',
       network: 'تعذّر الوصول إلى خدمة الإملاء على هذا الحاسوب.', nozone: 'لم يُعثر على خانة الكتابة: لم يُدرج النص.',
       switched: 'أُلغي الإملاء: لقد انتقلت إلى محادثة أخرى.', cancelled: 'أُلغي الإملاء.' },
@@ -92,7 +93,7 @@
       failed: 'Transkription fehlgeschlagen. Bitte erneut versuchen.',
       empty: 'Nichts Hörbares erkannt.', limit: 'Maximale Dauer erreicht: Aufnahme beendet.',
       too_long: 'Aufnahme zu lang: bitte kürzer fassen.',
-      too_short: 'Diktat zu kurz: bitte mindestens eine Sekunde sprechen.',
+      too_short: 'Diktat zu kurz: bitte einen ganzen Satz sprechen.',
       invalid_audio: 'Aufnahme unlesbar. Bitte erneut versuchen.',
       network: 'Diktierdienst auf diesem Computer nicht erreichbar.', nozone: 'Eingabefeld nicht gefunden: Text nicht eingefügt.',
       switched: 'Diktat abgebrochen: Sie haben die Unterhaltung gewechselt.', cancelled: 'Diktat abgebrochen.' },
@@ -103,7 +104,7 @@
       failed: 'متن میں تبدیلی ناکام رہی۔ دوبارہ کوشش کریں۔',
       empty: 'کوئی قابلِ سماعت آواز نہیں ملی۔', limit: 'زیادہ سے زیادہ دورانیہ پورا ہو گیا: ریکارڈنگ روک دی گئی۔',
       too_long: 'ریکارڈنگ بہت طویل ہے: اسے مختصر کریں۔',
-      too_short: 'املا بہت مختصر ہے: کم از کم ایک سیکنڈ بولیں۔',
+      too_short: 'املا بہت مختصر ہے: پورا جملہ بولیں۔',
       invalid_audio: 'ریکارڈنگ پڑھی نہیں جا سکی۔ دوبارہ کوشش کریں۔',
       network: 'اس کمپیوٹر پر املا کی سروس تک رسائی نہیں ہو سکی۔', nozone: 'لکھنے کی جگہ نہیں ملی: متن شامل نہیں ہوا۔',
       switched: 'املا منسوخ: آپ نے گفتگو بدل دی۔', cancelled: 'املا منسوخ ہو گیا۔' },
@@ -177,7 +178,7 @@
     }
     return n * 0.02;
   }
-  const VOIX_MIN_S = 1;
+  const VOIX_MIN_S = 1.5;
 
   const transportLocal = {
     maxSecondes: 120,

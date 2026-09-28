@@ -601,23 +601,26 @@ test('enregistrement muet : Whisper n’est PAS appelé (il invente du texte sur
   p.fermer();
 });
 
-test('dictée trop courte (0,8 s de voix sur 4 s, cas réel du 28/09) : Whisper PAS appelé, rien inséré', async () => {
-  const p = await monter({ duree: 4, voix: 0.8 });
-  await attendre(() => p.bouton());
-  await dicter(p);
-  assert.equal(p.posts().length, 0, 'aucun POST sur un énoncé trop court');
-  assert.equal(p.d.getElementById('chatinput').value, '');
-  assert.equal(p.msg(), 'Dictée trop courte : parlez au moins une seconde.');
-  p.fermer();
+test('dictée trop courte (0,8 s et 1,2 s de voix, cas réels du 28/09) : Whisper PAS appelé, rien inséré', async () => {
+  // Mesuré sur de vraies dictées : 0,82 à 1,10 s de voix ⇒ texte faux (même en langue forcée).
+  for (const voix of [0.8, 1.2]) {
+    const p = await monter({ duree: 4, voix });
+    await attendre(() => p.bouton());
+    await dicter(p);
+    assert.equal(p.posts().length, 0, 'aucun POST sur un énoncé trop court (' + voix + ' s)');
+    assert.equal(p.d.getElementById('chatinput').value, '');
+    assert.equal(p.msg(), 'Dictée trop courte : dites une phrase complète.');
+    p.fermer();
+  }
   const q = await monter({ duree: 4, voix: 0.8, lang: 'ar', dir: 'rtl' });
   await attendre(() => q.bouton());
   await dicter(q);
-  assert.equal(q.msg(), 'الإملاء قصير جدًا: تكلّم ثانية واحدة على الأقل.');
+  assert.equal(q.msg(), 'الإملاء قصير جدًا: قل جملة كاملة.');
   q.fermer();
 });
 
-test('dictée juste au-dessus du seuil (1,2 s de voix) : transcrite et insérée', async () => {
-  const p = await monter({ duree: 4, voix: 1.2 });
+test('dictée juste au-dessus du seuil (1,6 s de voix) : transcrite et insérée', async () => {
+  const p = await monter({ duree: 4, voix: 1.6 });
   await attendre(() => p.bouton());
   await dicter(p);
   assert.equal(p.posts().length, 1);
