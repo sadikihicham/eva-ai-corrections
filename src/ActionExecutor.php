@@ -2458,11 +2458,8 @@ class ActionExecutor {
         }
         $node = $this->resolve($home, $path);
         $parent = $node->getParent();
-        // Same rule as createFile: a text file renamed to .pdf/.xls/… is a corrupt file under a trusted name.
-        $toExt = strtolower(pathinfo($newName, PATHINFO_EXTENSION));
-        if (in_array($toExt, ['pdf', 'doc', 'docx', 'docm', 'xls', 'xlsx', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'], true)
-            && strtolower(pathinfo($path, PATHINFO_EXTENSION)) !== $toExt) {
-            return ['ok' => false, 'error' => 'Changing a file into .' . $toExt . ' by renaming is not allowed: the content would not be a real .' . $toExt . ' file. Nothing was renamed.'];
+        if (($error = $this->binaryExtensionChangeError($path, $newName, 'renaming', 'renamed')) !== null) {
+            return ['ok' => false, 'error' => $error];
         }
         if ($parent->nodeExists($newName)) {
             return ['ok' => false, 'error' => 'Target name already exists'];
@@ -2470,6 +2467,19 @@ class ActionExecutor {
         $node->move($parent->getPath() . '/' . $newName);
         $this->bumpSearchRevision();
         return ['ok' => true, 'result' => 'Renamed to ' . $newName];
+    }
+
+    /**
+     * Same rule as createFile: a text file renamed, moved or copied to .pdf/.xlsx/… is a corrupt file under a
+     * trusted name. Returns the error to give back, or null when the extension does not change into a binary one.
+     */
+    private function binaryExtensionChangeError(string $fromPath, string $toName, string $verb, string $done): ?string {
+        $toExt = strtolower(pathinfo($toName, PATHINFO_EXTENSION));
+        if (in_array($toExt, ['pdf', 'doc', 'docx', 'docm', 'xls', 'xlsx', 'xlsm', 'ppt', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'zip', '7z', 'png', 'jpg', 'jpeg', 'gif', 'webp'], true)
+            && strtolower(pathinfo($fromPath, PATHINFO_EXTENSION)) !== $toExt) {
+            return 'Changing a file into .' . $toExt . ' by ' . $verb . ' is not allowed: the content would not be a real .' . $toExt . ' file. Nothing was ' . $done . '. To get a real .' . $toExt . ', read the source with extract_file_text and call create_file with the .' . $toExt . ' name.';
+        }
+        return null;
     }
 
     /** Move a file or folder to a new relative path, creating destination folders. */
@@ -2487,6 +2497,9 @@ class ActionExecutor {
         $targetName = $this->cleanName($targetName);
         if ($targetName === '') {
             return ['ok' => false, 'error' => 'A valid target name is required'];
+        }
+        if ($node instanceof File && ($error = $this->binaryExtensionChangeError($path, $targetName, 'moving', 'moved')) !== null) {
+            return ['ok' => false, 'error' => $error];
         }
         $destination = $this->ensureFolderPath($home, $targetDir);
         if ($destination->nodeExists($targetName)) {
@@ -2511,6 +2524,9 @@ class ActionExecutor {
         [$targetDir, $targetName] = $this->splitPath($targetPath);
         $targetName = $this->cleanName($targetName);
         if ($targetName === '') return ['ok' => false, 'error' => 'A valid target name is required'];
+        if ($node instanceof File && ($error = $this->binaryExtensionChangeError($path, $targetName, 'copying', 'copied')) !== null) {
+            return ['ok' => false, 'error' => $error];
+        }
         $destination = $this->ensureFolderPath($home, $targetDir);
         if ($destination->nodeExists($targetName)) return ['ok' => false, 'error' => 'Target already exists'];
         $node->copy($destination->getPath() . '/' . $targetName);
