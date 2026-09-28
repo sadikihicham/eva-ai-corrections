@@ -22,7 +22,8 @@ r() { "${SSH[@]}" "$@" </dev/null; }
 
 # Table des fichiers : « chemin dans le dépôt » → « chemin relatif à la racine de l'app ».
 DEPOT=(); CIBLE=()
-for f in src/*.php; do DEPOT+=("$f"); CIBLE+=("lib/Service/${f#src/}"); done
+# src/ : seulement ces 3 fichiers (les autres .php de src/ sont des extraits ou d'anciennes corrections, non déployés).
+for f in ActionExecutor.php RagService.php ToolPolicy.php; do DEPOT+=("src/$f"); CIBLE+=("lib/Service/$f"); done
 while IFS= read -r f; do DEPOT+=("$f"); CIBLE+=("${f#app/}"); done < <(git ls-files app | grep -v '^app/LISEZMOI.md$')
 N=${#DEPOT[@]}
 
