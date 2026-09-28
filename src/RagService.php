@@ -98,6 +98,8 @@ class RagService {
         . '(advice, troubleshooting, drafting a text), give your previous answer again unchanged instead.';
     /** @var array<string,true> write tools already refused once by personalDataWriteGuard() in this answer */
     private array $personalWriteBlocked = [];
+    /** Write-tool calls in this answer, the ones refused by personalWriteBlocked included (needsWriteAfterRead). */
+    private int $writeAttempts = 0;
 
     public function __construct(
         private AppConfig $config,
@@ -156,6 +158,7 @@ class RagService {
         $this->writeToolSucceeded = false;
         $this->calledTools = [];
         $this->personalWriteBlocked = [];
+        $this->writeAttempts = 0;
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -314,6 +317,7 @@ class RagService {
             $this->writeToolSucceeded = false;
             $this->calledTools = [];
             $this->personalWriteBlocked = [];
+        $this->writeAttempts = 0;
         try {
             if ($this->clientDisconnected()) {
                 return;
@@ -519,6 +523,7 @@ $this->executor->setUserId($userId);
         // "no file was created" notice (copy, move, restore… do not fill $createdFiles).
         if (in_array($toolName, self::WRITE_TOOLS, true)) {
             $this->fileToolAttempted = true;
+            $this->writeAttempts++;
             if (!empty($res['ok'])) {
                 $this->writeToolSucceeded = true;
             }
@@ -1051,7 +1056,9 @@ $this->executor->setUserId($userId);
      */
     private function asksForPlace(string $answer): bool {
         $a = mb_strtolower(trim($answer));
+        // Not "…trouver une source fiable dans votre région ?": sending the user elsewhere is what G.2 must not do.
         return preg_match('~[?؟]\s*$~u', $a) === 1
+            && preg_match('~(?<!\p{L})(sources?|services?|sites?|applications?|apps?|website|trouver|find)(?!\p{L})~u', $a) !== 1
             && preg_match('~(?<!\p{L})(ville|villes|lieu|endroit|localit[ée]|r[ée]gion|pays|o[uù]\s+(ça|cela|[êe]tes|es-tu|vous\s+trouvez|te\s+trouves)|city|cities|place|location|where|town|area|مدينة|المدينة|أين|مكان|stadt|wo\s)(?!\p{L})~u', $a) === 1;
     }
 
@@ -1060,8 +1067,11 @@ $this->executor->setUserId($userId);
      * personalDataWriteGuard(), the data has since been read, and still no file exists.
      */
     private function needsWriteAfterRead(string $message, array $tools): bool {
-        if ($this->createdFiles !== [] || $this->personalWriteBlocked === [] || !$this->hasTool($tools, 'create_file')
-            || !$this->isFileCreationRequest($message)) {
+        // Any successful write counts (a file without links, copy_file…: review of ef71676), and only the refused
+        // writes may have been tried: after a write that failed for another reason, the nudge would be wrong.
+        if ($this->createdFiles !== [] || $this->writeToolSucceeded || $this->personalWriteBlocked === []
+            || $this->writeAttempts > count($this->personalWriteBlocked)
+            || !$this->hasTool($tools, 'create_file') || !$this->isFileCreationRequest($message)) {
             return false;
         }
         foreach ($this->personalDataKinds($message) as $kind) {
@@ -1446,6 +1456,12 @@ $this->executor->setUserId($userId);
     /** A question about the weather (forecast, rain, outside temperature), not "the oven temperature". */
     private function isWeatherQuestion(string $message): bool {
         $m = mb_strtolower(trim($message));
+        // Rain or snow in a creative or planning request is no forecast ("écris un poème sur la pluie", "des idées
+        // d'activités s'il pleut": review of ef71676).
+        if (preg_match('~(?<!\p{L})(po[èe]me|poem|po[ée]sie|histoire|story|chanson|song|haïku|haiku|id[ée]es?|ideas?|activit[ée]s?|activities|r[ée]dige|[ée]cris|write|dessin\p{L}*|draw)(?!\p{L})~u', $m) === 1
+            && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|pr[ée]visions?)(?!\p{L})~u', $m) !== 1) {
+            return false;
+        }
         return $m !== '' && mb_strlen($m) <= 300 && preg_match('~(?<!\p{L})(m[ée]t[ée]o|weather|forecast|wetter|pr[ée]visions?\s+m[ée]t[ée]o|pleuvoir|pleut|pluie|neige|rain|snow|الطقس)(?!\p{L})'
             . '|temps\s+(qu[\'’]il\s+)?(fait|fera)|temp[ée]rature[^.?!\n]{0,30}(demain|demin|aujourd|ce\s+soir|cette\s+semaine|week-?end|dehors|ext[ée]rieur|tomorrow|today|tonight|outside)'
             . '|temp[ée]rature[^.?!\n]{0,40}(?<!\p{L})(à|a|au|en|in|at)\s+\p{L}{3,}'
