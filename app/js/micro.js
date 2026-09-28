@@ -204,8 +204,11 @@
         try { j = await r.json(); } catch (e) { throw new ErreurDictee('failed'); }
         if (!j || typeof j !== 'object') throw new ErreurDictee('failed');
         const nom = String(j.language || '').toLowerCase();
+        // whisper-server 1.9.4 (mesuré le 28/09) : `detected_language_probability` (nombre) et
+        // `language_probabilities` indexé par CODE (« ar »), pas par nom (« arabic »).
         const probas = j.language_probabilities && typeof j.language_probabilities === 'object' ? j.language_probabilities : null;
-        const p = probas ? Number(probas[nom]) : NaN;
+        let p = Number(j.detected_language_probability);
+        if (!Number.isFinite(p) && probas) p = Number(probas[LANGUES_WHISPER[nom]] ?? probas[nom]);
         return { text: normaliser(texteDesSegments(j)), nom, probabilite: Number.isFinite(p) ? p : null };
       };
       const premier = await appel(null);

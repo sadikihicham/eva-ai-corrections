@@ -632,7 +632,8 @@ test('retour sur l’onglet (visibilitychange) : disponibilité revérifiée', a
 });
 
 // ------------------------------------------------------------------ bascule de langue de l'interface
-const AR_SUR = { text: 'مرحبا بكم', language: 'arabic', language_probabilities: { arabic: 0.93, persian: 0.03 } };
+// Forme RÉELLE de whisper-server 1.9.4 (mesurée le 28/09) : probabilités indexées par code.
+const AR_SUR = { text: 'مرحبا بكم', language: 'arabic', detected_language: 'arabic', detected_language_probability: 0.93, language_probabilities: { ar: 0.93, fa: 0.03 } };
 
 test('bascule : toutes conditions réunies ⇒ texte inséré, PUT OCS (langue seule), puis rechargement', async () => {
   const p = await monter({ lang: 'fr', duree: 3, whisper: () => reponse(200, AR_SUR) });
@@ -660,7 +661,7 @@ test('bascule : toutes conditions réunies ⇒ texte inséré, PUT OCS (langue s
 
 test('bascule : jamais si probabilité < 0,8 / absente, audio < 2 s, même langue, repli utilisé, < 30 s', async () => {
   const cas = [
-    { nom: 'prob 0,7', o: { duree: 3, whisper: () => reponse(200, { ...AR_SUR, language_probabilities: { arabic: 0.7 } }) } },
+    { nom: 'prob 0,7', o: { duree: 3, whisper: () => reponse(200, { ...AR_SUR, detected_language_probability: 0.7, language_probabilities: { ar: 0.7 } }) } },
     { nom: 'prob absente', o: { duree: 3, whisper: () => reponse(200, { text: 'مرحبا', language: 'arabic' }) } },
     { nom: 'audio 1,5 s', o: { duree: 1.5, whisper: () => reponse(200, AR_SUR) } },
     { nom: 'même langue', o: { lang: 'ar', duree: 3, whisper: () => reponse(200, AR_SUR) } },
