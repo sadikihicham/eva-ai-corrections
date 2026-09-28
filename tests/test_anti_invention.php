@@ -730,13 +730,23 @@ foreach (["traduis « bonjour » en urdu", "comment traduire un fichier en urdu 
 // en anglais. L'app Deck n'est pas installée : refus honnête, sans modèle, dans la langue de la question.
 $t = new RagSousTest(); $t->langue = 'en';
 foreach (["crée une carte Deck pour la réunion de lundi", "ajoute une tâche dans Deck", "make a new Deck board", "create a Deck card for the sprint",
-    "montre mes cartes Deck", "déplace la carte Deck « budget » dans Terminé", "ajoute ça sur Deck", "crée un tableau Deck Projet X",
-    "أنشئ بطاقة Deck للاجتماع", "Deck کارڈ بنائیں", "put this in Deck", "liste Deck des tâches", "erstelle eine Deck-Karte"] as $q) {
+    "montre mes cartes Deck", "déplace la carte Deck « budget » dans Terminé", "crée un tableau Deck Projet X",
+    "أنشئ بطاقة Deck للاجتماع", "Deck کارڈ بنائیں", "liste Deck « courses »", "erstelle eine Deck-Karte",
+    // Revue de 4548ce6 : oubliés
+    "crée une tâche Deck", "new Deck task", "nouvelle carte dans l'app Deck", "create a card in the Deck app", "erstelle eine Karte im Deck",
+    "füge eine Aufgabe zu Deck hinzu", "أضف مهمة إلى ديك", "ڈیک میں کارڈ بنائیں", "crée une carte deck pour demain"] as $q) {
     verifie('demande Deck reconnue : « ' . $q . ' »', $t->deck($q));
 }
 foreach (["crée un slide deck sur la cybersécurité", "fais un deck de présentation", "crée un deck powerpoint", "un pitch deck pour les investisseurs",
     "un deck de cartes Pokémon", "construire un deck en bois", "ajoute une slide dans le deck", "the deck of cards", "crée une carte de visite",
-    "crée une carte mentale", "c'est quoi un deck ?", "mets ça dans mon deck commercial", "on the deck of the ship", ""] as $q) {
+    "crée une carte mentale", "c'est quoi un deck ?", "mets ça dans mon deck commercial", "on the deck of the ship", "",
+    // Revue de 4548ce6 : fichiers, dossiers, decks numérotés, jeux de cartes, bateaux, DJ — un refus à tort bloque TOUTE la demande
+    "ouvre le fichier dans deck.md", "résume le PDF dans Deck/Projets/rapport.pdf", "upload into deck folder", "summarize the investor deck in deck.pptx",
+    "put the chart into deck", "add 3 slides to deck v2", "ajoute 3 slides sur deck v2", "compare the pitch in deck 2 and deck 3",
+    "the cards deck is shuffled", "my magic card deck needs more lands", "list deck cards for Hearthstone", "tableau deck de Mario Kart", "liste deck magic",
+    "wir essen auf Deck", "auf Deck 7 gibt es eine Bar", "Karten auf dem Deck kaufen", "switch to deck B on the mixer", "plug the mixer into deck A",
+    "ajoute 2 cartes au Deck B", "Deck of cards: explain the rules", "crée une carte du Deck de présentation", "le rapport_Deck.docx contient des tâches",
+    "enregistre ça dans Deck", "ajoute ce tableau au deck investisseurs", "الديك يصيح في الصباح"] as $q) {
     verifie('pas une demande Deck : « ' . $q . ' »', !$t->deck($q));
 }
 $r = $t->refusDeck('crée une carte Deck pour la réunion de lundi');
@@ -744,10 +754,14 @@ verifie('refus Deck en français (question en français, interface en anglais)',
 verifie('refus Deck en arabe', str_contains($t->refusDeck('أنشئ بطاقة Deck للاجتماع'), 'غير مثبت'));
 verifie('refus Deck en ourdou (pas en arabe)', str_contains($t->refusDeck('Deck کارڈ بنائیں'), 'انسٹال نہیں'));
 verifie('refus Deck en anglais', str_contains($t->refusDeck('make a new Deck board'), 'is not installed'));
+verifie('refus Deck en anglais pour « create a Deck card » (create ≠ crée)', str_contains($t->refusDeck('create a Deck card for the sprint'), 'is not installed'));
+verifie('refus Deck en ourdou sans ٹڈڑںےہ (« Deck پر کام شامل کرو »)', str_contains($t->refusDeck('Deck پر کام شامل کرو'), 'انسٹال نہیں'));
+verifie('refus Deck en arabe écrit « ديك »', str_contains($t->refusDeck('أضف مهمة إلى ديك'), 'غير مثبت'));
+verifie('ask() : même forme de retour que le chemin normal (clé error)', str_contains($source, '\'model\' => $this->config->get(\'chat_model\'), \'error\' => null, \'followups\' => []];'));
+verifie('Deck activé vérifié pour l\'utilisateur de la requête (Talk, tâches de fond : pas de session)', str_contains($source, 'isEnabledForUser(\'deck\', $user)'));
 verifie('refus Deck en allemand', str_contains($t->refusDeck('erstelle eine Deck-Karte'), 'nicht installiert'));
 verifie('refus Deck : aucun lien, aucun ancien nom, aucune promesse d\'action à la place', !str_contains($r, 'http') && !str_contains($r, 'EVA') && !preg_match('/je peux (ajouter|créer)/u', $r));
-verifie('refus Deck branché dans ask() et askStream()', substr_count($source, '$this->deckRefusal($message)') === 2);
-verifie('refus Deck seulement si Deck n\'est pas activé', str_contains($source, "isEnabledForUser('deck')"));
+verifie('refus Deck branché dans ask() et askStream()', substr_count($source, '$this->deckRefusal($userId, $message)') === 2);
 
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

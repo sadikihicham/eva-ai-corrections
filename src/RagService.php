@@ -160,9 +160,9 @@ class RagService {
         $this->personalWriteBlocked = [];
         $this->writeAttempts = 0;
         $requestDeadline = microtime(true) + self::MAX_REQUEST_SECONDS;
-        $deck = $this->deckRefusal($message);
+        $deck = $this->deckRefusal($userId, $message);
         if ($deck !== null) {
-            return ['answer' => $deck, 'sources' => [], 'model' => $this->config->get('chat_model'), 'followups' => []];
+            return ['answer' => $deck, 'sources' => [], 'model' => $this->config->get('chat_model'), 'error' => null, 'followups' => []];
         }
 		$topK = min($this->config->getInt('top_k', 6), (int)AppConfig::LIMITS['top_k'][1]);
 		$results = $this->searcher->search($userId, $this->searchQuery($message, $history), $topK, $scopePath);
@@ -330,7 +330,7 @@ class RagService {
                 yield json_encode(['type' => 'error', 'message' => 'Empty message']) . "\n";
                 return;
             }
-            $deck = $this->deckRefusal($message);
+            $deck = $this->deckRefusal($userId, $message);
             if ($deck !== null) {
                 yield json_encode(['type' => 'done', 'answer' => $deck, 'model' => $this->config->get('chat_model'), 'sources' => [], 'followups' => []]) . "\n";
                 return;
@@ -971,30 +971,44 @@ $this->executor->setUserId($userId);
      * The request is about the Deck app (a card, board or list in Deck), not a slide deck. Recette 28/09 09:45: with Deck
      * not installed, « crée une carte Deck pour la réunion de lundi » produced Deck_Carte.md with invented content and an
      * English answer. Only the current message counts: an earlier Deck question must not refuse the next request.
+     * A wrong match refuses the WHOLE request, so it stays narrow (review of 4548ce6): the app is « Deck » with a capital
+     * letter, never a file or folder (« deck.md », « Deck/Projets »), a deck number (« deck 2 », « Deck B »), nor « deck of /
+     * de … » (cards, slides); plus a word of Deck's own vocabulary (card, task, Kanban) or « app Deck ». Lower case only
+     * in « carte deck » / « tâche deck » (French says « deck de cartes » for a card game).
      */
     private function deckRequest(string $message): bool {
-        $m = mb_strtolower(trim((string)preg_replace('/\s+/u', ' ', $message)));
-        if ($m === '' || mb_strlen($m) > 2000) {
+        $raw = trim((string)preg_replace('/\s+/u', ' ', $message));
+        if ($raw === '' || mb_strlen($raw) > 2000) {
             return false;
         }
-        // « carte Deck », « deck card », « Deck-Karte », « Deck کارڈ », « بطاقة Deck », « dans Deck » / « in Deck » (no article:
-        // « dans le deck », « on the deck », « dans mon deck commercial » are slide decks or ships).
-        return preg_match('~(?<!\p{L})(cartes?|tableaux?|listes?|cards?|boards?|stacks?|karten?|brett|bretter|بطاقة|بطاقات|لوحة)\s+deck(?!\p{L})'
-            . '|(?<!\p{L})deck(?:-|\s+)(cards?|boards?|stacks?|karte\p{L}*|brett\p{L}*|کارڈ|بورڈ)(?!\p{L})'
-            . '|(?<!\p{L})(dans|sur|vers|in|into|to|onto|auf|في|إلى)\s+deck(?!\p{L})(?!\s*(de|of|en|powerpoint|slides?)(?!\p{L}))'
-            . '|(?<!\p{L})deck\s+(میں|پر)~u', $m) === 1;
+        $m = mb_strtolower($raw);
+        $notFile = '(?![\p{L}\p{N}_])(?![.\/\\\\]\S)';
+        $app = '(?<![\p{L}\p{N}_.\/\\\\-])(?<!dem )(?<!das )(?<!vom )(?<!aufs )Deck' . $notFile . '(?!\s+(?:[A-Z]|\p{N}+)(?![\p{L}\p{N}]))(?!\s+(?:of|de|du|des|en)(?!\p{L}))';
+        if (preg_match('~' . $app . '~u', $raw) === 1) {
+            // Deck's own vocabulary anywhere in the request; « tableau / liste / board » are generic, so only right next to it.
+            if (preg_match('~(?<!\p{L})(cartes?|t[âa]ches?|cards?|tasks?|kanban|karten?|aufgaben?|بطاقة|بطاقات|مهمة|مهام|کارڈ|ٹاسک)(?!\p{L})~u', $m) === 1
+                || preg_match('~(?<!\p{L})((?i:app|appli|application|anwendung|tableaux?|listes?|boards?|stacks?|brett|bretter)|تطبيق|لوحة|بورڈ)\s+' . $app
+                    . '|' . $app . '[\s-]((?i:app|application|boards?|stacks?|lists?|brett\p{L}*)|ایپ|بورڈ)(?!\p{L})~u', $raw) === 1) {
+                return true;
+            }
+        }
+        return preg_match('~(?<!\p{L})(cartes?|t[âa]ches?)\s+deck' . $notFile . '(?!\s+(?:de|du|des)(?!\p{L}))~u', $m) === 1
+            // Deck written in Arabic / Urdu script (« ديك » alone is a rooster: only with a card, task or app word).
+            || preg_match('~(تطبيق|بطاقة|بطاقات|لوحة|مهمة|مهام)\s+(?:(?:في|على|إلى|الى)\s+)?ديك(?!\p{L})~u', $m) === 1
+            || (preg_match('~(?<!\p{L})ڈیک(?!\p{L})~u', $m) === 1 && preg_match('~(کارڈ|بورڈ|ٹاسک|ایپ)~u', $m) === 1);
     }
 
     /** The honest answer when the Deck app is missing, in the language of the request (not only the interface's). */
     private function deckUnavailableAnswer(string $message): string {
         $m = mb_strtolower($message);
         if (preg_match('~\p{Arabic}~u', $m) === 1) {
-            $lang = preg_match('~[ٹڈڑںےہ]~u', $m) === 1 ? 'ur' : 'ar';
+            // ی and ک are the Persian-Urdu forms (Arabic writes ي and ك), so « Deck پر کام شامل کرو » is Urdu too.
+            $lang = preg_match('~[ٹڈڑںےہیک]~u', $m) === 1 ? 'ur' : 'ar';
         } elseif (preg_match('~(?<!\p{L})(karten?|brett|erstell\p{L}*|füg\p{L}*|zeig\p{L}*|verschieb\p{L}*|eine?)(?!\p{L})~u', $m) === 1) {
             $lang = 'de';
-        } elseif (preg_match('~(?<!\p{L})(cartes?|tableaux?|listes?|dans|sur|cr[ée]+\p{L}*|ajout\p{L}*|montr\p{L}*|d[ée]plac\p{L}*|mets|mes|une?)(?!\p{L})~u', $m) === 1) {
+        } elseif (preg_match('~(?<!\p{L})(cartes?|tableaux?|listes?|dans|sur|cr[ée][ée]?r?s?|t[âa]ches?|ajout\p{L}*|montr\p{L}*|d[ée]plac\p{L}*|mets|mes|une?)(?!\p{L})~u', $m) === 1) {
             $lang = 'fr';
-        } elseif (preg_match('~(?<!\p{L})(cards?|boards?|create|make|add|show|move|put|my|a|the|in|into)(?!\p{L})~u', $m) === 1) {
+        } elseif (preg_match('~(?<!\p{L})(cards?|boards?|tasks?|create|make|add|show|move|put|my|a|the|in|into)(?!\p{L})~u', $m) === 1) {
             $lang = 'en';
         } else {
             $lang = substr($this->conversationLanguage($m, $this->uiLanguage()), 0, 2);
@@ -1012,12 +1026,14 @@ $this->executor->setUserId($userId);
      * Answer given without the model when the request needs the Deck app and Deck is not enabled for the user. With Deck
      * enabled, the model keeps its generic confirmation-gated adapter (discover_app_api / call_app_api).
      */
-    private function deckRefusal(string $message): ?string {
+    private function deckRefusal(string $userId, string $message): ?string {
         if (!$this->deckRequest($message)) {
             return null;
         }
         try {
-            if (\OCP\Server::get(\OCP\App\IAppManager::class)->isEnabledForUser('deck')) {
+            // The user is passed explicitly: Talk, background jobs and TaskProcessing have no session user.
+            $user = \OCP\Server::get(\OCP\IUserManager::class)->get($userId);
+            if (\OCP\Server::get(\OCP\App\IAppManager::class)->isEnabledForUser('deck', $user)) {
                 return null;
             }
         } catch (\Throwable $e) {
