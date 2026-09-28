@@ -35,9 +35,12 @@ echo "2) restauration"
 PAIRES=$(cut -c67- <<< "$EMP" | while IFS= read -r f; do case "$f" in */*) echo "$f|$f";; *) echo "$f|lib/Service/$f";; esac; done)
 T=/tmp/eva-retour-$$
 cut -c67- <<< "$EMP" | "${SSH[@]}" "sudo tar cf - -C $B -T - | ($DOCKER -u www-data app sh -c 'rm -rf $T && mkdir -p $T && tar xf - -C $T')"
-printf '%s\n' "$PAIRES" | "${SSH[@]}" "$DOCKER -u www-data app sh -c 'while IFS=\"|\" read -r s c; do cat \"$T/\$s\" > \"$RACINE/\$c\" || echo \"ECHEC \$c\"; done; rm -rf $T'"
+# Copie reçue vérifiée AVANT d'écrire quoi que ce soit (un transfert partiel ne doit jamais vider la production).
+RECU=$(cut -c67- <<< "$EMP" | "${SSH[@]}" "$DOCKER app sh -c 'cd $T && xargs -d \"\\n\" sha256sum'") || true
+[ -z "$(diff <(sort -k2 <<< "$EMP") <(sort -k2 <<< "$RECU") || true)" ] || { echo "ARRET : copie de la sauvegarde incomplète dans le conteneur — production intacte"; exit 1; }
+printf '%s\n' "$PAIRES" | "${SSH[@]}" "$DOCKER -u www-data app sh -c 'while IFS=\"|\" read -r s c; do cp \"$T/\$s\" \"$RACINE/\$c.eva-tmp\" && chmod 644 \"$RACINE/\$c.eva-tmp\" && mv -f \"$RACINE/\$c.eva-tmp\" \"$RACINE/\$c\" || echo \"ECHEC \$c\"; done; rm -rf $T'"
 ATTENDU=$(while read -r somme f; do case "$f" in */*) c=$f;; *) c=lib/Service/$f;; esac; echo "$somme  $c"; done <<< "$EMP")
-EN_PLACE=$(cut -c67- <<< "$ATTENDU" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && xargs -d \"\\n\" sha256sum'")
+EN_PLACE=$(cut -c67- <<< "$ATTENDU" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && xargs -d \"\\n\" sha256sum'") || true
 [ -z "$(diff <(sort -k2 <<< "$ATTENDU") <(sort -k2 <<< "$EN_PLACE") || true)" ] || { echo "ALERTE : fichiers restaurés différents de la sauvegarde"; exit 1; }
 PHPKO=$(cut -c67- <<< "$ATTENDU" | grep '\.php$' | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && while read -r f; do php -l \"\$f\" >/dev/null 2>&1 || echo \"\$f\"; done'")
 [ -z "$PHPKO" ] || { echo "$PHPKO"; echo "ALERTE : erreur PHP après restauration"; exit 1; }

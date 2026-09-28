@@ -3,7 +3,8 @@
 # (bundles JS, l10n, templates, info.xml, icônes… versionnés depuis le renommage Infinity AI du 28/09).
 #
 # À lancer par l'admin, SUR LE MAC, depuis le dépôt eva-corrections :
-#     bash deploiement/appliquer-eva.sh                 (ESSAI=1 : s'arrête après les contrôles, n'écrit rien)
+#     ESSAI=1 bash deploiement/appliquer-eva.sh   → contrôles seuls, n'écrit rien
+#     bash deploiement/appliquer-eva.sh           → déploie
 # Garde-fous — le moindre écart arrête tout AVANT la moindre écriture en production :
 #   - rien de non commité dans src/ ni app/, HEAD poussé sur GitHub, hôte = workspace4 ;
 #   - la production est identique à l'état de référence REFERENCE, fichier par fichier (sinon on n'écrase rien) ;
@@ -16,7 +17,7 @@ cd "$(dirname "$0")/.."
 SSH=(ssh -o UserKnownHostsFile="$HOME/.ssh/known_hosts_workspace4" -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15 ubuntu@192.168.1.99)
 DOCKER='cd /home/ubuntu/docker && sudo docker compose --env-file .env exec -T'
 RACINE=/var/www/html/custom_apps/eva_ai
-REFERENCE=${REFERENCE:-4fe6752}   # production depuis le 28/09 12:08 (H.2 + G.2) ; surchargeable : REFERENCE=<sha> bash …
+REFERENCE=${REFERENCE:-8da7ef9}   # = production 4fe6752 (28/09 12:08) + instantané app/ ; surchargeable : REFERENCE=<sha> bash …
 h() { shasum -a 256 | cut -c1-64; }
 r() { "${SSH[@]}" "$@" </dev/null; }
 
@@ -38,10 +39,13 @@ echo "1) contrôle de dérive : la production doit être identique à $REFERENCE
 MANQUE=$(for f in "${DEPOT[@]}"; do git cat-file -e "$REFERENCE:$f" 2>/dev/null || echo "$f"; done)
 [ -z "$MANQUE" ] || { echo "$MANQUE" | head -5; echo "ARRET : fichier(s) absent(s) de $REFERENCE — rien n'a été modifié"; exit 1; }
 ATTENDU=$(for i in "${!DEPOT[@]}"; do echo "$(git show "$REFERENCE:${DEPOT[$i]}" | h)  ${CIBLE[$i]}"; done)
-REEL=$(printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && xargs -d \"\\n\" sha256sum'")
+REEL=$(printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && xargs -d \"\\n\" sha256sum'") || true   # un absent : le diff le dit
 ECARTS=$(diff <(sort -k2 <<< "$ATTENDU") <(sort -k2 <<< "$REEL") || true)
 [ -z "$ECARTS" ] || { echo "$ECARTS" | head -10; echo "ARRET : la production a changé depuis $REFERENCE — rien n'a été modifié"; exit 1; }
 echo "   $N fichiers identiques"
+NONINSCR=$(printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER -u www-data app sh -c 'cd $RACINE && while read -r f; do [ -w \"\$f\" ] && [ -w \"\$(dirname \"\$f\")\" ] || echo \"\$f\"; done'")
+[ -z "$NONINSCR" ] || { echo "$NONINSCR" | head -5; echo "ARRET : non inscriptible(s) par www-data — rien n'a été modifié"; exit 1; }
+echo "   tous inscriptibles par www-data"
 [ "${ESSAI:-0}" = 1 ] && { echo "ESSAI=1 : arrêt avant toute écriture."; exit 0; }
 
 echo "2) sauvegarde des fichiers de production"
@@ -53,6 +57,7 @@ printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "sudo sh -c 'cd $B && xargs -d \"\\n\"
 SAUVE=$(r "sudo cat $B/EMPREINTES")
 [ -z "$(diff <(sort -k2 <<< "$ATTENDU") <(sort -k2 <<< "$SAUVE") || true)" ] || { echo "ARRET : sauvegarde incomplète dans $B — rien n'a été modifié"; exit 1; }
 echo "   $B ($N fichiers + EMPREINTES, vérifiés)"
+trap 'echo; echo "ÉCHEC après la sauvegarde — retour arrière : bash deploiement/retour-arriere-eva.sh $B"' ERR
 
 echo "3) dépôt des nouveaux fichiers en temporaire, puis contrôle"
 T=/tmp/eva-deploiement-$$
@@ -68,8 +73,8 @@ PHPKO=$(printf '%s\n' "${CIBLE[@]}" | grep '\.php$' | "${SSH[@]}" "$DOCKER app s
 echo "   $N fichiers reçus intacts, PHP valide"
 
 echo "4) mise en place (tous les fichiers ont passé les contrôles)"
-# cat > : garde propriétaire et droits des fichiers existants.
-printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER -u www-data app sh -c 'while read -r f; do cat \"$T/\$f\" > \"$RACINE/\$f\" || echo \"ECHEC \$f\"; done; rm -rf $T'"
+# Copie à côté puis renommage : jamais de fichier à moitié écrit visible (www-data:644, comme les originaux).
+printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER -u www-data app sh -c 'while read -r f; do cp \"$T/\$f\" \"$RACINE/\$f.eva-tmp\" && chmod 644 \"$RACINE/\$f.eva-tmp\" && mv -f \"$RACINE/\$f.eva-tmp\" \"$RACINE/\$f\" || echo \"ECHEC \$f\"; done; rm -rf $T'"
 EN_PLACE=$(printf '%s\n' "${CIBLE[@]}" | "${SSH[@]}" "$DOCKER app sh -c 'cd $RACINE && xargs -d \"\\n\" sha256sum'")
 [ -z "$(diff <(sort -k2 <<< "$NOUVEAU") <(sort -k2 <<< "$EN_PLACE") || true)" ] \
   || { echo "ALERTE : fichiers en place différents — lancer le retour arrière : bash deploiement/retour-arriere-eva.sh $B"; exit 1; }

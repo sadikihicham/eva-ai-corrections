@@ -246,7 +246,6 @@ OC.L10N.register("eva_ai", {
     "Enter a folder path first.": "Enter a folder path first.",
     "Error: {error}": "Error: {error}",
     "Infinity AI": "Infinity AI",
-    "Infinity AI": "Infinity AI",
     "Infinity AI chat export": "Infinity AI chat export",
     "Infinity AI uses the selected files for document evidence and may use your personal KNOWLEDGE.md for context.": "Infinity AI uses the selected files for document evidence and may use your personal KNOWLEDGE.md for context.",
     "Infinity AI · v": "Infinity AI · v",

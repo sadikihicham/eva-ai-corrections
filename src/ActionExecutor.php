@@ -836,7 +836,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_sticker',
-                'description' => 'Generate a sticker image from a prompt and save it in the user\'s Infinity AI folder. Requires explicit confirmation and a configured OpenAI-compatible image provider.',
+                'description' => 'Generate a sticker image from a prompt and save it in the user\'s EVA folder. Requires explicit confirmation and a configured OpenAI-compatible image provider.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'prompt' => ['type' => 'string', 'description' => 'What the sticker should depict. Avoid private or identifying personal details.'],
                 ], 'required' => ['prompt']],
