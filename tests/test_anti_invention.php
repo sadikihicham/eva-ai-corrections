@@ -616,6 +616,10 @@ verifie('deleteQuestion : traduite (fr/ar/de/en) et dit « supprime »', str_con
 // Relance « données personnelles » : pas pour du dépannage ou de la rédaction (revue de corrections-recette, 🔴)
 $sansDonnees = ["Mon email pro ne marche plus sur mon iPhone, que faire ?", "Mes contacts ne se synchronisent pas avec Android",
     "Pourquoi mon agenda n'affiche pas les jours fériés ?", "Rédige un mail à mes collègues pour annoncer la réunion de demain"];
+foreach (["écris-moi mes rdv de demain", "quels mails d'erreur ai-je reçus aujourd'hui ?", "quelles sont mes réunions sync de demain ?", "pourquoi ai-je deux réunions demain ?"] as $q) {
+    $t = new RagSousTest();
+    verifie('vraie lecture → relance gardée : « ' . $q . ' »', $t->relanceGenerale($q, 'Vous avez une réunion à 10 h.', array_merge($perso, [['type' => 'function', 'function' => ['name' => 'list_contacts']]])) !== null);
+}
 $lecteurs = array_merge($perso, [['type' => 'function', 'function' => ['name' => 'list_contacts']]]);
 foreach ($sansDonnees as $q) {
     $t = new RagSousTest();

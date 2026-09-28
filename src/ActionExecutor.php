@@ -1033,11 +1033,14 @@ class ActionExecutor {
 
     /**
      * Unattended run (scheduled briefing with actions): nobody is present to confirm, so what the dialog would ask
-     * about is refused instead - deleting, a terminal command, replacing an existing file. The rest runs confirmed.
+     * about is refused instead - deleting, a terminal command, a generic app API call, a connector call other than GET,
+     * replacing an existing file. The rest runs confirmed. Plugin tools keep their own confirmation rule.
      */
     public function runUnattended(string $userId, string $name, array $args): array {
         $refused = 'This is never done in an unattended run: nobody is present to confirm. Tell the user what should be done and let them do it in the chat.';
-        if ($this->isDestructiveCall($name, $args) || in_array($name, ['run_safe_command', 'run_terminal_command', 'run_terminal_sequence'], true)) {
+        $method = strtoupper(trim((string)($args['method'] ?? 'GET')));
+        if ($this->isDestructiveCall($name, $args) || in_array($name, ['call_app_api', 'run_safe_command', 'run_terminal_command', 'run_terminal_sequence'], true)
+            || ($name === 'call_external_connector' && $method !== 'GET')) {
             return ['ok' => false, 'error' => $refused];
         }
         try {
@@ -1192,8 +1195,8 @@ class ActionExecutor {
 
         // Never delete without asking (recette 28/09, test I.1: "supprime le fichier X" deleted at once, because a
         // complete call runs directly on the web surface). Every destructive tool asks on the web and TaskProcessing
-        // surfaces; the dialog runs the call again through runConfirmed(). Autonomous briefings call runConfirmed()
-        // themselves: RagService refuses destructive tools there (nobody is present to confirm).
+        // surfaces; the dialog runs the call again through runConfirmed(). Autonomous briefings go through
+        // runUnattended(), which refuses them (nobody is present to confirm).
         if (!$confirmed && $this->requiresDeleteConfirmation($name, $args, isset($policy['risk']) ? (string)$policy['risk'] : null)) {
             return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
                 'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),

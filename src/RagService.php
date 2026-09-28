@@ -1245,11 +1245,15 @@ $this->executor->setUserId($userId);
         if ($this->isFileCreationRequest($message)) {
             return null;
         }
-        // Troubleshooting, drafting or translating mentions "mon email" / "la réunion de demain" without asking for the
-        // data itself (review of corrections-recette: "mon email ne marche plus sur mon iPhone" would read the inbox).
-        if (preg_match('~(?<!\p{L})(pourquoi|why|ne\s+(marche|fonctionne|s[ey]\s+synchronis\p{L}*|s[\'’]affiche|charge)|(doesn|don|isn|won|can)[\'’]?t\s+(work|sync|load|show)'
-            . '|not\s+(working|syncing|loading|showing)|probl[eè]me|problem|bug|erreur|error|panne|param[eè]tr\p{L}*|config\p{L}*|r[ée]glages?|settings?|synchronis\p{L}*|sync'
-            . '|r[ée]dige|r[ée]diger|[ée]cris|[ée]crire|draft|write|compose|traduis|traduire|translate|reformule|rephrase|corrige|proofread)(?!\p{L})~u', mb_strtolower($message)) === 1) {
+        // Troubleshooting or drafting mentions "mon email" / "la réunion de demain" without asking for the data itself
+        // (review of corrections-recette: "mon email ne marche plus sur mon iPhone" would read the inbox). A request
+        // that lists or asks about the data ("quels mails d'erreur ai-je reçus", "écris-moi mes rdv") still reads it.
+        $low = mb_strtolower($message);
+        $reads = preg_match('~(?<!\p{L})(quels?|quelles?|liste\p{L}*|montre\p{L}*|affiche-moi|donne-moi|combien|ai-je|avons-nous|what|which|list|show|how\s+many|do\s+i\s+have)(?!\p{L})~u', $low) === 1;
+        $fix = preg_match('~(?<!\p{L})(pourquoi|why|n[\'’](affiche|appara[iî]t)\p{L}*|ne\s+(marche|marchent|fonctionne|fonctionnent|s[ey]\s+synchronis\p{L}*|s[\'’]affiche\p{L}*|charge\p{L}*)|(doesn|don|isn|won|can)[\'’]?t\s+(work|sync|load|show)'
+            . '|not\s+(working|syncing|loading|showing)|probl[eè]me\s+(avec|de|sur)|problem\s+with|param[eè]tr\p{L}+|configur\p{L}+|set\s+up)(?!\p{L})~u', $low) === 1;
+        $draft = preg_match('~(?<!\p{L})(r[ée]dige\p{L}*|[ée]cri[st]|[ée]crire|draft|write|compose|traduis|traduire|translate|reformule\p{L}*|rephrase)\s+(moi\s+)?(un|une|le|la|a|an|the|ce|cette)\s+(\p{L}+\s+)?(mail|e-?mail|courriel|message|texte|lettre|r[ée]ponse|invitation|annonce|note|text|letter|reply|announcement)(?!\p{L})~u', $low) === 1;
+        if (!$reads && ($fix || $draft)) {
             return null;
         }
         $missing = $this->unreadPersonalData($message, $tools);
