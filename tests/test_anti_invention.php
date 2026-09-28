@@ -609,5 +609,11 @@ verifie('autre outil → non concerné', $t->gardeMeteo(['location' => 'Abu Dhab
 verifie('location vide → laissée à l\'outil (qui la refuse)', $t->gardeMeteo(['location' => ''], [$question("Quel temps fera-t-il demain ?")]) === null);
 verifie('une relance d\'EVA n\'est pas la question de l\'utilisateur', $t->gardeMeteo(['location' => 'Abu Dhabi'], [$question("Quel temps fera-t-il demain ?"), ['role' => 'user', 'content' => RagSousTest::WEATHER_NUDGE]]) !== null);
 
+// Suppressions (revue de 229ea02) : jamais en exécution autonome, et une question lisible avant confirmation.
+$auto = strpos($source, '? ($this->executor->isDestructiveCall(');
+verifie('briefing autonome : outil destructif refusé AVANT runConfirmed (contrôle de source)', $auto !== false && ($rc = strpos($source, '$this->executor->runConfirmed(', $auto)) !== false && $rc - $auto < 600);
+verifie('question de suppression affichée dans les DEUX chemins (ask + askStream)', substr_count($source, '$this->deleteQuestion($confirmationName,') === 2);
+verifie('deleteQuestion : traduite (fr/ar/de/en) et dit « supprime »', str_contains($d = (string)substr($source, (int)strpos($source, 'private function deleteQuestion('), 1500), "'fr' =>") && str_contains($d, "'ar' =>") && str_contains($d, 'supprime'));
+
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

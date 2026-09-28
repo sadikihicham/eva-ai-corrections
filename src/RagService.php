@@ -222,7 +222,10 @@ class RagService {
 				$res = $overwrite !== null ? ['ok' => false, 'error' => $overwrite] : ($seenToolCalls[$fingerprint] > self::MAX_IDENTICAL_TOOL_CALLS
 					? ['ok' => false, 'error' => 'The same tool call was already attempted twice; choose a different next step.']
 						: ($autonomousActions
-							? $this->executor->runConfirmed($userId, $tc['name'], $toolArgs)
+							// Nobody is present to confirm an unattended run (scheduled briefing): it never destroys data.
+							? ($this->executor->isDestructiveCall((string)$tc['name'], is_array($toolArgs) ? $toolArgs : [])
+								? ['ok' => false, 'error' => 'Deleting or overwriting data is never done in an unattended run: nobody is present to confirm. Tell the user what should be deleted and let them do it in the chat.']
+								: $this->executor->runConfirmed($userId, $tc['name'], $toolArgs))
 							: $this->executor->run($userId, $tc['name'], $toolArgs)));
 				if ($onProgress !== null) $onProgress('tool_result', (string)($tc['name'] ?? ''), [
 					'ok' => !empty($res['ok']),
@@ -238,7 +241,8 @@ class RagService {
 				if (!empty($res['confirmation_required'])) {
 					$confirmationName = (string)($res['tool'] ?? $tc['name'] ?? '');
 					return [
-						'answer' => ($res['existing'] ?? []) !== [] ? $this->overwriteQuestion((array)$res['existing']) : 'I need your confirmation before I can perform that action.',
+						'answer' => ($res['existing'] ?? []) !== [] ? $this->overwriteQuestion((array)$res['existing'])
+							: (!empty($res['delete']) ? $this->deleteQuestion($confirmationName, is_array($res['arguments'] ?? null) ? $res['arguments'] : []) : 'I need your confirmation before I can perform that action.'),
 						'sources' => $this->answerSources($byDoc),
 						'model' => $chat['model'] ?? $this->config->get('chat_model'),
 						'error' => null,
@@ -423,6 +427,9 @@ $this->executor->setUserId($userId);
 						if (($res['existing'] ?? []) !== []) {
 							// Say WHAT is confirmed: the dialog alone does not show that a file would be replaced.
 							yield json_encode(['type' => 'content', 'delta' => ($answer !== '' && !$holdText ? "\n\n" : '') . $this->overwriteQuestion((array)$res['existing'])], JSON_UNESCAPED_UNICODE) . "\n";
+						} elseif (!empty($res['delete'])) {
+							// Same for a deletion: say what would be deleted, the dialog only lists raw arguments.
+							yield json_encode(['type' => 'content', 'delta' => ($answer !== '' && !$holdText ? "\n\n" : '') . $this->deleteQuestion($confirmationName, is_array($res['arguments'] ?? null) ? $res['arguments'] : [])], JSON_UNESCAPED_UNICODE) . "\n";
 						}
 						yield json_encode([
 							'type' => 'confirmation',
@@ -1339,6 +1346,22 @@ $this->executor->setUserId($userId);
             'ar' => '⚠️ ' . $list . ' موجود بالفعل وسيتم **استبداله**. أكّد للاستبدال، أو اطلب مني استخدام اسم آخر.',
             'de' => '⚠️ ' . $list . ' existiert bereits und würde **ersetzt**. Bestätigen Sie das Ersetzen oder bitten Sie mich um einen anderen Namen.',
             default => '⚠️ ' . $list . ' already exists and would be **replaced**. Confirm to replace it, or ask me to use another name.',
+        };
+    }
+
+    /** The question shown before a deletion (or a destructive restore), in the interface language. */
+    private function deleteQuestion(string $tool, array $args): string {
+        $what = [];
+        foreach (['path', 'query', 'name', 'title', 'id', 'event_id', 'share_id', 'comment_id', 'task_id', 'briefing_id'] as $key) {
+            $v = $args[$key] ?? null;
+            if (is_scalar($v) && trim((string)$v) !== '') { $what[] = '« ' . mb_substr(trim((string)$v), 0, 120) . ' »'; break; }
+        }
+        $what = $what !== [] ? $what[0] . ' (' . $tool . ')' : $tool;
+        return match (substr($this->uiLanguage(), 0, 2)) {
+            'fr' => '⚠️ ' . $what . ' : cette action **supprime ou remplace** des données, sans retour possible. Confirmez pour continuer.',
+            'ar' => '⚠️ ' . $what . ': هذا الإجراء **يحذف أو يستبدل** بيانات بشكل نهائي. أكّد للمتابعة.',
+            'de' => '⚠️ ' . $what . ': Diese Aktion **löscht oder ersetzt** Daten endgültig. Bestätigen Sie, um fortzufahren.',
+            default => '⚠️ ' . $what . ': this action **deletes or replaces** data for good. Confirm to continue.',
         };
     }
 

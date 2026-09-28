@@ -1175,7 +1175,7 @@ class ActionExecutor {
         if (!$confirmed && $this->requiresDeleteConfirmation($name, $args, isset($policy['risk']) ? (string)$policy['risk'] : null)) {
             return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
                 'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),
-                'error' => $this->deleteConfirmationMessage($name, $args)];
+                'delete' => true, 'error' => $this->deleteConfirmationMessage($name, $args)];
         }
         // Never replace an existing file silently (admin, 28/09): on the web surface a complete create_file runs at
         // once, and create_file overwrites. The user confirms in the dialog, which runs the call again confirmed.
