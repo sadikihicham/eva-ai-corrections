@@ -1,4 +1,4 @@
-# Contrat de la dictée (bouton micro d'Infinity AI) — v2.1, 28/09/2026
+# Contrat de la dictée (bouton micro d'Infinity AI) — v2.2, 28/09/2026
 
 Remplace la v1 (route audio côté serveur, ABANDONNÉE). Toute modification = décision de l'intégrateur.
 
@@ -8,8 +8,8 @@ Remplace la v1 (route audio côté serveur, ABANDONNÉE). Toute modification = d
 - Transcription par Whisper installé **sur l'ordinateur de l'utilisateur** (test : le Mac de l'admin).
   Les autres postes n'ont rien : le bouton n'apparaît simplement pas chez eux.
 - Langue de la voix : **détection automatique SEULE**, aucun choix manuel (décision admin, v2.1).
-- **L'interface bascule automatiquement dans la langue parlée** (fr / ar / en) : changement de la langue
-  du compte Nextcloud puis rechargement, le texte dicté étant conservé (voir « Bascule de langue »).
+- **Pas de changement de la langue de l'interface** (bascule automatique essayée puis ARRÊTÉE par l'admin,
+  v2.2) : seule la zone de saisie prend le sens d'écriture de la langue parlée (rtl pour l'arabe).
 - Le texte est inséré dans la **zone de saisie** ; l'utilisateur relit et envoie. Jamais d'envoi automatique.
 - Enregistrement : **120 s maximum**.
 
@@ -35,17 +35,6 @@ Aucune route audio dans eva_ai. Le serveur ne reçoit que le message tapé/dict�
 - Silence / `[BLANK_AUDIO]` testé AVANT le repli (pas de second appel sur un silence). (Mesuré : la détection a rendu « islandais » sur une vraie dictée courte ;
   imposer une MAUVAISE langue produit du charabia, d'où le choix manuel.)
 - Réponse `[BLANK_AUDIO]` / vide ⇒ message « rien d'audible », rien inséré.
-
-## Bascule de langue de l'interface (décision admin : automatique)
-- Conditions, TOUTES requises : langue ∈ {fr, ar, en} ; probabilité de détection ≥ 0,80 ; audio ≥ 2 s ;
-  langue ≠ langue actuelle de la page ; pas de bascule dans les 30 dernières secondes ; repli non utilisé.
-  (Garde-fou d'implémentation : un mot court mal reconnu — « Non » lu vietnamien le 28/09 — ne bascule rien.)
-- Action : texte inséré, sauvegardé en sessionStorage (≤ 2 min, effacé à la restauration), puis
-  `PUT /ocs/v2.php/cloud/users/<uid>` `language=<code>` (OCS-APIRequest + requesttoken), puis rechargement.
-  C'est le SEUL appel du script vers Nextcloud ; il ne contient jamais le texte.
-- Effet : c'est la langue du COMPTE, donc tout Nextcloud (Fichiers, Talk…) change de langue.
-- **[non vérifié]** eva_ai ne livre dans ce dépôt que les traductions `de` et `en` : en `ar`/`fr`, les textes
-  propres à Infinity AI peuvent rester en anglais (repli Nextcloud) ; à constater en recette.
 
 ## Serveur eva_ai (PageController seulement)
 - Deux interrupteurs, tous deux requis (revue sécurité I-1 : sinon TOUS les navigateurs sondent localhost) :
