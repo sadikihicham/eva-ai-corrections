@@ -85,12 +85,18 @@ $d = ouvre($g->x("## العنوان\n- نص"), 'lang');
 verifie('texte arabe : lang="ar-AE"', str_contains($d['slides'][0], 'lang="ar-AE"'));
 // Prod 28/09 : le modèle écrit des étiquettes de structure comme titres
 $d = ouvre($g->x("## Diapositive 1: Titre\n\n**Cybersécurité en entreprise : Une priorité absolue**\n\n## Sous-titre\nProtection des données et responsabilité collective.\n\n## Diapositive 2: Introduction à la cybersécurité\nLa cybersécurité protège les systèmes.\n\n## Slide 3 - Les menaces\n- Phishing"), 'etiquettes');
-verifie('« Titre » + « Sous-titre » → une vraie diapositive de titre (titre + sous-titre)', count($d['slides']) === 3 && str_contains($d['slides'][0], 'sz="4400"') && textes($d['slides'][0]) === 'Cybersécurité en entreprise : Une priorité absolue | Protection des données et responsabilité collective.', textes($d['slides'][0]));
+verifie('« Titre » + « Sous-titre » → une vraie diapositive de titre (titre + sous-titre)', count($d['slides']) === 3 && str_contains($d['slides'][0], 'sz="4400"') && str_starts_with(textes($d['slides'][0]), 'Cybersécurité en entreprise : Une priorité absolue | Protection des données et responsabilité collective.'), textes($d['slides'][0]));
 verifie('préfixes « Diapositive 2: » / « Slide 3 - » retirés des titres', str_starts_with(textes($d['slides'][1]), 'Introduction à la cybersécurité') && str_starts_with(textes($d['slides'][2]), 'Les menaces'), textes($d['slides'][1]) . ' / ' . textes($d['slides'][2]));
 $d = ouvre($g->x("## Titre de la présentation\n- a"), 'titre-normal');
 verifie('un vrai titre qui commence par « Titre » est gardé', str_starts_with(textes($d['slides'][0]), 'Titre de la présentation'));
 $d = ouvre($g->x("## مثالیں\n- یہ ایک مثال ہے"), 'ourdou');
 verifie('texte urdu : lang="ur-PK" (arabe : ar-AE)', str_contains($d['slides'][0], 'lang="ur-PK"') && !str_contains($d['slides'][0], 'lang="ar-AE"'));
+// Palette « Désert & or » + logo vectoriel (admin 28/09)
+$d = ouvre($g->x("# Plan 2026\nÉquipe IT\n\n## Objectifs\n- un"), 'marque');
+verifie('palette B dans le thème (anthracite, or, émeraude, sable)', str_contains($d['parts']['ppt/theme/theme1.xml'], '<a:accent1><a:srgbClr val="C8A15A"/>') && str_contains($d['parts']['ppt/theme/theme1.xml'], '<a:accent2><a:srgbClr val="0E7C66"/>') && str_contains($d['parts']['ppt/theme/theme1.xml'], '<a:lt2><a:srgbClr val="F7F3EC"/>'));
+verifie('titre : fond anthracite, bande or, logo ∞ (tracé) + « Infinity AI » blanc', str_contains($d['slides'][0], 'name="Bande"') && str_contains($d['slides'][0], '<a:custGeom>') && str_contains($d['slides'][0], '<a:cubicBezTo>') && str_contains($d['slides'][0], '<a:t>Infinity </a:t>') && str_contains($d['slides'][0], '<a:t>AI</a:t>') && str_contains($d['slides'][0], 'val="FFFFFF"/></a:solidFill><a:latin typeface="Calibri Light"/>'));
+verifie('contenu : petit logo (texte sombre) sur chaque diapositive', str_contains($d['slides'][1], 'name="Logo infini"') && str_contains($d['slides'][1], 'val="1F2A37"/></a:solidFill><a:latin typeface="Calibri Light"/>'));
+verifie('aucune image embarquée (logo 100 % vectoriel)', array_filter(array_keys($d['parts']), static fn(string $n): bool => str_starts_with($n, 'ppt/media/')) === []);
 verifie('câblage : create_file .pptx, convert_file pptx, plus refusé', str_contains($source, "=== 'pptx') {\n            try { \$content = \$this->buildPptx(") && str_contains($source, "CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'pptx'") && !preg_match("~noTextBuilder = \[[^\]]*'pptx'~", $source));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

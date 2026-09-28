@@ -2326,8 +2326,9 @@ class ActionExecutor {
      */
     private function buildPptx(string $text): string {
         if (!class_exists(\ZipArchive::class)) throw new \RuntimeException('PHP ZipArchive extension is required');
-        $pal = ['dk1' => '1B2430', 'lt1' => 'FFFFFF', 'dk2' => '0B1F3A', 'lt2' => 'F4F7FB', 'accent1' => '1E6FFF', 'accent2' => '00B3A6',
-            'accent3' => 'F5A524', 'accent4' => '7C5CFF', 'accent5' => 'E5484D', 'accent6' => '6B7A90', 'hlink' => '1E6FFF', 'folHlink' => '7C5CFF'];
+        // Palette « Désert & or » (admin 28/09) : anthracite, or, émeraude, sable. accent5 = texte clair sur fond sombre.
+        $pal = ['dk1' => '1F2A37', 'lt1' => 'FFFFFF', 'dk2' => '1F2A37', 'lt2' => 'F7F3EC', 'accent1' => 'C8A15A', 'accent2' => '0E7C66',
+            'accent3' => 'B5523B', 'accent4' => '8C6D3F', 'accent5' => 'D9C7A0', 'accent6' => '6B7280', 'hlink' => '0E7C66', 'folHlink' => '8C6D3F'];
         $W = 12192000; $H = 6858000; $emu = 914400;
         $esc = static fn(string $v): string => htmlspecialchars((string)preg_replace(['/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '/[\x{FFFE}\x{FFFF}]/u'], '', $v), ENT_XML1 | ENT_COMPAT | ENT_SUBSTITUTE, 'UTF-8');
         $isRtl = static fn(string $v): bool => preg_match('/\p{L}/u', $v, $f) === 1 && preg_match('/\p{Arabic}|\p{Hebrew}/u', $f[0]) === 1;   // first letter decides
@@ -2366,6 +2367,26 @@ class ActionExecutor {
             $id++;
             return '<p:sp><p:nvSpPr><p:cNvPr id="' . $id . '" name="' . $name . '"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="' . $x . '" y="' . $y . '"/>'
                 . '<a:ext cx="' . $w . '" cy="' . $h . '"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="' . $color . '"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp>';
+        };
+        // Logo « ∞ Infinity AI » drawn as shapes (no image part): the infinity sign is a gold cubic-Bézier path, the words
+        // are a text box, « AI » in bold gold. $h = logo height in EMU; $light = white words (dark background).
+        $logo = static function (int $x, int $y, int $h, bool $light) use (&$id, $pal): string {
+            $sw = (int)round($h * 1.85); $id++;
+            $pt = static fn(float $px, float $py): string => '<a:pt x="' . (int)round($px) . '" y="' . (int)round($py) . '"/>';
+            $path = '<a:moveTo>' . $pt(0, 14) . '</a:moveTo><a:cubicBezTo>' . $pt(0, 0) . $pt(18, 0) . $pt(26, 14) . '</a:cubicBezTo>'
+                . '<a:cubicBezTo>' . $pt(34, 28) . $pt(52, 28) . $pt(52, 14) . '</a:cubicBezTo><a:cubicBezTo>' . $pt(52, 0) . $pt(34, 0) . $pt(26, 14) . '</a:cubicBezTo>'
+                . '<a:cubicBezTo>' . $pt(18, 28) . $pt(0, 28) . $pt(0, 14) . '</a:cubicBezTo><a:close/>';
+            $xml = '<p:sp><p:nvSpPr><p:cNvPr id="' . $id . '" name="Logo infini"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="' . $x . '" y="' . $y . '"/><a:ext cx="' . $sw . '" cy="' . $h . '"/></a:xfrm>'
+                . '<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="0" t="0" r="r" b="b"/><a:pathLst><a:path w="52" h="28" fill="none">' . $path . '</a:path></a:pathLst></a:custGeom>'
+                . '<a:noFill/><a:ln w="' . max(12700, (int)round($h * 0.14)) . '" cap="rnd"><a:solidFill><a:srgbClr val="' . $pal['accent1'] . '"/></a:solidFill><a:round/></a:ln></p:spPr></p:sp>';
+            $id++;
+            $size = max(900, min(4000, (int)round($h / 12700 * 1.2) * 100));
+            $xml .= '<p:sp><p:nvSpPr><p:cNvPr id="' . $id . '" name="Logo texte"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="' . ($x + $sw + (int)round($h * 0.3)) . '" y="' . ($y - (int)round($h * 0.35)) . '"/>'
+                . '<a:ext cx="' . ($h * 6) . '" cy="' . (int)round($h * 1.7) . '"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>'
+                . '<p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr"><a:noAutofit/></a:bodyPr><a:lstStyle/><a:p>'
+                . '<a:r><a:rPr lang="en-US" sz="' . $size . '" dirty="0"><a:solidFill><a:srgbClr val="' . ($light ? 'FFFFFF' : $pal['dk1']) . '"/></a:solidFill><a:latin typeface="Calibri Light"/></a:rPr><a:t>Infinity </a:t></a:r>'
+                . '<a:r><a:rPr lang="en-US" sz="' . $size . '" b="1" dirty="0"><a:solidFill><a:srgbClr val="' . $pal['accent1'] . '"/></a:solidFill><a:latin typeface="Calibri"/></a:rPr><a:t>AI</a:t></a:r></a:p></p:txBody></p:sp>';
+            return $xml;
         };
         $table = static function (array $rows, int $x, int $y, int $w) use (&$id, $esc, $pal, $isRtl): string {
             $cols = max(array_map('count', $rows)); $colW = intdiv($w, max(1, $cols)); $rowH = 411480;
@@ -2467,9 +2488,10 @@ class ActionExecutor {
             // Title slide: a first "# " heading with at most two plain lines (a "## Objectifs" with bullets stays a content slide).
             if ($i === 0 && $title !== '' && $level === 1 && count($items) <= 2 && count($plain) === count($items)) {
                 // Title slide: dark band, big title, subtitle lines.
-                $shapes .= $rect('Fond', 0, 0, $W, $H, $pal['dk2']) . $rect('Accent', $isRtl($title) ? $W - (int)($emu * 2.5) : (int)($emu * 0.9), (int)($emu * 4.35), (int)($emu * 1.6), 60000, $pal['accent2']);
+                $shapes .= $rect('Fond', 0, 0, $W, $H, $pal['dk2']) . $rect('Accent', $isRtl($title) ? $W - (int)($emu * 2.5) : (int)($emu * 0.9), (int)($emu * 4.35), (int)($emu * 1.6), 60000, $pal['accent2'])
+                    . $rect('Bande', 0, $H - (int)($emu * 0.32), $W, (int)($emu * 0.32), $pal['accent1']);
                 $shapes .= $box('Titre', (int)($emu * 0.9), (int)($emu * 1.9), (int)($emu * 11.5), (int)($emu * 2.3), $para($title, 4400, true, $pal['lt1']), 'b');
-                $sub = implode('', array_map(static fn(array $it): string => $para($it[2], 2200, false, 'C9D6EA'), $items));
+                $sub = implode('', array_map(static fn(array $it): string => $para($it[2], 2200, false, $pal['accent5']), $items));
                 if ($sub !== '') $shapes .= $box('Sous-titre', (int)($emu * 0.9), (int)($emu * 4.55), (int)($emu * 11.5), (int)($emu * 1.6), $sub);
             } else {
                 $top = (int)($emu * 0.35);
@@ -2499,6 +2521,9 @@ class ActionExecutor {
                 }
                 $flush(true);
             }
+            // The logo comes last: reading order (screen readers, extracted text) starts with the title, not the brand.
+            $shapes .= str_contains($shapes, "name=\"Fond\"") ? $logo((int)($emu * 0.9), (int)($emu * 0.75), (int)($emu * 0.36), true)
+                : $logo($W - (int)($emu * 2.35), $H - (int)($emu * 0.42), (int)($emu * 0.2), false);
             $slideXml[] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld ' . $ns . '><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
                 . '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>' . $shapes
                 . '</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>';
