@@ -129,6 +129,22 @@ class ActionExecutor {
         'create_sticker' => ['prompt'],
     ];
 
+    /** Deletions are never run on a model call alone (recette 28/09, test I.1): the user confirms each one. */
+    private function requiresDeleteConfirmation(string $name): bool {
+        return str_starts_with($name, 'delete_');
+    }
+
+    /** Says what would be deleted, from the tool's required arguments (path, event_id, share_id…). */
+    private function deleteConfirmationMessage(string $name, array $args): string {
+        $target = [];
+        foreach (self::REQUIRED_ARGS[$name] ?? [] as $key) {
+            $value = $args[$key] ?? null;
+            if (is_scalar($value) && trim((string)$value) !== '') $target[] = $key . ' "' . mb_substr(trim((string)$value), 0, 200) . '"';
+        }
+        return 'Deleting is irreversible: ' . $name . ($target !== [] ? ' would delete ' . implode(', ', $target) : ' would delete the requested item')
+            . '. The user must confirm this deletion before it runs.';
+    }
+
     /**
      * Return the keys of required arguments that are missing or empty.
      *
@@ -1139,6 +1155,14 @@ class ActionExecutor {
             return ['ok' => false, 'error' => 'File tools are not available in the background worker (CLI). Ask in the web chat instead.'];
         }
 
+        // Never delete without asking (recette 28/09, test I.1: "supprime le fichier X" deleted at once, because a
+        // complete call runs directly on the web surface). Every delete_* tool asks on every surface; the dialog
+        // runs the call again through runConfirmed().
+        if (!$confirmed && $this->requiresDeleteConfirmation($name)) {
+            return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
+                'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),
+                'error' => $this->deleteConfirmationMessage($name, $args)];
+        }
         // Never replace an existing file silently (admin, 28/09): on the web surface a complete create_file runs at
         // once, and create_file overwrites. The user confirms in the dialog, which runs the call again confirmed.
         if (!$confirmed && $home !== null && ($existing = $this->existingWriteTargets($home, $name, $args)) !== []) {
@@ -2066,6 +2090,25 @@ class ActionExecutor {
         // Models often send a Markdown table ("| a | b |"), sometimes after an intro sentence (seen 28/09: every line
         // landed in a single cell). Then the intro before the first table is dropped; later prose (notes, totals) is
         // kept in column A, and a separator is only the 2nd line of a table (a data row "| - | - |" stays).
+        // A Markdown table may also come without the outer pipes ("a | b" / "---|---" / "1 | 2", recette 28/09, test B.1:
+        // everything landed in column A). Only a real separator line under a line with "|" makes it a table, so a CSV
+        // cell holding "|" stays CSV; the header and the "|" lines below the separator get their outer pipes back.
+        $isSeparator = static fn(string $l): bool => preg_match('/^[\s|:-]+$/', $l) === 1 && str_contains($l, '|') && str_contains($l, '-');
+        if (array_filter($rows, static fn(string $l): bool => str_starts_with(ltrim($l), '|')) === []) {
+            $pipe = static function (string $l): string {
+                $l = trim($l);
+                if (!str_starts_with($l, '|')) $l = '| ' . $l;
+                if (!str_ends_with($l, '|') || str_ends_with($l, '\\|')) $l .= ' |';
+                return $l;
+            };
+            $count = count($rows);
+            for ($k = 1; $k < $count; $k++) {
+                if (!$isSeparator($rows[$k]) || !str_contains($rows[$k - 1], '|') || $isSeparator($rows[$k - 1])) continue;
+                $rows[$k - 1] = $pipe($rows[$k - 1]);
+                for ($j = $k; $j < $count && trim($rows[$j]) !== '' && str_contains($rows[$j], '|'); $j++) $rows[$j] = $pipe($rows[$j]);
+                $k = $j;
+            }
+        }
         $first = null;
         foreach ($rows as $k => $l) { if (str_starts_with(ltrim($l), '|')) { $first = $k; break; } }
         $markdown = $first !== null;
