@@ -430,7 +430,7 @@ class ToolPolicy {
             'risk' => self::RISK_READONLY,
             'surfaces' => [self::SURFACE_WEB, self::SURFACE_TALK, self::SURFACE_TASKPROCESSING, self::SURFACE_TASKPROCESSING_CONFIRMED, self::SURFACE_RAG],
             'requiresConfirmation' => false,
-            'description' => 'Discover enabled Nextcloud apps and available EVA integrations',
+            'description' => 'Discover enabled Nextcloud apps and available Infinity AI integrations',
         ],
         'discover_app_api' => [
             'risk' => self::RISK_READONLY,
@@ -466,25 +466,25 @@ class ToolPolicy {
             'risk' => self::RISK_READONLY,
             'surfaces' => [self::SURFACE_WEB, self::SURFACE_TALK, self::SURFACE_RAG],
             'requiresConfirmation' => false,
-            'description' => 'List the user\'s EVA scheduled briefings',
+            'description' => 'List the user\'s Infinity AI scheduled briefings',
         ],
         'create_scheduled_briefing' => [
             'risk' => self::RISK_MUTATING,
             'surfaces' => [self::SURFACE_WEB],
             'requiresConfirmation' => true,
-            'description' => 'Create an EVA scheduled briefing',
+            'description' => 'Create an Infinity AI scheduled briefing',
         ],
         'update_scheduled_briefing' => [
             'risk' => self::RISK_MUTATING,
             'surfaces' => [self::SURFACE_WEB],
             'requiresConfirmation' => true,
-            'description' => 'Update an EVA scheduled briefing',
+            'description' => 'Update an Infinity AI scheduled briefing',
         ],
         'delete_scheduled_briefing' => [
             'risk' => self::RISK_DESTRUCTIVE,
             'surfaces' => [self::SURFACE_WEB],
             'requiresConfirmation' => true,
-            'description' => 'Delete an EVA scheduled briefing',
+            'description' => 'Delete an Infinity AI scheduled briefing',
         ],
         'current_time' => [
             'risk' => self::RISK_READONLY,
@@ -660,7 +660,7 @@ class ToolPolicy {
             && $this->appConfig->getInt('talk_write_enabled', 0) !== 1) {
             return [
                 'allowed' => false,
-                'reason' => 'Posting to Nextcloud Talk is disabled in the EVA AI settings',
+                'reason' => 'Posting to Nextcloud Talk is disabled in the Infinity AI settings',
             ];
         }
 

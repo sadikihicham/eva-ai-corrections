@@ -8,7 +8,7 @@ final class EvaAudioChatProvider extends EvaAudioTranscriptionProvider {
 	private const LANGUAGE_RULE = 'same language as the voice message';
 	protected function subtitles(): bool { return false; }
 	public function getId(): string { return 'eva_ai:audio2audio:chat:openai-compatible'; }
-	public function getName(): string { return $this->l->t('Eva (audio chat)'); }
+	public function getName(): string { return $this->l->t('Infinity AI (audio chat)'); }
 	public function getTaskTypeId(): string { return AudioToAudioChat::ID; }
 	public function process(?string $userId, array $input, callable $reportProgress): array {
 		if ($userId === null || $userId === '') throw new RuntimeException('No user context');

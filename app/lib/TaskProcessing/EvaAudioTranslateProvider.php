@@ -8,7 +8,7 @@ final class EvaAudioTranslateProvider extends EvaAudioTranscriptionProvider {
 	private const LANGUAGE_RULE = 'same language as the target language';
 	protected function subtitles(): bool { return false; }
 	public function getId(): string { return 'eva_ai:audio2audio:translate:openai-compatible'; }
-	public function getName(): string { return $this->l->t('Eva (audio translation)'); }
+	public function getName(): string { return $this->l->t('Infinity AI (audio translation)'); }
 	public function getTaskTypeId(): string { return AudioToAudioTranslate::ID; }
 	public function process(?string $userId, array $input, callable $reportProgress): array {
 		if ($userId === null || $userId === '') throw new RuntimeException('No user context');

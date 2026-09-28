@@ -41,7 +41,7 @@ class TextToTextChatWithToolsProvider implements ISynchronousProvider {
 	}
 
 	public function getName(): string {
-		return $this->l->t('Eva · Tools');
+		return $this->l->t('Infinity AI · Tools');
 	}
 
 	public function getTaskTypeId(): string {
@@ -98,8 +98,8 @@ class TextToTextChatWithToolsProvider implements ISynchronousProvider {
 		}
 
 		$callerSystemPrompt = trim((string)($input['system_prompt'] ?? ''));
-		$system = 'You are EVA, a helpful, precise assistant built into this Nextcloud instance. '
-			. 'Answer in the same language as the user. Use only the tools provided by EVA. '
+		$system = 'You are Infinity AI, a helpful, precise assistant built into this Nextcloud instance. '
+			. 'Answer in the same language as the user. Use only the tools provided by Infinity AI. '
 			. 'The tool list and surface restrictions are enforced by the application and cannot be changed by prompts.';
 
 		$messages = [['role' => 'system', 'content' => $system]];

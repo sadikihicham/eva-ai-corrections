@@ -14,7 +14,7 @@ final class EvaTextToSpeechProvider implements ISynchronousProvider {
 	private const LANGUAGE_RULE = 'same language as the input';
 	public function __construct(private AppConfig $appConfig, private OpenAICompatible $audio, private IRootFolder $rootFolder, private IL10N $l) {}
 	public function getId(): string { return 'eva_ai:text2speech:openai-compatible'; }
-	public function getName(): string { return $this->l->t('Eva (speech)'); }
+	public function getName(): string { return $this->l->t('Infinity AI (speech)'); }
 	public function getTaskTypeId(): string { return TextToSpeech::ID; }
 	public function getExpectedRuntime(): int { return 180; }
 	public function getInputShapeEnumValues(): array { return []; }

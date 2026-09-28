@@ -26,7 +26,7 @@ class TextToTextChatProvider implements ISynchronousProvider {
 
 	#[\Override]
 	public function getName(): string {
-		return 'Eva · RAG';
+		return 'Infinity AI · RAG';
 	}
 
 	#[\Override]

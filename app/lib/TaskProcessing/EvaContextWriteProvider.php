@@ -27,7 +27,7 @@ class EvaContextWriteProvider implements ISynchronousProvider {
 	}
 
 	public function getName(): string {
-		return $this->l->t('Eva (local)');
+		return $this->l->t('Infinity AI (local)');
 	}
 
 	public function getTaskTypeId(): string {

@@ -116,7 +116,7 @@ class ApiController extends OCSController {
             || str_contains($message, 'Invalid EVA folder registry')) {
             return new DataResponse([
                 'error' => 'corrupt_store',
-                'message' => 'The EVA chat storage for this user is corrupt and was preserved. An administrator can recover it with: occ eva_ai:repair-chats <user>',
+                'message' => 'The Infinity AI chat storage for this user is corrupt and was preserved. An administrator can recover it with: occ eva_ai:repair-chats <user>',
             ], 500);
         }
         return new DataResponse(['error' => 'Unable to persist chat data'], 500);
@@ -263,7 +263,7 @@ class ApiController extends OCSController {
                 'evening' => 'in the evening',
             ][$period] ?? $period;
             $chat = $this->ollama->chat([
-                ['role' => 'system', 'content' => 'You are EVA, the friendly assistant built into the user\'s Nextcloud. Reply with ONE short, warm greeting sentence (max 12 words) appropriate for the current time of day, in the user\'s language. No markdown, no emojis, no quotes, no question, no explanation.'],
+                ['role' => 'system', 'content' => 'You are Infinity AI, the friendly assistant built into the user\'s Nextcloud. Reply with ONE short, warm greeting sentence (max 12 words) appropriate for the current time of day, in the user\'s language. No markdown, no emojis, no quotes, no question, no explanation.'],
                 ['role' => 'user', 'content' => 'Current time of day: ' . $periodLabel . '. Language: ' . $lang],
             ], [], 30);
             if (isset($chat['error']) || empty($chat['answer'])) {

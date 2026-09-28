@@ -1,5 +1,5 @@
 /**
- * Eva AI admin settings — behaviour for the native Nextcloud admin page.
+ * Infinity AI admin settings — behaviour for the native Nextcloud admin page.
  *
  * Uses only native DOM APIs and, when available, Nextcloud's own OC.Notification
  * for feedback. Every interaction talks to the admin-only OCS endpoints under
@@ -198,7 +198,7 @@
 			if (data && data.enabled === false) {
 				var hint = document.createElement('p')
 				hint.className = 'settings-hint'
-				hint.textContent = 'Web search is switched off for your account. Turn it on in your personal Eva AI settings and choose a provider.'
+				hint.textContent = 'Web search is switched off for your account. Turn it on in your personal Infinity AI settings and choose a provider.'
 				box.appendChild(hint)
 			}
 			box.appendChild(problem)

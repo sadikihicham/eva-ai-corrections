@@ -7,7 +7,7 @@ use OCP\TaskProcessing\TaskTypes\MultimodalContextAgentInteraction;
 final class MultimodalContextAgentProvider extends AgentInteractionProvider {
 	private const LANGUAGE_RULE = 'same language as the user';
 	public function getId(): string { return 'eva_ai:contextagent:multimodal-interaction'; }
-	public function getName(): string { return $this->l->t('Eva · Multimodal Agent'); }
+	public function getName(): string { return $this->l->t('Infinity AI · Multimodal Agent'); }
 	public function getTaskTypeId(): string { return MultimodalContextAgentInteraction::ID; }
 
 	public function process(?string $userId, array $input, callable $reportProgress): array {

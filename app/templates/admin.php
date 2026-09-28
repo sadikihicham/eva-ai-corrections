@@ -67,9 +67,9 @@ $providerLabels = [
 
 <div id="eva-ai-admin" class="section" data-api-base="<?php p($apiBase); ?>">
 
-	<h2><?php p($l->t('Eva AI')); ?></h2>
+	<h2><?php p($l->t('Infinity AI')); ?></h2>
 	<p class="settings-hint">
-		<?php p($l->t('Eva AI answers questions from the files and mail of this instance. Configure the language models, the background indexer and the optional external tools here.')); ?>
+		<?php p($l->t('Infinity AI answers questions from the files and mail of this instance. Configure the language models, the background indexer and the optional external tools here.')); ?>
 	</p>
 
 	<p class="eva-chip-row">
@@ -88,7 +88,7 @@ $providerLabels = [
 
 	<h3><?php p($l->t('Instance status')); ?></h3>
 	<p class="settings-hint">
-		<?php p($l->t('Live information about the services Eva AI depends on. Nothing here changes a setting.')); ?>
+		<?php p($l->t('Live information about the services Infinity AI depends on. Nothing here changes a setting.')); ?>
 	</p>
 
 	<table class="grid">
@@ -195,7 +195,7 @@ $providerLabels = [
 
 	<h3><?php p($l->t('Web search')); ?></h3>
 	<p class="settings-hint">
-		<?php p($l->t('Web search is opt-in and off by default. Each user turns it on and picks a provider in their personal Eva AI settings; the options below provide the instance-wide infrastructure for everyone.')); ?>
+		<?php p($l->t('Web search is opt-in and off by default. Each user turns it on and picks a provider in their personal Infinity AI settings; the options below provide the instance-wide infrastructure for everyone.')); ?>
 	</p>
 
 	<table class="grid eva-provider-table">
@@ -250,7 +250,7 @@ $providerLabels = [
 	</div>
 
 	<p class="settings-hint eva-indent">
-		<?php p($l->t('Search limits, page reading, images, safe search and browser rendering are configured by each user in personal Eva AI settings. This page only stores shared provider credentials and browser infrastructure.')); ?>
+		<?php p($l->t('Search limits, page reading, images, safe search and browser rendering are configured by each user in personal Infinity AI settings. This page only stores shared provider credentials and browser infrastructure.')); ?>
 	</p>
 
 	<div class="eva-field">
@@ -278,7 +278,7 @@ $providerLabels = [
 
 	<h3><?php p($l->t('Test the web search')); ?></h3>
 	<p class="settings-hint">
-		<?php p($l->t('Run a real search and see exactly what the assistant would receive: the ranked results, how much page text was read, and the pictures found. This uses your own account settings, so enable web search and pick a provider in your personal Eva AI settings first.')); ?>
+		<?php p($l->t('Run a real search and see exactly what the assistant would receive: the ranked results, how much page text was read, and the pictures found. This uses your own account settings, so enable web search and pick a provider in your personal Infinity AI settings first.')); ?>
 	</p>
 
 	<div class="eva-test-row">
@@ -302,7 +302,7 @@ $providerLabels = [
 	</p>
 
 	<p class="settings-hint">
-		<?php p($l->t('Tool permissions, including weather forecasts and file actions, are configured by each user in personal Eva AI settings.')); ?>
+		<?php p($l->t('Tool permissions, including weather forecasts and file actions, are configured by each user in personal Infinity AI settings.')); ?>
 	</p>
 
 

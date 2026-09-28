@@ -58,7 +58,7 @@ class TalkBotRegistrar {
 		$bot->setSecret($this->random->generate(64));
 		$bot->setState(Bot::STATE_ENABLED);
 		$bot->setFeatures(Bot::FEATURE_RESPONSE | Bot::FEATURE_EVENT);
-		$bot->setDescription('Eva AI assistant: chat with your indexed files.');
+		$bot->setDescription('Infinity AI assistant: chat with your indexed files.');
 		try {
 			$botServerMapper->insert($bot);
 		} catch (DbException $e) {

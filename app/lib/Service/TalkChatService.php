@@ -173,7 +173,7 @@ class TalkChatService
         if (!$this->writeEnabled()) {
             return [
                 'ok' => false,
-                'error' => 'Posting to Nextcloud Talk is switched off. Enable "Let the assistant post to Talk for me" in the EVA AI settings first.',
+                'error' => 'Posting to Nextcloud Talk is switched off. Enable "Let the assistant post to Talk for me" in the Infinity AI settings first.',
             ];
         }
         $message = trim($message);

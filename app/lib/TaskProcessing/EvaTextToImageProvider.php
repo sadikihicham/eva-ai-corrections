@@ -24,7 +24,7 @@ final class EvaTextToImageProvider implements ISynchronousProvider {
 	}
 
 	public function getId(): string { return 'eva_ai:text2image:openai-compatible'; }
-	public function getName(): string { return $this->l->t('Eva (image provider)'); }
+	public function getName(): string { return $this->l->t('Infinity AI (image provider)'); }
 	public function getTaskTypeId(): string { return TextToImage::ID; }
 	public function getExpectedRuntime(): int { return 180; }
 	public function getInputShapeEnumValues(): array { return []; }

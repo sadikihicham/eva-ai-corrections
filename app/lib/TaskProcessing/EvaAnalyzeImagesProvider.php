@@ -34,7 +34,7 @@ final class EvaAnalyzeImagesProvider implements ISynchronousProvider {
 	}
 
 	public function getId(): string { return 'eva_ai:image2text:analyze'; }
-	public function getName(): string { return $this->l->t('Eva (vision)'); }
+	public function getName(): string { return $this->l->t('Infinity AI (vision)'); }
 	public function getTaskTypeId(): string { return AnalyzeImages::ID; }
 	public function getExpectedRuntime(): int { return 120; }
 	public function getInputShapeEnumValues(): array { return []; }
@@ -102,7 +102,7 @@ final class EvaAnalyzeImagesProvider implements ISynchronousProvider {
 
 		$reportProgress(0.4);
 		$result = $this->ollama->chat([
-			['role' => 'system', 'content' => 'You are EVA vision. Answer the question using only what is visible in the supplied images. Do not invent identities or details. Answer in the same language as the question.'],
+			['role' => 'system', 'content' => 'You are Infinity AI vision. Answer the question using only what is visible in the supplied images. Do not invent identities or details. Answer in the same language as the question.'],
 			['role' => 'user', 'content' => $question, 'images' => $images, 'image_mimes' => $mimes],
 		], [], 120, static function (float $progress) use ($reportProgress): void {
 			$reportProgress(0.4 + min(0.5, max(0.0, $progress)) * 0.9);

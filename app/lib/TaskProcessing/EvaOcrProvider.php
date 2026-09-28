@@ -24,7 +24,7 @@ final class EvaOcrProvider implements ISynchronousProvider {
 	}
 
 	public function getId(): string { return 'eva_ai:image2text:ocr'; }
-	public function getName(): string { return $this->l->t('Eva (local)'); }
+	public function getName(): string { return $this->l->t('Infinity AI (local)'); }
 	public function getTaskTypeId(): string { return ImageToTextOpticalCharacterRecognition::ID; }
 	public function getExpectedRuntime(): int { return 120; }
 	public function getInputShapeEnumValues(): array { return []; }

@@ -24,7 +24,7 @@ class AdminSection implements IIconSection {
     }
 
     public function getName(): string {
-        return $this->l->t('Eva AI');
+        return $this->l->t('Infinity AI');
     }
 
     public function getPriority(): int {

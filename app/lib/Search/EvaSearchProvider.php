@@ -41,7 +41,7 @@ final class EvaSearchProvider implements IProvider {
     }
 
     public function getName(): string {
-        return $this->l10n->t('EVA indexed files');
+        return $this->l10n->t('Infinity AI indexed files');
     }
 
     public function getOrder(string $route, array $routeParameters): int {

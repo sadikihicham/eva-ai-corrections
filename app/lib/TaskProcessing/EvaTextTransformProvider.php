@@ -29,7 +29,7 @@ abstract class EvaTextTransformProvider implements ISynchronousProvider {
 	abstract protected function instruction(): string;
 
 	public function getName(): string {
-		return $this->l->t('Eva (local)');
+		return $this->l->t('Infinity AI (local)');
 	}
 
 	public function getExpectedRuntime(): int {

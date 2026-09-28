@@ -34,7 +34,7 @@ class EVAWidget implements IWidget, IAPIWidget, IAPIWidgetV2 {
     }
 
     public function getTitle(): string {
-        return $this->l10n->t('EVA AI');
+        return $this->l10n->t('Infinity AI');
     }
 
     public function getOrder(): int {

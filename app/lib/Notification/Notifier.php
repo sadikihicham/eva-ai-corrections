@@ -23,7 +23,7 @@ class Notifier implements INotifier {
 	}
 
 	public function getName(): string {
-		return 'EVA – Chat';
+		return 'Infinity AI – Chat';
 	}
 
 	public function prepare(INotification $notification, string $languageCode): INotification {
@@ -35,8 +35,8 @@ class Notifier implements INotifier {
 			$params = $notification->getSubjectParameters();
 			$subject = $notification->getSubject();
 			$notification->setParsedSubject($subject === 'scheduled_briefing'
-				? 'EVA scheduled briefing'
-				: ($subject === 'background_failed' ? 'EVA task failed' : 'EVA answer ready'));
+				? 'Infinity AI scheduled briefing'
+				: ($subject === 'background_failed' ? 'Infinity AI task failed' : 'Infinity AI answer ready'));
 			$notification->setParsedMessage((string)($params['text'] ?? ''));
 			// NC >= 30 verlangt absolute URLs fuer das Icon; relative Pfade
 			// werfen InvalidValueException (subklasse von \InvalidArgumentException)

@@ -36,13 +36,13 @@ use Psr\Log\LoggerInterface;
  */
 class TalkBotListener implements IEventListener {
     private const SYSTEM_PROMPT = <<<'PROMPT'
-You are EVA, a helpful assistant in a Nextcloud Talk conversation. Answer briefly and in a friendly tone (1-3 sentences), in the language of the message you are answering.
+You are Infinity AI, a helpful assistant in a Nextcloud Talk conversation. Answer briefly and in a friendly tone (1-3 sentences), in the language of the message you are answering.
 
 You have read-only tools (calendar, tasks, files, contacts, mail, …). Use them when the user asks for information.
 
 You also have a web search tool (`web_search`), a page reader (`open_website`) and an image search tool (`search_images`). Use the web search proactively when you need current or time-critical information: news, software releases, prices, weather, documentation, opening hours, recipes, how-to guides or technical problems. When you are unsure whether your training data is still current, search the internet instead of guessing. When the user asks to see pictures of something, use `search_images` and embed the pictures with Markdown image syntax - you can display images, so never answer that you cannot.
 
-Important: in Talk you cannot create, change or delete files, contacts, calendar entries, shares or tasks. Say so briefly and point to the EVA web chat for those actions, where an explicit confirmation is required.
+Important: in Talk you cannot create, change or delete files, contacts, calendar entries, shares or tasks. Say so briefly and point to the Infinity AI web chat for those actions, where an explicit confirmation is required.
 PROMPT;
 
     public function __construct(
@@ -220,7 +220,7 @@ PROMPT;
         }
         $joined = mb_substr(implode("\n", array_slice($texts, -40)), 0, 12000);
         $messages = [
-            ['role' => 'system', 'content' => 'You are EVA. Summarize the following chat messages in 3-6 sentences, in the language the messages are written in. Name the most important topics and results without inventing details.'],
+            ['role' => 'system', 'content' => 'You are Infinity AI. Summarize the following chat messages in 3-6 sentences, in the language the messages are written in. Name the most important topics and results without inventing details.'],
             ['role' => 'user', 'content' => $joined],
         ];
         $resp = $this->ollama->chat($messages, []);

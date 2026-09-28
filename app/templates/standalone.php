@@ -7,7 +7,7 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>EVA – Chat with your files</title>
+    <title>Infinity AI – Chat with your files</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="stylesheet" href="<?php echo htmlspecialchars(\OC::$WEBROOT . '/core/css/server.css', ENT_QUOTES); ?>">
     <style>
@@ -282,8 +282,8 @@
 <body>
     <div id="topbar">
         <a class="brand" href="<?php echo htmlspecialchars(\OC::$WEBROOT . '/apps/eva_ai/', ENT_QUOTES); ?>">
-            <img class="logo" src="<?php echo htmlspecialchars(\OC::$WEBROOT . '/apps/eva_ai/img/eva-icon.svg', ENT_QUOTES); ?>" alt="EVA">
-            <span>EVA</span>
+            <img class="logo" src="<?php echo htmlspecialchars(\OC::$WEBROOT . '/apps/eva_ai/img/eva-icon.svg', ENT_QUOTES); ?>" alt="Infinity AI">
+            <span>Infinity AI</span>
         </a>
         <div class="spacer"></div>
         <a class="toplink" href="<?php echo htmlspecialchars(\OC::$WEBROOT . '/', ENT_QUOTES); ?>">Back to overview</a>
@@ -302,7 +302,7 @@
             </a>
             <div class="sidebar-sep"></div>
             <div style="font-size:12px;color:var(--color-text-maxcontrast,#666);padding:4px 12px;">
-                EVA · <span id="badge-version">standalone</span>
+                Infinity AI · <span id="badge-version">standalone</span>
             </div>
         </nav>
 

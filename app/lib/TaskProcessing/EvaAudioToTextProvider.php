@@ -7,7 +7,7 @@ use RuntimeException;
 final class EvaAudioToTextProvider extends EvaAudioTranscriptionProvider {
 	private const LANGUAGE_RULE = 'same language as the audio';
 	public function getId(): string { return 'eva_ai:audio2text:openai-compatible'; }
-	public function getName(): string { return $this->l->t('Eva (audio transcription)'); }
+	public function getName(): string { return $this->l->t('Infinity AI (audio transcription)'); }
 	public function getTaskTypeId(): string { return AudioToText::ID; }
 	protected function subtitles(): bool { return false; }
 	public function process(?string $userId, array $input, callable $reportProgress): array {

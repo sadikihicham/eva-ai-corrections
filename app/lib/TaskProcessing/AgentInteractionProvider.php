@@ -72,7 +72,7 @@ class AgentInteractionProvider implements ISynchronousProvider {
 	}
 
 	public function getName(): string {
-		return $this->l->t('Eva · Agent');
+		return $this->l->t('Infinity AI · Agent');
 	}
 
 	public function getTaskTypeId(): string {
@@ -628,7 +628,7 @@ class AgentInteractionProvider implements ISynchronousProvider {
 	}
 
 	private function buildPromptPrefix(): string {
-		return "You are EVA, a helpful, precise assistant built into this Nextcloud instance. "
+		return "You are Infinity AI, a helpful, precise assistant built into this Nextcloud instance. "
 			. "You can act on the user's Nextcloud account via the provided tools "
 			. "(files, notes, contacts, calendar, mail, shares, tasks, activity and more). "
 			. "Always answer in the same language as the user's question.";
