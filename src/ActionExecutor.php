@@ -130,6 +130,35 @@ class ActionExecutor {
     ];
 
     /**
+     * Deletions are never run on a model call alone (recette 28/09, test I.1): the user confirms each one.
+     * Covers every tool the policy marks destructive (delete_*, restore_file_version, which overwrites the current
+     * content) and an external connector called with DELETE (reachable through the call_app_api alias).
+     */
+    private function requiresDeleteConfirmation(string $name, array $args = [], ?string $risk = null): bool {
+        return str_starts_with($name, 'delete_')
+            || $risk === ToolPolicy::RISK_DESTRUCTIVE
+            || ($name === 'call_external_connector' && strtoupper(trim((string)($args['method'] ?? ''))) === 'DELETE');
+    }
+
+    /** For callers that confirm on the user's behalf (autonomous briefings): true when the call would destroy data. */
+    public function isDestructiveCall(string $name, array $args): bool {
+        if ($name === 'call_app_api' && strtoupper(trim((string)($args['method'] ?? ''))) === 'DELETE') return true;
+        $policy = $this->toolPolicy->check($name);
+        return $this->requiresDeleteConfirmation($name, $args, isset($policy['risk']) ? (string)$policy['risk'] : null);
+    }
+
+    /** Says what would be deleted, from the tool's required arguments (path, event_id, share_id…). */
+    private function deleteConfirmationMessage(string $name, array $args): string {
+        $target = [];
+        foreach (self::REQUIRED_ARGS[$name] ?? [] as $key) {
+            $value = $args[$key] ?? null;
+            if (is_scalar($value) && trim((string)$value) !== '') $target[] = $key . ' "' . mb_substr(trim((string)$value), 0, 200) . '"';
+        }
+        return 'Deleting is irreversible: ' . $name . ($target !== [] ? ' would delete ' . implode(', ', $target) : ' would delete the requested item')
+            . '. The user must confirm this deletion before it runs.';
+    }
+
+    /**
      * Return the keys of required arguments that are missing or empty.
      *
      * @return string[]
@@ -1003,6 +1032,31 @@ class ActionExecutor {
     }
 
     /**
+     * Unattended run (scheduled briefing with actions): nobody is present to confirm, so what the dialog would ask
+     * about is refused instead - deleting, a terminal command, a generic app API call, a connector call other than GET,
+     * replacing an existing file. The rest runs confirmed. Plugin tools keep their own confirmation rule.
+     */
+    public function runUnattended(string $userId, string $name, array $args): array {
+        $refused = 'This is never done in an unattended run: nobody is present to confirm. Tell the user what should be done and let them do it in the chat.';
+        $method = strtoupper(trim((string)($args['method'] ?? 'GET')));
+        if ($this->isDestructiveCall($name, $args) || in_array($name, ['call_app_api', 'run_safe_command', 'run_terminal_command', 'run_terminal_sequence'], true)
+            || ($name === 'call_external_connector' && $method !== 'GET')) {
+            return ['ok' => false, 'error' => $refused];
+        }
+        try {
+            $this->setUserId($userId);
+            if (PHP_SAPI === 'cli') \OC_Util::setupFS($userId);
+            $existing = $this->existingWriteTargets($this->rootFolder->getUserFolder($userId), $name, $args);
+        } catch (\Throwable $e) {
+            $existing = [];
+        }
+        if ($existing !== []) {
+            return ['ok' => false, 'error' => 'The file ' . implode(', ', $existing) . ' already exists. ' . $refused];
+        }
+        return $this->runConfirmed($userId, $name, $args);
+    }
+
+    /**
      * Führt einen Tool-Aufruf aus. Wirft nie - liefert immer {ok, result|error}.
      * @return array{ok:bool,result?:mixed,error?:string,confirmation_required?:bool,tool?:string,risk?:string}
      */
@@ -1139,6 +1193,15 @@ class ActionExecutor {
             return ['ok' => false, 'error' => 'File tools are not available in the background worker (CLI). Ask in the web chat instead.'];
         }
 
+        // Never delete without asking (recette 28/09, test I.1: "supprime le fichier X" deleted at once, because a
+        // complete call runs directly on the web surface). Every destructive tool asks on the web and TaskProcessing
+        // surfaces; the dialog runs the call again through runConfirmed(). Autonomous briefings go through
+        // runUnattended(), which refuses them (nobody is present to confirm).
+        if (!$confirmed && $this->requiresDeleteConfirmation($name, $args, isset($policy['risk']) ? (string)$policy['risk'] : null)) {
+            return ['ok' => false, 'confirmation_required' => true, 'tool' => $name, 'arguments' => $args,
+                'risk' => (string)($policy['risk'] ?? ToolPolicy::RISK_MUTATING),
+                'delete' => true, 'error' => $this->deleteConfirmationMessage($name, $args)];
+        }
         // Never replace an existing file silently (admin, 28/09): on the web surface a complete create_file runs at
         // once, and create_file overwrites. The user confirms in the dialog, which runs the call again confirmed.
         if (!$confirmed && $home !== null && ($existing = $this->existingWriteTargets($home, $name, $args)) !== []) {
@@ -2066,10 +2129,32 @@ class ActionExecutor {
         // Models often send a Markdown table ("| a | b |"), sometimes after an intro sentence (seen 28/09: every line
         // landed in a single cell). Then the intro before the first table is dropped; later prose (notes, totals) is
         // kept in column A, and a separator is only the 2nd line of a table (a data row "| - | - |" stays).
+        // A Markdown table may also come without the outer pipes ("a | b" / "---|---" / "1 | 2", recette 28/09, test B.1:
+        // everything landed in column A). Only a real separator line under a line with "|" makes it a table, so a CSV
+        // cell holding "|" stays CSV; the header and the "|" lines below the separator get their outer pipes back.
+        $isSeparator = static fn(string $l): bool => preg_match('/^[\s|:-]+$/', $l) === 1 && str_contains($l, '|') && str_contains($l, '-');
+        if (array_filter($rows, static fn(string $l): bool => str_starts_with(ltrim($l), '|')) === []) {
+            $pipe = static function (string $l): string {
+                $l = trim($l);
+                if (!str_starts_with($l, '|')) $l = '| ' . $l;
+                if (!str_ends_with($l, '|') || str_ends_with($l, '\\|')) $l .= ' |';
+                return $l;
+            };
+            $count = count($rows);
+            for ($k = 1; $k < $count; $k++) {
+                if (!$isSeparator($rows[$k]) || !str_contains($rows[$k - 1], '|') || $isSeparator($rows[$k - 1])) continue;
+                $rows[$k - 1] = $pipe($rows[$k - 1]);
+                for ($j = $k; $j < $count && trim($rows[$j]) !== '' && str_contains($rows[$j], '|'); $j++) $rows[$j] = $pipe($rows[$j]);
+                $k = $j;
+            }
+        }
         $first = null;
         foreach ($rows as $k => $l) { if (str_starts_with(ltrim($l), '|')) { $first = $k; break; } }
         $markdown = $first !== null;
-        if ($markdown) $rows = array_slice($rows, $first);
+        // Only a prose intro is dropped: when a line before the table looks like data (tab, ";" or "," and not ending
+        // like a sentence), everything is kept, in column A, rather than lost silently (review of 229ea02).
+        $looksLikeData = static fn(string $l): bool => trim($l) !== '' && preg_match('/[\t;,]/', $l) === 1 && preg_match('/[:.!?]\s*$/u', $l) !== 1;
+        if ($markdown && array_filter(array_slice($rows, 0, $first), $looksLikeData) === []) $rows = array_slice($rows, $first);
         $blockRow = 0;
         // French Excel writes "a;b;c" (seen 28/09: the whole row landed in column A). Decided on the header line, quoted
         // text left out: ";" inside cells or French decimals "48,85" in the data must not choose (review of 2195949).

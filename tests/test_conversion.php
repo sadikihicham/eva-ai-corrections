@@ -9,6 +9,8 @@
  */
 set_error_handler(function (int $n, string $m): bool { global $echecs; echo "❌ AVERTISSEMENT PHP : $m\n"; $echecs = ($echecs ?? 0) + 1; return true; });
 $source = file_get_contents($argv[1] ?? 'php://stdin');
+// Facultatif : ToolPolicy.php concaténé après une ligne « //@@TOOLPOLICY@@ » (test piloté par la table des risques).
+[$source, $politique] = array_pad(explode("\n//@@TOOLPOLICY@@\n", $source, 2), 2, null);
 function extraire(string $src, string $nom): string {
     $debut = strpos($src, 'private function ' . $nom . '(');
     if ($debut === false) { fwrite(STDERR, "méthode $nom absente\n"); exit(2); }
@@ -107,6 +109,36 @@ $garde = strpos($source, 'if (!$confirmed && $home !== null && ($existing = $thi
 $execution = strpos($source, '$result = match ($name) {');
 verifie('run() : confirmation d\'écrasement placée avant l\'exécution de l\'outil', $garde !== false && $execution !== false && $garde < $execution);
 verifie('run() : la garde renvoie confirmation_required', $garde !== false && str_contains(substr($source, $garde, 400), "'confirmation_required' => true"));
+// 6. suppression sans confirmation (recette 28/09, test I.1 : « supprime le fichier X » supprimait sans rien demander)
+$gardeSuppr = strpos($source, 'if (!$confirmed && $this->requiresDeleteConfirmation($name, $args,');
+verifie('run() : garde delete_* présente et dépendant de !$confirmed', $gardeSuppr !== false);
+verifie('run() : garde delete_* placée avant l\'exécution de l\'outil', $gardeSuppr !== false && $execution !== false && $gardeSuppr < $execution);
+verifie('run() : garde delete_* après le contrôle de politique (outil interdit = refus, pas de dialogue)', $gardeSuppr !== false && ($pol = strpos($source, '$policy = $this->toolPolicy->check($name);')) !== false && $pol < $gardeSuppr);
+verifie('run() : la garde delete_* renvoie confirmation_required avec tool/arguments/risk', $gardeSuppr !== false && str_contains($bloc = substr($source, $gardeSuppr, 400), "'confirmation_required' => true") && str_contains($bloc, "'tool' => \$name") && str_contains($bloc, "'arguments' => \$args") && str_contains($bloc, "'risk' =>"));
+if (!class_exists('ToolPolicy')) eval('class ToolPolicy { public const RISK_DESTRUCTIVE = "destructive"; }');
+eval('class SupprSousTest { ' . constante($source, 'REQUIRED_ARGS') . extraire($source, 'requiresDeleteConfirmation') . extraire($source, 'deleteConfirmationMessage')
+    . ' public function exige(string $n, array $a = [], ?string $r = null): bool { return $this->requiresDeleteConfirmation($n, $a, $r); } public function message(string $n, array $a): string { return $this->deleteConfirmationMessage($n, $a); } }');
+$s = new SupprSousTest();
+$tous = ['delete_file', 'delete_contact', 'delete_calendar_event', 'delete_task', 'delete_comment', 'delete_share', 'delete_scheduled_briefing'];
+verifie('les 7 outils delete_* exigent une confirmation', array_filter($tous, fn($n) => !$s->exige($n)) === []);
+verifie('create_file / read_file / list_files / update_contact → pas concernés', !$s->exige('create_file') && !$s->exige('read_file') && !$s->exige('list_files') && !$s->exige('update_contact'));
+verifie('risque « destructive » de la politique (restore_file_version) → confirmation', $s->exige('restore_file_version', ['path' => 'a.txt'], 'destructive') && !$s->exige('restore_file_version', [], 'mutating'));
+verifie('connecteur externe en DELETE → confirmation ; en GET/POST → non', $s->exige('call_external_connector', ['method' => 'delete']) && !$s->exige('call_external_connector', ['method' => 'GET']) && !$s->exige('call_external_connector', ['method' => 'POST']));
+// Piloté par la table réelle : tout outil que ToolPolicy classe « destructive » demande confirmation.
+if ($politique !== null) {
+    preg_match_all("~'([a-z_]+)' => \[[^\]]*?'risk' => self::RISK_DESTRUCTIVE~s", $politique, $m);
+    $destructifs = $m[1];
+    verifie('table ToolPolicy lue : au moins 8 outils destructifs (dont restore_file_version)', count($destructifs) >= 8 && in_array('restore_file_version', $destructifs, true), json_encode($destructifs));
+    verifie('chaque outil destructif de ToolPolicy exige une confirmation', array_filter($destructifs, fn($n) => !$s->exige($n, [], 'destructive')) === []);
+} else {
+    verifie('ToolPolicy.php fourni après //@@TOOLPOLICY@@ (sinon test de table sauté)', false);
+}
+$pub = (string)substr($source, (int)strpos($source, 'public function isDestructiveCall('), 450);
+verifie('isDestructiveCall (briefings autonomes) : call_app_api en DELETE + politique réelle', str_contains($pub, "'call_app_api'") && str_contains($pub, 'toolPolicy->check($name)') && str_contains($pub, 'requiresDeleteConfirmation('));
+$m = $s->message('delete_file', ['path' => 'Documents/Rapport.docx']);
+verifie('message : dit ce qui serait supprimé et que l\'utilisateur doit confirmer', str_contains($m, 'Documents/Rapport.docx') && str_contains($m, 'confirm'), $m);
+$m = $s->message('delete_task', []);
+verifie('message sans argument : reste explicite, pas d\'avertissement PHP', str_contains($m, 'delete_task') && str_contains($m, 'confirm'), $m);
 verifie('convert_file est déclaré aux 4 endroits (outil, arguments requis, liste fichiers, exécution)', substr_count($source, "'convert_file'") >= 4);
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

@@ -46,5 +46,23 @@ $l = lignes($g->x("Tâche,Notes\n\"Appeler; relancer; clôturer\",\"a; b\""));
 verifie('CSV « , » avec plusieurs « ; » entre guillemets → « , » gardé', $l === [['Tâche', 'Notes'], ['Appeler; relancer; clôturer', 'a; b']], json_encode($l, JSON_UNESCAPED_UNICODE));
 $l = lignes($g->x("Lat;Long\n48,85;2,35\n43,30;5,37"));
 verifie('CSV « ; » avec décimales « 48,85 » → « ; »', $l === [['Lat', 'Long'], ['48,85', '2,35'], ['43,30', '5,37']], json_encode($l, JSON_UNESCAPED_UNICODE));
+// 7. tableau Markdown SANS « | » en début de ligne (recette 28/09, test B.1 : tout tombait en colonne A)
+$l = lignes($g->x("Nom de l'employé | Performance de la semaine\n-----------------|--------------------------\nAlice | 95\nBob | 87"));
+verifie('tableau sans « | » extérieurs → 2 colonnes, séparateur écarté, 2 lignes de données', $l === [["Nom de l'employé", 'Performance de la semaine'], ['Alice', '95'], ['Bob', '87']], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("a | b\n:--|--:\n1 | 2"));
+verifie('séparateur aligné « :--|--: » sans « | » extérieurs → a|b / 1|2', $l === [['a', 'b'], ['1', '2']], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("Voici le tableau :\n\nProduit | Prix\n---|---\nThé | 3\n\nTotal : 3"));
+verifie('intro écartée, prose après le tableau gardée en colonne A', $l === [['Produit', 'Prix'], ['Thé', '3'], ['Total : 3']], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("Nom,Commentaire\nA,\"x | y\""));
+verifie('CSV avec « | » dans une cellule (sans séparateur) → inchangé', $l === [['Nom', 'Commentaire'], ['A', 'x | y']], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("Titre\na | b\nfin"));
+verifie('ligne « a | b » isolée sans séparateur → comportement CSV inchangé', $l === [['Titre'], ['a | b'], ['fin']], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("Liste\n---\nun"));
+verifie('ligne « --- » sans « | » → pas un tableau', $l === [['Liste'], ['---'], ['un']], json_encode($l, JSON_UNESCAPED_UNICODE));
+// revue de 229ea02 : des données CSV avant un tableau ne disparaissent plus avec l'intro
+$l = lignes($g->x("Date,Montant\n2026-01-01,10\n\nLégende | Code\n---|---\nA | 1"));
+verifie('CSV avant un tableau → gardé (colonne A), tableau en colonnes', $l === [['Date,Montant'], ['2026-01-01,10'], ['Légende', 'Code'], ['A', '1']], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("Voici, comme demandé, le tableau.\n\n| a | b |\n|---|---|\n| 1 | 2 |"));
+verifie('intro avec virgules finie par « . » → écartée', $l === [['a', 'b'], ['1', '2']], json_encode($l, JSON_UNESCAPED_UNICODE));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);
