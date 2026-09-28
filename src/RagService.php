@@ -804,10 +804,12 @@ $this->executor->setUserId($userId);
             return false;
         }
         // "how do I create an Excel file?" asks for an explanation, not a file.
-        if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $m) === 1) {
+        // But "un doc pour expliquer le fichier" / "a file to explain how…" is a file whose PURPOSE is explaining (test 28/09 04:54).
+        $asked = (string)preg_replace('~(?<!\p{L})(pour|to|qui|that)\s+(expliqu\p{L}*|explain\p{L}*|d[ée]cri\p{L}*|describ\p{L}*).*$~us', '', $m);
+        if (preg_match('~(?<!\p{L})(comment|how|pourquoi|why|explique\p{L}*|explain\p{L}*|wie|كيف)(?!\p{L})~u', $asked) === 1) {
             return false;
         }
-        $verb = '(cr[eé]+[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
+        $verb = '(cr[eé]+r?[rsz]?|creat|g[ée]n[èeé]r\p{L}*|fai[st]|faire|pr[ée]par\p{L}*|export\p{L}*|enregistr\p{L}*|sauvegard\p{L}*|[ée]cri[srt]\p{L}*|r[ée]dig\p{L}*|mets|mettre|create|generate|make|export|save|write|put|erstell\p{L}*|أنشئ|انشئ|اصنع|اكتب|اعمل)';
         // Not "tableau / table / markdown / note" alone: "fais un tableau comparatif" is an in-chat answer (second review, 28/09).
         $object = '(fichier|document|doc|docx|word|excel|exel|xlsx|xls|tableur|classeur|pdf|csv|txt|file|spreadsheet|workbook|powerpoint|pptx|datei|ملف|مستند|اكسل)';
         // An object named with "this / the / my…" is an existing file ("fais un résumé de ce document"),

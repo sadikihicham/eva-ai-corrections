@@ -37,5 +37,10 @@ verifie('séparateur aligné :--/--: écarté, \\| dans une cellule gardé', $l 
 // 5. revue adverse de ae24527 : rien de perdu sans prévenir
 $l = lignes($g->x("Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nTotal : 3\n\n| c | d |\n|---|---|\n| - | - |\n| 2**3 | **gras** |"));
 verifie('prose après le tableau gardée, 2 tableaux séparés, « | - | - | » gardé, ** seulement autour', $l === [['a', 'b'], ['1', '2'], ['Total : 3'], ['c', 'd'], ['-', '-'], ['2**3', 'gras']], json_encode($l, JSON_UNESCAPED_UNICODE));
+// 6. CSV français « ; » (test admin 28/09 04:52 : tout dans la colonne A)
+$l = lignes($g->x("Date;Heure;Objet\n2026-09-28;10:00;Réunion d'équipe"));
+verifie('CSV « ; » → vraies colonnes', $l === [['Date', 'Heure', 'Objet'], ['2026-09-28', '10:00', "Réunion d'équipe"]], json_encode($l, JSON_UNESCAPED_UNICODE));
+$l = lignes($g->x("Nom,Note\n\"Dupont; Jean\",12"));
+verifie('CSV « , » avec un « ; » dans une cellule → inchangé', $l === [['Nom', 'Note'], ['Dupont; Jean', '12']], json_encode($l, JSON_UNESCAPED_UNICODE));
 echo $echecs === 0 ? "\nRÉSULTAT : $total/$total réussis\n" : "\nRÉSULTAT : $echecs échec(s) sur $total\n";
 exit($echecs === 0 ? 0 : 1);

@@ -290,6 +290,10 @@ verifie('indentation de tête conservée', str_starts_with($r, '    code'), $r);
 foreach (["creat pdf", "creer pdf", "crée moi pdf", "exporte en pdf", "export excel", "creer un pdf a partir du fichier excel"] as $qc) {
     verifie('création demandée : ' . $qc, $t->fichier($qc));
 }
+verifie('faute « crerr un fichier doc » (test admin 28/09 04:54) → demande de création', $t->fichier('crerr un fichier doc pour expliquer le fichier excel'));
+verifie('« crerr » + affirmation sans outil → relance création', $t->relance('crerr un fichier doc pour expliquer le fichier excel', 'I have created the Word document "Explication.docx" to explain the Excel file.', $tous));
+verifie('« explique comment créer un fichier excel » reste une question', !$t->fichier('explique comment créer un fichier excel'));
+verifie('« crée un document pour expliquer comment faire » = demande de fichier', $t->fichier('crée un document pour expliquer comment faire'));
 verifie('« Comment créer un pdf ? » reste une question, pas une demande', !$t->fichier('Comment créer un pdf ?'));
 $r = $t->relanceGenerale('creer un pdf a partir du fichier excel', "It seems there is no direct tool available to convert an Excel file to a PDF. Would you like me to create a new PDF document for you? If so, I'll proceed with that.", $tous);
 verifie('« Would you like me to create a new PDF…? » en réponse à une demande de PDF → relance création', $r === RagSousTest::CREATION_NUDGE, (string)$r);

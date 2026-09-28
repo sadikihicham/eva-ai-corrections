@@ -211,7 +211,7 @@ class ActionExecutor {
             ]],
             ['type' => 'function', 'function' => [
                 'name' => 'create_file',
-                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma- or tab-separated rows) and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes.',
+                'description' => 'Create (or overwrite) a file anywhere in the user\'s Nextcloud home. Put text in content: .docx (one paragraph per line), .xlsx (comma-, semicolon- or tab-separated rows, or a Markdown table) and .pdf (plain text or simple Markdown: # headings, - lists, **bold**, | tables |, ``` code) are generated automatically from content, never encode them yourself. .pdf supports Latin-script text only (French, English, German…); for Arabic or other scripts create a .docx. Use content_base64 only for real binary files you already have as bytes. The name and content must answer the user\'s CURRENT request (its subject, its columns, its items): never reuse the data of an unrelated file from the context or from an earlier file.',
                 'parameters' => ['type' => 'object', 'properties' => [
                     'path' => ['type' => 'string', 'description' => 'Relative path from the home folder, e.g. "Documents/Plan.md" or "Report.txt".'],
                     'content' => ['type' => 'string', 'description' => 'Full UTF-8 text content.'],
@@ -2052,6 +2052,8 @@ class ActionExecutor {
         $markdown = $first !== null;
         if ($markdown) $rows = array_slice($rows, $first);
         $blockRow = 0;
+        // French Excel writes "a;b;c" (seen 28/09: the whole row landed in column A). ";" wins when the text uses it more than ",".
+        $delim = substr_count($text, ';') > substr_count($text, ',') ? ';' : ',';
         foreach ($rows as $line) {
             if ($markdown) {
                 $inner = trim($line);
@@ -2067,7 +2069,7 @@ class ActionExecutor {
                     if ($blockRow === 1 && $r > 0) $r++;   // an empty row between two tables
                 }
             }
-            $r++; $cells = $markdown ? $cells : (str_contains($line, "\t") ? explode("\t", $line) : str_getcsv($line, ',', '"', '\\')); $c = 0; $sheet .= '<row r="' . $r . '">'; foreach ($cells as $value) { $c++; $col = ''; $n = $c; while ($n > 0) { $n--; $col = chr(65 + ($n % 26)) . $col; $n = intdiv($n, 26); } $sheet .= '<c r="' . $col . $r . '" t="inlineStr"><is><t>' . $esc((string)$value) . '</t></is></c>'; } $sheet .= '</row>'; }
+            $r++; $cells = $markdown ? $cells : (str_contains($line, "\t") ? explode("\t", $line) : str_getcsv($line, $delim, '"', '\\')); $c = 0; $sheet .= '<row r="' . $r . '">'; foreach ($cells as $value) { $c++; $col = ''; $n = $c; while ($n > 0) { $n--; $col = chr(65 + ($n % 26)) . $col; $n = intdiv($n, 26); } $sheet .= '<c r="' . $col . $r . '" t="inlineStr"><is><t>' . $esc((string)$value) . '</t></is></c>'; } $sheet .= '</row>'; }
         $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');
         $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
         $zip->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="EVA" sheetId="1" r:id="rId1"/></sheets></workbook>');
