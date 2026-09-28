@@ -1,6 +1,6 @@
 /*
  * Bouton micro (dictée) d'Infinity AI — eva_ai, fichier NEUF, sans build ni dépendance.
- * Contrat : deploiement/CONTRAT-DICTEE.md (v2.2, 28/09/2026) + décisions admin du 28/09 (détection
+ * Contrat : deploiement/CONTRAT-DICTEE.md (v2.4, 28/09/2026) + décisions admin du 28/09 (détection
  * automatique seule, sans bascule de langue de l'interface). Repris du prototype ~/whisper-test/prototype/micro.js
  * (encodage WAV 16 kHz vérifié dans Chrome, gardé octet pour octet).
  *
