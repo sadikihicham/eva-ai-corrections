@@ -399,7 +399,7 @@ $this->executor->setUserId($userId);
 						$confirmationName = (string)($res['tool'] ?? $toolName ?? '');
 						if (($res['existing'] ?? []) !== []) {
 							// Say WHAT is confirmed: the dialog alone does not show that a file would be replaced.
-							yield json_encode(['type' => 'content', 'delta' => $this->overwriteQuestion((array)$res['existing'])], JSON_UNESCAPED_UNICODE) . "\n";
+							yield json_encode(['type' => 'content', 'delta' => ($answer !== '' && !$holdText ? "\n\n" : '') . $this->overwriteQuestion((array)$res['existing'])], JSON_UNESCAPED_UNICODE) . "\n";
 						}
 						yield json_encode([
 							'type' => 'confirmation',
@@ -1016,7 +1016,8 @@ $this->executor->setUserId($userId);
 
     /** The question shown before a write replaces existing files, in the interface language. */
     private function overwriteQuestion(array $paths): string {
-        $list = implode(', ', array_map(static fn($p): string => '« ' . basename((string)$p) . ' »', $paths));
+        // Not basename(): it depends on the locale and can cut a name starting with an accented letter.
+        $list = implode(', ', array_map(static fn($p): string => '« ' . substr((string)$p, (int)strrpos('/' . (string)$p, '/')) . ' »', $paths));
         return match (substr($this->uiLanguage(), 0, 2)) {
             'fr' => '⚠️ ' . $list . ' existe déjà et serait **remplacé**. Confirmez pour le remplacer, ou demandez-moi d\'utiliser un autre nom.',
             'ar' => '⚠️ ' . $list . ' موجود بالفعل وسيتم **استبداله**. أكّد للاستبدال، أو اطلب مني استخدام اسم آخر.',

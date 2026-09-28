@@ -2610,6 +2610,8 @@ class ActionExecutor {
     /** @return array{ok:true,result:array} */
     /** Formats whose text is read through the indexer (extract_file_text), never as raw bytes. */
     private const EXTRACTED_FORMATS = ['pdf', 'docx', 'docm', 'dotx', 'xlsx', 'xlsm', 'xltx', 'pptx', 'pptm', 'odt', 'ods', 'odp', 'epub', 'rtf', 'doc', 'xls', 'ppt'];
+    /** Indexer::extractTextForAgent() cuts the extracted text at this length without saying so. */
+    private const INDEXER_MAX_CHARS = 100000;
     /** Formats convert_file can write (the create_file generators). */
     private const CONVERT_TARGETS = ['pdf', 'docx', 'xlsx', 'md', 'txt'];
 
@@ -2649,7 +2651,13 @@ class ActionExecutor {
         }
         // target_path, else the source path; its extension is always the requested format (review of d889ebd:
         // target_format pdf + target_path "x.docx" wrote a DOCX).
-        $target = $this->cleanPath(trim((string)($args['target_path'] ?? '')) ?: (string)($args['path'] ?? ''));
+        $given = trim((string)($args['target_path'] ?? ''));
+        // "Documents/" names a folder: the source file name goes inside it (not "Documents.pdf" at the root).
+        if ($given !== '' && str_ends_with($given, '/')) {
+            $source = $this->cleanPath((string)($args['path'] ?? ''));
+            $given = $given . substr($source, (int)strrpos('/' . $source, '/'));
+        }
+        $target = $this->cleanPath($given ?: (string)($args['path'] ?? ''));
         if ($target === '') {
             return null;
         }
@@ -2689,7 +2697,7 @@ class ActionExecutor {
             $text = (string)($read['result']['content'] ?? '');
             // The indexer cuts the extracted text at 100 000 characters without saying so (Indexer::extractTextForAgent):
             // at that length the source may be longer, and a truncated conversion must never be reported as done.
-            if (!empty($read['result']['has_more']) || (int)($read['result']['total_chars'] ?? 0) >= 100000) {
+            if (!empty($read['result']['has_more']) || (int)($read['result']['total_chars'] ?? 0) >= self::INDEXER_MAX_CHARS) {
                 return ['ok' => false, 'error' => 'The source is too long to convert in one step (more than ' . self::MAX_READ_CHUNK_CHARS . ' characters). Nothing was written.'];
             }
         } else {

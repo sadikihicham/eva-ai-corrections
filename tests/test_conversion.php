@@ -28,7 +28,7 @@ class Folder {
     public function get(string $p): File { if (!isset($this->fichiers[$p])) throw new RuntimeException('absent'); return $this->fichiers[$p]; }
 }
 $corps = implode("\n", array_map(fn($m) => extraire($source, $m), ['convertFile', 'convertTargetPath', 'existingWriteTargets', 'readFile', 'cleanPath', 'cleanName']));
-$consts = implode('', array_map(fn($c) => constante($source, $c), ['EXTRACTED_FORMATS', 'CONVERT_TARGETS', 'MAX_READ_CHARS', 'MAX_READ_CHUNK_CHARS', 'MAX_READ_FILE_BYTES', 'NOTES_FOLDER']));
+$consts = implode('', array_map(fn($c) => constante($source, $c), ['EXTRACTED_FORMATS', 'CONVERT_TARGETS', 'MAX_READ_CHARS', 'MAX_READ_CHUNK_CHARS', 'MAX_READ_FILE_BYTES', 'NOTES_FOLDER', 'INDEXER_MAX_CHARS']));
 eval('class ConvSousTest {
     ' . $consts . '
     public array $ecrit = []; public array $extraits = []; public string $texte = "";  public bool $encore = false; public ?int $total = null;
@@ -54,6 +54,7 @@ verifie('« doc » demandé → .docx (EVA ne sait pas écrire .doc)', $t->cible
 verifie('« word » / « excel » / « .PDF » acceptés', $t->cible(['path' => 'a.md', 'target_format' => 'word']) === 'a.docx' && $t->cible(['path' => 'a.pdf', 'target_format' => 'excel']) === 'a.xlsx' && $t->cible(['path' => 'a.md', 'target_format' => '.PDF']) === 'a.pdf');
 verifie('format inconnu → null', $t->cible(['path' => 'a.pdf', 'target_format' => 'png']) === null);
 verifie('target_path fourni → utilisé', $t->cible(['path' => 'a.pdf', 'target_format' => 'docx', 'target_path' => '/Documents/Nouveau.docx']) === 'Documents/Nouveau.docx');
+verifie('target_path « Documents/ » = dossier : le nom de la source y est placé', $t->cible(['path' => 'Rapports/Été.pdf', 'target_format' => 'docx', 'target_path' => 'Documents/']) === 'Documents/Été.docx');
 verifie('target_path d\'une autre extension → forcé au format demandé (revue d889ebd)', $t->cible(['path' => 'a.md', 'target_format' => 'pdf', 'target_path' => 'x.docx']) === 'x.pdf');
 verifie('dossier avec un point, fichier sans extension', $t->cible(['path' => 'v1.2/rapport', 'target_format' => 'pdf']) === 'v1.2/rapport.pdf');
 
