@@ -435,24 +435,16 @@ class WebSearchService {
         // The two halves are attempted independently, so a blocked news feed
         // (or a blocked web index) still leaves the other one usable instead of
         // failing the whole question.
+        $fallback = null;
         if ($mode !== 'news') {
-            try {
-                $results = match ($provider) {
-                    'duckduckgo' => $this->searchDuckDuckGo($query, $candidates),
-                    'bing' => $this->searchBing($query, $candidates),
-                    'searxng' => $this->searchSearxng($query, $candidates),
-                    'brave' => $this->searchBrave($query, $candidates),
-                    'tavily' => $this->searchTavily($query, $candidates),
-                    default => throw new ProviderException('Unsupported web search provider: ' . $provider),
-                };
-            } catch (ProviderException $e) {
-                $failures[] = $e->getMessage();
-            } catch (\Throwable $e) {
-                $this->logger->warning('eva_ai: web search failed', [
-                    'provider' => $provider,
-                    'exception' => $e->getMessage(),
-                ]);
-                $failures[] = 'Web search failed.';
+            $results = $this->webResults($provider, $query, $candidates, $failures);
+            // Repli (30/09) : un moteur principal muet (SearXNG dont les moteurs sont suspendus, CAPTCHA…) ne doit
+            // pas laisser le modèle répondre de mémoire : on retente une fois avec le flux Bing, sans clé.
+            if ($results === [] && $provider !== 'bing') {
+                $results = $this->webResults('bing', $query, $candidates, $failures);
+                if ($results !== []) {
+                    $fallback = 'bing';
+                }
             }
         }
 
@@ -469,6 +461,17 @@ class WebSearchService {
             } catch (\Throwable $e) {
                 $this->logger->warning('eva_ai: news search failed', ['exception' => $e->getMessage()]);
                 $failures[] = 'The news feeds could not be read.';
+            }
+        }
+
+        // Repli (30/09) : « actualités seulement » sans aucun article ⇒ recherche web avec la même requête, au lieu
+        // d'un échec qui pousse le modèle à répondre de mémoire (vu le 30/09 : liste de modèles de 2023).
+        if ($mode === 'news' && $results === []) {
+            $results = $this->webResults($provider, $query, $candidates, $failures);
+            $fallback = $results !== [] ? 'web' : null;
+            if ($results === [] && $provider !== 'bing') {
+                $results = $this->webResults('bing', $query, $candidates, $failures);
+                $fallback = $results !== [] ? 'bing' : null;
             }
         }
 
@@ -489,7 +492,39 @@ class WebSearchService {
         $results = $this->rankResults($results, $query, true, $mode);
         $results = array_slice($results, 0, $count);
 
-        return ['ok' => true, 'provider' => $provider, 'mode' => $mode, 'results' => $results, 'error' => null];
+        $ok = ['ok' => true, 'provider' => $provider, 'mode' => $mode, 'results' => $results, 'error' => null];
+        if ($fallback !== null) {
+            $ok['fallback'] = $fallback;
+        }
+        return $ok;
+    }
+
+    /**
+     * Web results from one provider; a failure is recorded in $failures and yields [].
+     *
+     * @param list<string> $failures
+     * @return list<array{title:string,url:string,snippet:string}>
+     */
+    private function webResults(string $provider, string $query, int $candidates, array &$failures): array {
+        try {
+            return match ($provider) {
+                'duckduckgo' => $this->searchDuckDuckGo($query, $candidates),
+                'bing' => $this->searchBing($query, $candidates),
+                'searxng' => $this->searchSearxng($query, $candidates),
+                'brave' => $this->searchBrave($query, $candidates),
+                'tavily' => $this->searchTavily($query, $candidates),
+                default => throw new ProviderException('Unsupported web search provider: ' . $provider),
+            };
+        } catch (ProviderException $e) {
+            $failures[] = $e->getMessage();
+        } catch (\Throwable $e) {
+            $this->logger->warning('eva_ai: web search failed', [
+                'provider' => $provider,
+                'exception' => $e->getMessage(),
+            ]);
+            $failures[] = 'Web search failed.';
+        }
+        return [];
     }
 
     /**
@@ -2444,21 +2479,24 @@ class WebSearchService {
             ]) => $this->browserHeaders(self::GOOGLE_NEWS_ENDPOINT, self::FEED_ACCEPT),
         ];
         $collected = [];
+        $read = 0;
         foreach ($feeds as $url => $headers) {
             try {
                 $body = $this->httpGet((string)$url, $headers);
                 foreach ($this->parseRssResults($body, 'news', $count) as $row) {
                     $collected[] = $row;
                 }
+                $read++;
             } catch (\Throwable $e) {
                 // One feed being unavailable must not lose the other one.
                 $this->logger->info('eva_ai: news feed unavailable', ['feed' => (string)parse_url((string)$url, PHP_URL_HOST), 'error' => $e->getMessage()]);
             }
         }
-        if ($collected === []) {
+        if ($collected === [] && $read === 0) {
             throw new ProviderException('The news feeds could not be read.');
         }
-        return $this->deduplicate($collected, $count);
+        // Flux lus mais sans article : ce n'est pas une panne (message « no articles » d'emptyResultError).
+        return $collected === [] ? [] : $this->deduplicate($collected, $count);
     }
 
     /**
