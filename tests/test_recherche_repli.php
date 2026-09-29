@@ -45,8 +45,10 @@ eval('class Recherche {
     public array $flux = [];             // hôte => liste d\'articles | "panne"
     public array $appels = [];
     public ?string $lastDuckDuckGoError = null;
+    public bool $bingFeedFailed = false;
+    public array $avertissements = [];
     public $logger;
-    public function __construct() { $this->logger = new class { function warning($m, $c = []) {} function info($m, $c = []) {} }; }
+    public function __construct() { $this->logger = new class { public $a = []; function warning($m, $c = []) { $this->a[] = $m; } function info($m, $c = []) {} }; }
     private function provider(): string { return $this->fournisseur; }
     private function isEnabled(): bool { return true; }
     private function maxResults(): int { return 5; }
@@ -104,10 +106,10 @@ $t = new Recherche(); $t->moteurs = ['searxng' => [$R('techsy.io')]]; $t->flux =
 $r = $t->search('modèles LLM récents', 5, 'news');
 verifie('news : flux vides ⇒ repli web (SearXNG)', $r['ok'] && ($r['fallback'] ?? null) === 'web' && in_array('searxng', $t->appels, true), json_encode([$r, $t->appels]));
 
-// 7. Flux illisibles + SearXNG vide ⇒ Bing web
-$t = new Recherche(); $t->moteurs = ['searxng' => [], 'bing' => [$R('bing.example')]]; $t->flux = ['www.bing.com' => 'panne', 'news.google.com' => 'panne'];
+// 7. Flux Google illisible, flux Bing lu mais vide, SearXNG vide ⇒ Bing web (Bing répond, il n'a pas échoué)
+$t = new Recherche(); $t->moteurs = ['searxng' => [], 'bing' => [$R('bing.example')]]; $t->flux = ['www.bing.com' => [], 'news.google.com' => 'panne'];
 $r = $t->search('x', 5, 'news');
-verifie('news : flux illisibles + SearXNG vide ⇒ repli Bing', $r['ok'] && ($r['fallback'] ?? null) === 'bing', json_encode($r));
+verifie('news : Google illisible, Bing vide, SearXNG vide ⇒ repli Bing web', $r['ok'] && ($r['fallback'] ?? null) === 'bing', json_encode($r));
 
 // 8. Actualités disponibles ⇒ pas de repli, pas d'appel web
 $t = new Recherche(); $t->flux = ['www.bing.com' => [$R('news.example')], 'news.google.com' => []];
@@ -129,5 +131,33 @@ $t = new Recherche(); $t->moteurs = ['searxng' => [$R('a.example')]]; $t->flux =
 $r = $t->search('x', 5, 'auto');
 verifie('auto : web + actualités, pas de repli', $r['ok'] && count($r['results']) === 2 && !isset($r['fallback']), json_encode($r));
 
-echo $echecs === 0 ? "\nTOUT VERT (11 cas)\n" : "\n$echecs ÉCHEC(S)\n";
+// 12. (revue) auto : web vide mais articles présents ⇒ Bing NON appelé
+$t = new Recherche(); $t->moteurs = ['searxng' => [], 'bing' => [$R('bing.example')]]; $t->flux = ['www.bing.com' => [$R('news.example')], 'news.google.com' => []];
+$r = $t->search('x', 5, 'auto');
+verifie('auto : web vide + articles ⇒ pas de repli Bing', $r['ok'] && !in_array('bing', $t->appels, true) && !isset($r['fallback']), json_encode([$r, $t->appels]));
+
+// 13. (revue) news avec fournisseur bing : Bing web appelé une seule fois
+$t = new Recherche(); $t->fournisseur = 'bing'; $t->moteurs = ['bing' => []]; $t->flux = ['www.bing.com' => [], 'news.google.com' => []];
+$t->search('x', 5, 'news');
+verifie('news, fournisseur bing : Bing web appelé une fois', count(array_keys($t->appels, 'bing', true)) === 1, json_encode($t->appels));
+
+// 14. (revue) flux Bing News en échec ⇒ pas de nouvelle tentative Bing web (pire cas borné)
+$t = new Recherche(); $t->moteurs = ['searxng' => [], 'bing' => [$R('bing.example')]]; $t->flux = ['www.bing.com' => 'panne', 'news.google.com' => []];
+$r = $t->search('x', 5, 'news');
+verifie('news : flux Bing en échec ⇒ Bing web non retenté', !in_array('bing', $t->appels, true) && !$r['ok'], json_encode([$r, $t->appels]));
+
+// 15. (revue) après repli : mode « web », avertissement journalisé pour le repli Bing
+$t = new Recherche(); $t->moteurs = ['searxng' => [], 'bing' => [$R('bing.example')]];
+$r = $t->search('x', 5, 'web');
+verifie('repli Bing ⇒ mode web + avertissement journalisé', $r['mode'] === 'web' && count($t->logger->a) === 1, json_encode([$r, $t->logger->a]));
+$t = new Recherche(); $t->moteurs = ['searxng' => [$R('techsy.io')]]; $t->flux = ['www.bing.com' => [], 'news.google.com' => []];
+$r = $t->search('x', 5, 'news');
+verifie('repli web depuis news ⇒ mode web', $r['mode'] === 'web' && ($r['fallback'] ?? null) === 'web', json_encode($r));
+
+// 16. (revue) message quand le web a déjà été tenté : pas d'invitation à « search the web instead »
+$t = new Recherche(); $t->moteurs = ['searxng' => [], 'bing' => []]; $t->flux = ['www.bing.com' => [], 'news.google.com' => []];
+$r = $t->search('x', 5, 'news');
+verifie('message : pas de « search the web instead » après repli', !str_contains((string)$r['error'], 'search the web instead'), json_encode($r));
+
+echo $echecs === 0 ? "\nTOUT VERT (17 cas)\n" : "\n$echecs ÉCHEC(S)\n";
 exit($echecs === 0 ? 0 : 1);

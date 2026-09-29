@@ -200,6 +200,8 @@ class WebSearchService {
      * to the caller instead of silently returning zero results.
      */
     private ?string $lastDuckDuckGoError = null;
+    /** Le flux Bing News a échoué pendant cette recherche : ne pas retenter Bing en repli (pire cas borné, revue 30/09). */
+    private bool $bingFeedFailed = false;
 
     /**
      * How many pages the last search read through a real browser.
@@ -411,7 +413,11 @@ class WebSearchService {
     /**
      * Run one web search.
      *
-     * @return array{ok:bool,provider:string,results:list<array{title:string,url:string,snippet:string}>,error:?string}
+     * Replis (30/09) : « news » sans article ⇒ recherche web ; tout vide (web, news ou auto) ⇒ une seule tentative par le
+     * flux Bing d'eva (décision admin du 30/09 : Bing en complément, Google retiré), sauf si Bing est déjà le moteur ou
+     * si son flux vient d'échouer. `fallback` ('web'|'bing') dit quel repli a servi ; `mode` vaut alors 'web'.
+     *
+     * @return array{ok:bool,provider:string,mode:string,results:list<array{title:string,url:string,snippet:string}>,error:?string,fallback?:string}
      */
     public function search(string $query, ?int $limit = null, string $mode = 'web'): array {
         $query = trim($query);
@@ -429,6 +435,7 @@ class WebSearchService {
         // field to choose from, "best" inevitably collapses to "first".
         $candidates = $this->candidateLimit($count);
         $this->lastDuckDuckGoError = null;
+        $this->bingFeedFailed = false;
         $failures = [];
         $results = [];
 
@@ -438,14 +445,6 @@ class WebSearchService {
         $fallback = null;
         if ($mode !== 'news') {
             $results = $this->webResults($provider, $query, $candidates, $failures);
-            // Repli (30/09) : un moteur principal muet (SearXNG dont les moteurs sont suspendus, CAPTCHA…) ne doit
-            // pas laisser le modèle répondre de mémoire : on retente une fois avec le flux Bing, sans clé.
-            if ($results === [] && $provider !== 'bing') {
-                $results = $this->webResults('bing', $query, $candidates, $failures);
-                if ($results !== []) {
-                    $fallback = 'bing';
-                }
-            }
         }
 
         if ($mode !== 'web') {
@@ -466,19 +465,27 @@ class WebSearchService {
 
         // Repli (30/09) : « actualités seulement » sans aucun article ⇒ recherche web avec la même requête, au lieu
         // d'un échec qui pousse le modèle à répondre de mémoire (vu le 30/09 : liste de modèles de 2023).
+        $tried = false;
         if ($mode === 'news' && $results === []) {
+            $tried = true;
             $results = $this->webResults($provider, $query, $candidates, $failures);
             $fallback = $results !== [] ? 'web' : null;
-            if ($results === [] && $provider !== 'bing') {
-                $results = $this->webResults('bing', $query, $candidates, $failures);
-                $fallback = $results !== [] ? 'bing' : null;
+        }
+        // Repli Bing (30/09), APRÈS les actualités (en auto, des articles suffisent) : un moteur principal muet
+        // (SearXNG aux moteurs suspendus, CAPTCHA…) ne doit pas laisser le modèle répondre de mémoire.
+        if ($results === [] && $provider !== 'bing' && !$this->bingFeedFailed) {
+            $tried = true;
+            $results = $this->webResults('bing', $query, $candidates, $failures);
+            if ($results !== []) {
+                $fallback = 'bing';
+                $this->logger->warning('eva_ai: primary web search provider returned nothing, bing fallback used', ['provider' => $provider, 'mode' => $mode]);
             }
         }
 
         // An empty result set must never be reported as success: the model
         // would then claim the web had no answer. Say why instead.
         if ($results === []) {
-            return ['ok' => false, 'provider' => $provider, 'mode' => $mode, 'results' => [], 'error' => $this->emptyResultError($provider, $mode, $failures)];
+            return ['ok' => false, 'provider' => $provider, 'mode' => $mode, 'results' => [], 'error' => $this->emptyResultError($provider, $mode, $failures, $tried)];
         }
 
         // Two-phase selection. First a cheap pass ranks on title, snippet and
@@ -492,7 +499,7 @@ class WebSearchService {
         $results = $this->rankResults($results, $query, true, $mode);
         $results = array_slice($results, 0, $count);
 
-        $ok = ['ok' => true, 'provider' => $provider, 'mode' => $mode, 'results' => $results, 'error' => null];
+        $ok = ['ok' => true, 'provider' => $provider, 'mode' => $fallback !== null ? 'web' : $mode, 'results' => $results, 'error' => null];
         if ($fallback !== null) {
             $ok['fallback'] = $fallback;
         }
@@ -856,7 +863,7 @@ class WebSearchService {
      * cause (anti-bot page, unreachable endpoint) is much more useful than a
      * generic "no results", because the fix differs entirely.
      */
-    private function emptyResultError(string $provider, string $mode = 'web', array $failures = []): string {
+    private function emptyResultError(string $provider, string $mode = 'web', array $failures = [], bool $fallbackTried = false): string {
         if ($failures !== []) {
             // Report the concrete reason instead of a generic "no results": the
             // fix (a different provider, a key) depends on it.
@@ -864,6 +871,12 @@ class WebSearchService {
         }
         if ($provider === 'duckduckgo' && $this->lastDuckDuckGoError !== null) {
             return $this->lastDuckDuckGoError;
+        }
+        if ($fallbackTried) {
+            // Le web a déjà été essayé : ne pas inviter le modèle à relancer la même recherche (revue 30/09).
+            return $mode === 'news'
+                ? 'Neither the news feeds nor the web search returned results for this query. Try a shorter or broader query.'
+                : 'No web search provider returned results for this query. Try a shorter or broader query.';
         }
         if ($mode === 'news') {
             return 'The news feeds returned no articles for this query. Try a broader query, or search the web instead.';
@@ -2488,6 +2501,9 @@ class WebSearchService {
                 }
                 $read++;
             } catch (\Throwable $e) {
+                if (parse_url((string)$url, PHP_URL_HOST) === 'www.bing.com') {
+                    $this->bingFeedFailed = true;
+                }
                 // One feed being unavailable must not lose the other one.
                 $this->logger->info('eva_ai: news feed unavailable', ['feed' => (string)parse_url((string)$url, PHP_URL_HOST), 'error' => $e->getMessage()]);
             }
