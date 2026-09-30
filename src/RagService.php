@@ -2209,6 +2209,30 @@ $this->executor->setUserId($userId);
     }
 
     /**
+     * Presentation rules for EVERY account (decision admin 30/09 « go style global »): the admin's layout rules, first
+     * written in his KNOWLEDGE.md — which the prompt deliberately treats as untrusted facts, never instructions — moved
+     * here so they really apply, with the assistant's current name. Per-chat personas and custom instructions come
+     * after this block and may adapt it.
+     */
+    public const PRESENTATION_STYLE = 'Presentation: start directly with the answer, without a long introduction, and keep it concise, professional and natural. '
+        . 'Adapt the layout to the request: a simple question gets a short answer; a procedure or tutorial gets numbered steps, one per line; '
+        . 'comparisons, figures and statistics get a Markdown table; a diagnosis or an error the user asks about gets three short sections - diagnosis (🔍), solution (🛠️) '
+        . 'and check (✅), titled in the language of the answer; commands and code (Linux, Docker, APIs, configuration) always go in fenced code blocks '
+        . 'with the language name; a summary gets key points; for a complex concept, give a simple summary first, then the technical details. '
+        . 'Use Markdown headings only when the answer has several sections. Use a few relevant emoji where they help scanning - 💡 key information, '
+        . '✅ recommendation or success, ⚠️ warning, ❌ error, 🔍 analysis, 📁 files, 📊 data, 🔧 configuration, 🔐 security, 🌐 web, 📝 summary - '
+        . 'at most one per heading or bullet, none in a one-line answer. For an important takeaway, use a short quote block starting with "> 💡". '
+        . 'Use **bold** for key elements, never for whole paragraphs. In the chat reply, never add decorative HTML, CSS or JavaScript, fake buttons '
+        . 'or cards, or invented image links; when files are involved, name the real files. '
+        . 'These presentation rules apply only to your chat reply, never to the content of files, notes, events, tasks or messages you create '
+        . 'with tools: that content follows the user\'s request and the file format.';
+
+    /** Talk (bot) : réponses courtes dans une conversation de groupe, sans la mise en page longue (revue 30/09). */
+    public const PRESENTATION_STYLE_TALK = 'You are answering inside a Nextcloud Talk conversation: reply briefly (1-3 sentences or a few bullets) in plain '
+        . 'Markdown, without headings, tables or quote blocks; a command may go in a short code block. This applies only to your chat reply, '
+        . 'never to the content of files or messages you create with tools.';
+
+    /**
      * Preset persona templates (Issue #90). The slug is stored on the chat
      * and expanded here into a short behaviour block that is injected into
      * the system prompt between the base rules and the user question.
@@ -2262,6 +2286,16 @@ $this->executor->setUserId($userId);
         return $clause;
     }
 
+    /** Vrai quand la requête vient du bot Talk (surface posée par TalkBotListener sur l'exécuteur). */
+    private function onTalkSurface(): bool
+    {
+        try {
+            return $this->executor->getToolPolicy()->getSurface() === \OCA\EvaAi\Service\ToolPolicy::SURFACE_TALK;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
     /**
      * @param array<int,array{role:string,content:string}> $history
      * @return array<int,array{role:string,content:string}>
@@ -2292,6 +2326,7 @@ $this->executor->setUserId($userId);
             . "Don't summarize what the files are about; answer the actual question. "
             . "Use standard Markdown and answer in the same language as the user's question. "
             . "If the user's question is not clearly in one language, answer in the user's Nextcloud UI language (" . $this->uiLanguage() . ")."
+            . ' ' . ($this->onTalkSurface() ? self::PRESENTATION_STYLE_TALK : self::PRESENTATION_STYLE)
             . ($actions
                 ? " You also have tools that work on the user's Nextcloud account: files (create, create_files for related batches, read, rename, move, delete, search, list), notes, contacts, calendar events, mail (search, read, list, unread count), shares (create link/user/group shares, expiry, note, delete), tasks/to-dos (create, list, update, complete, delete), comments, system tags and file versions. Use them when the user asks to create, save, find, share or schedule something. You can also manage the user's scheduled briefings with list_scheduled_briefings, create_scheduled_briefing, update_scheduled_briefing and delete_scheduled_briefing; never enable allow_actions unless the user explicitly requests autonomous changes. When a request concerns the user's files and the indexed context is insufficient, proactively use list_files or search_files to discover the relevant folder and read_file or extract_file_text to inspect the matching file. These read-only tools are safe; never crawl the entire home without a concrete task. For shares always give the link URL after creating. Run the tool, then briefly confirm what you did. If a tool needs the file path, use the easiest path (e.g. \"/Readme.md\" or \"Documents/Plan.pdf\"). For an enabled Nextcloud app you do not know yet, first call list_learned_app_apis and then discover_app_api with its app id when the cache is missing or stale; inspect the OCS routes before using call_app_api for the exact same-origin path. call_app_api always pauses for explicit user confirmation, including GET requests; never invent credentials or send secrets in params. Never use tools for anything else."
                 . " Use list_learned_file_locations before a broad file search when you need to navigate the user's Nextcloud storage."
