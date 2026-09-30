@@ -1,26 +1,34 @@
 #!/usr/bin/env bash
-# Déploie UNIQUEMENT lib/Service/OpenAICompatible.php et lib/Service/Ollama.php (correctif streaming réel pour
-# le provider OpenAI-compatible / vLLM-LiteLLM, branche streaming-vllm-openai-compatible, PR #26 mergée) sur
-# workspace4. Ne touche à aucun autre fichier d'eva_ai (≠ appliquer-eva.sh qui déploie tout l'état de la branche).
+# Déploie UNIQUEMENT lib/Service/OpenAICompatible.php et lib/Service/Ollama.php sur workspace4.
+# Ne touche à aucun autre fichier d'eva_ai (≠ appliquer-eva.sh qui déploie tout l'état de la branche).
+#
+# 2e passage sur ces 2 fichiers (01/10/2026) : le 1er correctif (PR #26/#27, IClientService::post()+lecture
+# par blocs) était mergé et déployé, mais MESURÉ défectueux après un test admin en prod — IClientService
+# bufferise tout en interne malgré stream:true. Remplacé par curl_multi natif (branche
+# curl-multi-streaming-reel), testé empiriquement AVANT ce déploiement (staging /tmp dans le conteneur,
+# avant l'autoload Nextcloud) : événements réellement étalés de +207ms à +2111ms au lieu de tous au même
+# instant. ORIGINE ci-dessous = la version PR #27 déjà en prod (pas celle d'avant le 1er correctif).
 #
 # À lancer par l'admin, SUR LE MAC, depuis ce worktree :
 #     ESSAI=1 bash deploiement/appliquer-streaming-vllm.sh   → contrôles seuls, n'écrit rien
 #     bash deploiement/appliquer-streaming-vllm.sh           → déploie
 # Garde-fous (tout écart arrête AVANT la moindre écriture) :
-#   - les 2 fichiers sont commités et contiennent bien le correctif ; hôte = workspace4 ;
-#   - la production doit être EXACTEMENT la version d'origine (sha256 ORIGINE, notée dans le commit d'import
-#     255b4de du 30/09) pour CHAQUE fichier — sinon on n'écrase rien ;
+#   - les 2 fichiers sont commités et contiennent bien CE correctif (marqueur lireLignesEnFlux, pas
+#     seulement chatStream qui existait déjà dans la version PR #27) ; hôte = workspace4 ;
+#   - la production doit être EXACTEMENT la version ORIGINE (PR #27) pour CHAQUE fichier — sinon rien écrasé ;
 #   - sauvegarde des 2 fichiers vérifiée par empreinte ; nouveaux fichiers déposés en temporaire, vérifiés
 #     (empreinte + php -l), puis mis en place un par un.
 # Retour arrière : bash deploiement/retour-arriere-streaming-vllm.sh <dossier de sauvegarde affiché>
+# ⚠️ Ce retour arrière restaure la version PR #27 (qui streame déjà — imparfaitement, tout d'un coup — au
+#    lieu de couper complètement le streaming). Ne restaure PAS jusqu'à la version originale pré-PR #26.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=5 ubuntu@192.168.1.99)
 APP=/var/www/html/custom_apps/eva_ai/lib/Service
 declare -A ORIGINE=(
-  [OpenAICompatible.php]=b331984ebacc0b8309f652f475bbcc238b543d0c8915fb4cec2c2e6f7d569152
-  [Ollama.php]=d18905bcdb4a85eb1ac2fdd7e06ca4e2a762a6a946490bf6b48d7a2f13d190a3
+  [OpenAICompatible.php]=d7427c156d9b2bbf0e9aa6aeab436634958b639d05aea20a94bcbb057c102300
+  [Ollama.php]=e849945e2d1b1ae793f15a9f65e6c2c77e5536d2fb23bee18b723533b9b527e3
 )
 FICHIERS=(OpenAICompatible.php Ollama.php)
 h() { shasum -a 256 | cut -c1-64; }
@@ -30,8 +38,8 @@ echo "0) vérifications préalables"
 for f in "${FICHIERS[@]}"; do
   git diff --quiet HEAD -- "app/lib/Service/$f" || { echo "ARRET : app/lib/Service/$f modifié et non commité"; exit 1; }
 done
-grep -q "public function chatStream(array \$messages" app/lib/Service/OpenAICompatible.php || { echo "ARRET : le correctif n'est pas dans OpenAICompatible.php"; exit 1; }
-grep -q "openAiCompatible()->chatStream(" app/lib/Service/Ollama.php || { echo "ARRET : le correctif n'est pas dans Ollama.php"; exit 1; }
+grep -q "private function lireLignesEnFlux" app/lib/Service/OpenAICompatible.php || { echo "ARRET : le correctif curl_multi n'est pas dans OpenAICompatible.php"; exit 1; }
+grep -q "private function lireLignesEnFlux" app/lib/Service/Ollama.php || { echo "ARRET : le correctif curl_multi n'est pas dans Ollama.php"; exit 1; }
 [ "$(r hostname)" = workspace4 ] || { echo "ARRET : l'hôte distant n'est pas workspace4"; exit 1; }
 echo "   version : $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 
