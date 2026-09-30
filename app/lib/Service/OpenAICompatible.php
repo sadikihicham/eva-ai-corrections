@@ -51,13 +51,17 @@ class OpenAICompatible {
     }
 
     /**
-     * Streaming variant of chat() : POST avec stream:true, lit le corps HTTP au fur et à mesure
-     * (mêmes 8192 octets/lecture + read_timeout que Ollama::chatStream, voir ce fichier) et parse les
-     * lignes SSE `data: {...}` du serveur amont (vLLM/LiteLLM/OpenAI), jusqu'à `data: [DONE]`. Avant
-     * le 01/10/2026, chat() (bloquant, stream:false) était appelé à la place et sa réponse complète
-     * rejouée comme un seul faux "chunk" — aucun token n'atteignait le navigateur avant la fin de la
-     * génération côté modèle. PROBLEMES.md n'en parle pas encore, à ajouter si un autre écart de
-     * comportement apparaît entre Ollama et ce provider.
+     * Streaming variant of chat() : POST avec stream:true, parse les lignes SSE `data: {...}` du serveur
+     * amont (vLLM/LiteLLM/OpenAI) jusqu'à `data: [DONE]`. Le 01/10/2026, la 1ère version de cette méthode
+     * utilisait `IClientService::post(...['stream'=>true])` + lecture par blocs (comme Ollama::chatStream)
+     * — MESURÉ défectueux ce même jour : post() bufferise tout en interne malgré stream:true et ne rend la
+     * main qu'une fois la réponse ENTIÈRE reçue (mesuré : post() a mis exactement le temps de génération
+     * total — la lecture "par blocs" ensuite ne prenait que 0 ms, elle relisait un tampon déjà plein).
+     * Remplacé par lireLignesEnFlux() (curl_multi natif), seul patron qui a montré des lignes livrées
+     * étalées dans le temps lors de la mesure (curl brut : 116 paquets sur 1,9 s ; ce patron : 236 lignes
+     * sur 2,07 s, dernière à +1924 ms). Ollama::chatStream() (même fichier) a probablement le même défaut,
+     * jamais vérifié empiriquement avant — à corriger de la même façon si un jour ce provider est utilisé
+     * en pratique (au 01/10/2026, tous les comptes sont configurés sur "custom", pas "ollama").
      * @param array<int,array{role:string,content:string}> $messages
      * @return \Generator<string,array{type:string,delta?:string,tool_calls?:array,raw?:array,model?:string},void,void>
      */
@@ -66,7 +70,6 @@ class OpenAICompatible {
         $model = $this->model();
         $payload = ['model' => $model, 'messages' => $this->normalizeMessages($messages), 'temperature' => max(0.0, min(2.0, (float)$this->config->get('temperature'))), 'stream' => true];
         if ($tools !== []) $payload['tools'] = $tools;
-        $body = null;
         $startedAt = microtime(true);
         $answer = '';
         $streamCalls = [];
@@ -78,103 +81,144 @@ class OpenAICompatible {
             ksort($streamCalls);
             return ['type' => 'tool_calls', 'tool_calls' => $this->normalizeStreamedToolCalls($streamCalls), 'raw' => array_values($streamCalls), 'model' => $model];
         };
+        $headers = [
+            'Authorization: Bearer ' . $this->credentials->getCustom($this->config->userId() ?? '', $id),
+            'Content-Type: application/json',
+            'Accept: text/event-stream',
+        ];
         try {
             if ($this->clientDisconnected()) {
                 return;
             }
-            $response = $this->clients->newClient()->post($this->endpoint(), [
-                'headers' => ['Authorization' => 'Bearer ' . $this->credentials->getCustom($this->config->userId() ?? '', $id), 'Content-Type' => 'application/json', 'Accept' => 'text/event-stream'],
-                'json' => $payload,
-                'timeout' => max(1, min(300, $timeout)),
-                // Lectures bornées pour que la détection de déconnexion se déclenche même si le
-                // serveur amont reste temporairement silencieux (pas de token).
-                'read_timeout' => 5,
-                'stream' => true,
-                'http_errors' => false,
-            ]);
-            $status = $response->getStatusCode();
-            if ($status < 200 || $status >= 300) {
-                yield ['type' => 'error', 'delta' => 'Provider request failed (HTTP ' . $status . ').'];
-                return;
-            }
-            $body = $response->getBody();
-            $buffer = '';
-            while (is_resource($body) ? !feof($body) : !$body->eof()) {
+            foreach ($this->lireLignesEnFlux($this->endpoint(), $headers, $payload, $timeout) as $ligneBrute) {
+                $line = trim($ligneBrute);
+                // Ignore les lignes vides, "event: ...", les commentaires SSE ":..." (keep-alive) —
+                // seules les lignes "data: " portent un événement du contrat OpenAI.
+                if ($line === '' || !str_starts_with($line, 'data:')) {
+                    continue;
+                }
+                $data = trim(substr($line, 5));
+                if ($data === '[DONE]') {
+                    yield $finir();
+                    return;
+                }
                 if ($this->clientDisconnected()) {
                     return;
                 }
-                $chunk = is_resource($body) ? fread($body, 8192) : $body->read(8192);
-                if ($chunk === '' || $chunk === false) {
-                    usleep(10000);
+                $obj = json_decode($data, true);
+                if (!is_array($obj)) {
                     continue;
                 }
-                $buffer .= $chunk;
-                while (($nl = strpos($buffer, "\n")) !== false) {
-                    $line = trim(substr($buffer, 0, $nl));
-                    $buffer = substr($buffer, $nl + 1);
-                    // Ignore les lignes vides, "event: ...", les commentaires SSE ":..." (keep-alive) —
-                    // seules les lignes "data: " portent un événement du contrat OpenAI.
-                    if ($line === '' || !str_starts_with($line, 'data:')) {
-                        continue;
+                $delta = $obj['choices'][0]['delta'] ?? [];
+                if (!is_array($delta)) {
+                    continue;
+                }
+                if (is_array($delta['tool_calls'] ?? null)) {
+                    foreach ($delta['tool_calls'] as $tc) {
+                        if (!is_array($tc)) continue;
+                        $idx = (int)($tc['index'] ?? 0);
+                        $fn = is_array($tc['function'] ?? null) ? $tc['function'] : [];
+                        if (!isset($streamCalls[$idx])) {
+                            $streamCalls[$idx] = ['id' => (string)($tc['id'] ?? ('call_' . bin2hex(random_bytes(4)))), 'type' => 'function', 'function' => ['name' => '', 'arguments' => '']];
+                        }
+                        if (!empty($tc['id'])) $streamCalls[$idx]['id'] = (string)$tc['id'];
+                        if (isset($fn['name']) && $fn['name'] !== '') $streamCalls[$idx]['function']['name'] = (string)$fn['name'];
+                        // OpenAI streame toujours les arguments comme fragments de chaîne à
+                        // concaténer (jamais un objet déjà décodé, contrairement à Ollama).
+                        if (isset($fn['arguments']) && is_string($fn['arguments'])) $streamCalls[$idx]['function']['arguments'] .= $fn['arguments'];
                     }
-                    $data = trim(substr($line, 5));
-                    if ($data === '[DONE]') {
-                        yield $finir();
-                        return;
-                    }
+                }
+                $content = (string)($delta['content'] ?? '');
+                if ($content !== '') {
+                    $answer .= $content;
                     if ($this->clientDisconnected()) {
                         return;
                     }
-                    $obj = json_decode($data, true);
-                    if (!is_array($obj)) {
-                        continue;
-                    }
-                    $delta = $obj['choices'][0]['delta'] ?? [];
-                    if (!is_array($delta)) {
-                        continue;
-                    }
-                    if (is_array($delta['tool_calls'] ?? null)) {
-                        foreach ($delta['tool_calls'] as $tc) {
-                            if (!is_array($tc)) continue;
-                            $idx = (int)($tc['index'] ?? 0);
-                            $fn = is_array($tc['function'] ?? null) ? $tc['function'] : [];
-                            if (!isset($streamCalls[$idx])) {
-                                $streamCalls[$idx] = ['id' => (string)($tc['id'] ?? ('call_' . bin2hex(random_bytes(4)))), 'type' => 'function', 'function' => ['name' => '', 'arguments' => '']];
-                            }
-                            if (!empty($tc['id'])) $streamCalls[$idx]['id'] = (string)$tc['id'];
-                            if (isset($fn['name']) && $fn['name'] !== '') $streamCalls[$idx]['function']['name'] = (string)$fn['name'];
-                            // OpenAI streame toujours les arguments comme fragments de chaîne à
-                            // concaténer (jamais un objet déjà décodé, contrairement à Ollama).
-                            if (isset($fn['arguments']) && is_string($fn['arguments'])) $streamCalls[$idx]['function']['arguments'] .= $fn['arguments'];
-                        }
-                    }
-                    $content = (string)($delta['content'] ?? '');
-                    if ($content !== '') {
-                        $answer .= $content;
-                        if ($this->clientDisconnected()) {
-                            return;
-                        }
-                        yield ['type' => 'content', 'delta' => $content];
-                    }
+                    yield ['type' => 'content', 'delta' => $content];
                 }
             }
-            // Connexion fermée sans "data: [DONE]" explicite (certains serveurs auto-hébergés ne
-            // l'envoient pas) : le flux est quand même terminé normalement, on clôt pareil.
+            // Flux terminé sans "data: [DONE]" explicite (certains serveurs auto-hébergés ne l'envoient
+            // pas) : normal, on clôt pareil.
             yield $finir();
         } catch (\Throwable $e) {
             if (!$this->clientDisconnected()) {
                 yield ['type' => 'error', 'delta' => $e instanceof ProviderException ? $e->getMessage() : 'Provider connection or response failed. Check endpoint, key and model.'];
             }
-        } finally {
-            if (is_resource($body)) {
-                @fclose($body);
-            } elseif (is_object($body) && method_exists($body, 'close')) {
-                try {
-                    $body->close();
-                } catch (\Throwable $ignored) {
-                    // Le nettoyage ne doit jamais masquer le résultat réel du flux.
+        }
+    }
+
+    /**
+     * Lit un POST JSON en flux RÉEL via curl_multi — jamais IClientService::post() (voir le commentaire de
+     * chatStream() : mesuré bufferisant tout en interne malgré stream:true). `yield` ne peut pas se faire
+     * depuis CURLOPT_WRITEFUNCTION (ce callback tourne à l'intérieur de curl_multi_exec, pas dans ce
+     * générateur) : le callback empile seulement les octets bruts dans $tampon par référence, et c'est
+     * CETTE boucle, en sondant curl_multi_exec/curl_multi_select, qui yield chaque ligne complète dès
+     * qu'elle apparaît.
+     * @param list<string> $headers lignes complètes "Nom: valeur" (format curl, pas le format associatif Guzzle)
+     * @return \Generator<int,string,void,void> lignes brutes (sans le \n final), au fil de l'eau
+     */
+    private function lireLignesEnFlux(string $url, array $headers, array $payload, int $timeoutTotal): \Generator {
+        $ch = curl_init($url);
+        $tampon = '';
+        $options = [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            CURLOPT_TIMEOUT => max(1, min(300, $timeoutTotal)),
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$tampon): int {
+                $tampon .= $data;
+                return strlen($data);
+            },
+        ];
+        // Même confiance TLS que le reste de Nextcloud (IClientService/Guzzle) : le paquet système +
+        // les certificats importés par l'admin (occ security:certificates:import — c'est le cas ici pour
+        // les serveurs LLM internes, ex. infinityai02). JAMAIS de CURLOPT_SSL_VERIFYPEER=false : ça
+        // désactiverait la vérification TLS pour de vrai, contrairement au client Nextcloud.
+        try {
+            $options[CURLOPT_CAINFO] = \OCP\Server::get(\OCP\ICertificateManager::class)->getAbsoluteBundlePath();
+        } catch (\Throwable $ignored) {
+            // Repli sur le magasin système par défaut de curl si le gestionnaire de certificats n'est pas
+            // disponible dans ce contexte — ne bloque jamais le flux pour ça.
+        }
+        curl_setopt_array($ch, $options);
+        $mh = curl_multi_init();
+        curl_multi_add_handle($mh, $ch);
+        try {
+            $actif = null;
+            do {
+                if ($this->clientDisconnected()) {
+                    return;
                 }
+                $etat = curl_multi_exec($mh, $actif);
+                while (($nl = strpos($tampon, "\n")) !== false) {
+                    yield substr($tampon, 0, $nl);
+                    $tampon = substr($tampon, $nl + 1);
+                    if ($this->clientDisconnected()) {
+                        return;
+                    }
+                }
+                if ($actif > 0) {
+                    // Bornée (200 ms) : une déconnexion client doit se détecter même si le serveur amont
+                    // reste temporairement silencieux (même intention que l'ancien read_timeout=5).
+                    curl_multi_select($mh, 0.2);
+                }
+            } while ($actif > 0 && $etat === CURLM_OK);
+            if ($tampon !== '') {
+                yield $tampon;
             }
+            $erreur = curl_error($ch);
+            if ($erreur !== '') {
+                throw new ProviderException('Provider connection failed: ' . $erreur);
+            }
+            $statut = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            if ($statut < 200 || $statut >= 300) {
+                throw new ProviderException('Provider request failed (HTTP ' . $statut . ').');
+            }
+        } finally {
+            curl_multi_remove_handle($mh, $ch);
+            curl_multi_close($mh);
+            curl_close($ch);
         }
     }
 
