@@ -1123,113 +1123,90 @@ class Ollama {
         if ($tools !== []) {
             $payload['tools'] = $this->normalizePayload($tools);
         }
-        $body = null;
         $startedAt = microtime(true);
         $streamAnswer = '';
+        $headers = ['Content-Type: application/json'];
         try {
             if ($this->clientDisconnected()) {
                 return;
             }
-            $r = $this->client()->post($this->base() . '/api/chat', [
-                'json' => $payload,
-                'timeout' => max(1, $timeout ?? self::TIMEOUT),
-                // Bound idle reads so disconnect checks can release the worker
-                // even when Ollama temporarily emits no token.
-                'read_timeout' => 5,
-                'stream' => true,
-            ]);
-            $body = $r->getBody();
-            $buffer = '';
             $streamCalls = [];
-            while (is_resource($body) ? !feof($body) : !$body->eof()) {
+            foreach ($this->lireLignesEnFlux($this->base() . '/api/chat', $headers, $payload, max(1, $timeout ?? self::TIMEOUT)) as $ligneBrute) {
+                if (trim($ligneBrute) === '') {
+                    continue;
+                }
                 if ($this->clientDisconnected()) {
                     return;
                 }
-                $chunk = is_resource($body) ? fread($body, 8192) : $body->read(8192);
-                if ($chunk === '') {
-                    usleep(10000);
+                $obj = json_decode($ligneBrute, true);
+                if (!is_array($obj)) {
                     continue;
                 }
-                $buffer .= $chunk;
-                while (($nl = strpos($buffer, "\n")) !== false) {
-                    $line = substr($buffer, 0, $nl);
-                    $buffer = substr($buffer, $nl + 1);
-                    if (trim($line) === '') {
-                        continue;
+                $msg = $obj['message'] ?? [];
+                if (is_array($msg) && !empty($msg['tool_calls'])) {
+                    // Ollama streamt Tool-Call-Argumente in mehreren Chunks:
+                    // nach Index akkumulieren statt überschreiben.
+                    foreach ($msg['tool_calls'] as $tc) {
+                        $idx = (int)($tc['index'] ?? 0);
+                        $fn = $tc['function'] ?? [];
+                        if (!isset($streamCalls[$idx])) {
+                            $streamCalls[$idx] = [
+                                'id' => (string)($tc['id'] ?? ('call_' . random_int(100000, 999999))),
+                                'type' => 'function',
+                                'function' => ['name' => (string)($fn['name'] ?? ''), 'arguments' => ''],
+                            ];
+                        }
+                        if (isset($fn['name']) && $fn['name'] !== '') {
+                            $streamCalls[$idx]['function']['name'] = (string)$fn['name'];
+                        }
+                        if (isset($fn['arguments'])) {
+                            $arg = $fn['arguments'];
+                            if (is_array($arg)) {
+                                $arg = json_encode($arg, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                            }
+                            if (is_string($arg) && $arg !== '') {
+                                $streamCalls[$idx]['function']['arguments'] .= $arg;
+                            }
+                        }
                     }
+                }
+                if (!empty($obj['done'])) {
                     if ($this->clientDisconnected()) {
                         return;
                     }
-                    $obj = json_decode($line, true);
-                    if (!is_array($obj)) {
-                        continue;
+                    $doneModel = isset($obj['model']) ? (string)$obj['model'] : '';
+                    $usageData = [
+                        'model' => $doneModel !== '' ? $doneModel : $modelName,
+                        'prompt_eval_count' => isset($obj['prompt_eval_count']) ? (int)$obj['prompt_eval_count'] : null,
+                        'eval_count' => isset($obj['eval_count']) ? (int)$obj['eval_count'] : null,
+                    ];
+                    $this->recordUsage($modelName, $messages, $streamAnswer, $usageData, $startedAt);
+                    if ($streamCalls !== []) {
+                        ksort($streamCalls);
+                        $rawToolCalls = array_values($streamCalls);
+                        yield ['type' => 'tool_calls', 'tool_calls' => $this->normalizeToolCalls($streamCalls), 'raw' => $rawToolCalls, 'model' => $doneModel];
+                    } else {
+                        yield ['type' => 'finished', 'model' => $doneModel];
                     }
-                    $msg = $obj['message'] ?? [];
-                    if (is_array($msg) && !empty($msg['tool_calls'])) {
-                        // Ollama streamt Tool-Call-Argumente in mehreren Chunks:
-                        // nach Index akkumulieren statt überschreiben.
-                        foreach ($msg['tool_calls'] as $tc) {
-                            $idx = (int)($tc['index'] ?? 0);
-                            $fn = $tc['function'] ?? [];
-                            if (!isset($streamCalls[$idx])) {
-                                $streamCalls[$idx] = [
-                                    'id' => (string)($tc['id'] ?? ('call_' . random_int(100000, 999999))),
-                                    'type' => 'function',
-                                    'function' => ['name' => (string)($fn['name'] ?? ''), 'arguments' => ''],
-                                ];
-                            }
-                            if (isset($fn['name']) && $fn['name'] !== '') {
-                                $streamCalls[$idx]['function']['name'] = (string)$fn['name'];
-                            }
-                            if (isset($fn['arguments'])) {
-                                $arg = $fn['arguments'];
-                                if (is_array($arg)) {
-                                    $arg = json_encode($arg, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-                                }
-                                if (is_string($arg) && $arg !== '') {
-                                    $streamCalls[$idx]['function']['arguments'] .= $arg;
-                                }
-                            }
-                        }
-                    }
-                    if (!empty($obj['done'])) {
-                        if ($this->clientDisconnected()) {
-                            return;
-                        }
-                        $doneModel = isset($obj['model']) ? (string)$obj['model'] : '';
-                        $usageData = [
-                            'model' => $doneModel !== '' ? $doneModel : $modelName,
-                            'prompt_eval_count' => isset($obj['prompt_eval_count']) ? (int)$obj['prompt_eval_count'] : null,
-                            'eval_count' => isset($obj['eval_count']) ? (int)$obj['eval_count'] : null,
-                        ];
-                        $this->recordUsage($modelName, $messages, $streamAnswer, $usageData, $startedAt);
-                        if ($streamCalls !== []) {
-                            ksort($streamCalls);
-                            $rawToolCalls = array_values($streamCalls);
-                            yield ['type' => 'tool_calls', 'tool_calls' => $this->normalizeToolCalls($streamCalls), 'raw' => $rawToolCalls, 'model' => $doneModel];
-                        } else {
-                            yield ['type' => 'finished', 'model' => $doneModel];
-                        }
+                    return;
+                }
+                if (!is_array($msg)) {
+                    continue;
+                }
+                $thinking = (string)($msg['thinking'] ?? $msg['reasoning'] ?? '');
+                if ($thinking !== '') {
+                    if ($this->clientDisconnected()) {
                         return;
                     }
-                    if (!is_array($msg)) {
-                        continue;
+                    yield ['type' => 'thinking', 'delta' => $thinking];
+                }
+                $content = (string)($msg['content'] ?? '');
+                if ($content !== '') {
+                    $streamAnswer .= $content;
+                    if ($this->clientDisconnected()) {
+                        return;
                     }
-                    $thinking = (string)($msg['thinking'] ?? $msg['reasoning'] ?? '');
-                    if ($thinking !== '') {
-                        if ($this->clientDisconnected()) {
-                            return;
-                        }
-                        yield ['type' => 'thinking', 'delta' => $thinking];
-                    }
-                    $content = (string)($msg['content'] ?? '');
-                    if ($content !== '') {
-                        $streamAnswer .= $content;
-                        if ($this->clientDisconnected()) {
-                            return;
-                        }
-                        yield ['type' => 'content', 'delta' => $content];
-                    }
+                    yield ['type' => 'content', 'delta' => $content];
                 }
             }
         } catch (\Throwable $e) {
@@ -1237,16 +1214,84 @@ class Ollama {
                 $this->logger->error('eva_ai ollama chat stream failed', ['exception' => $e]);
                 yield ['type' => 'error', 'delta' => 'Ollama error: ' . $e->getMessage()];
             }
-        } finally {
-            if (is_resource($body)) {
-                @fclose($body);
-            } elseif (is_object($body) && method_exists($body, 'close')) {
-                try {
-                    $body->close();
-                } catch (\Throwable $ignored) {
-                    // Cleanup must never mask the original stream result.
+        }
+    }
+
+    /**
+     * Lit un POST JSON en flux RÉEL via curl_multi — jamais IClientService::post() (mesuré le 01/10/2026 :
+     * bufferise tout en interne malgré stream:true et ne rend la main qu'une fois la réponse ENTIÈRE
+     * reçue, voir OpenAICompatible::chatStream() pour la mesure complète — même défaut probable ici,
+     * jamais vérifié empiriquement avant ce jour). `yield` ne peut pas se faire depuis
+     * CURLOPT_WRITEFUNCTION (tourne dans curl_multi_exec, pas dans ce générateur) : le callback empile
+     * seulement les octets bruts dans $tampon par référence, et c'est CETTE boucle qui yield chaque ligne
+     * complète dès qu'elle apparaît, en sondant curl_multi_exec/curl_multi_select.
+     * @param list<string> $headers lignes complètes "Nom: valeur" (format curl)
+     * @return \Generator<int,string,void,void> lignes brutes (sans le \n final), au fil de l'eau
+     */
+    private function lireLignesEnFlux(string $url, array $headers, array $payload, int $timeoutTotal): \Generator {
+        $ch = curl_init($url);
+        $tampon = '';
+        $options = [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            CURLOPT_TIMEOUT => max(1, min(600, $timeoutTotal)),
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$tampon): int {
+                $tampon .= $data;
+                return strlen($data);
+            },
+        ];
+        // Même confiance TLS que IClientService/Guzzle (voir OpenAICompatible::lireLignesEnFlux) : utile
+        // si $url pointe un jour vers un Ollama en HTTPS avec certificat importé par l'admin. Sans effet
+        // pour le cas courant (Ollama en HTTP local).
+        try {
+            $options[CURLOPT_CAINFO] = \OCP\Server::get(\OCP\ICertificateManager::class)->getAbsoluteBundlePath();
+        } catch (\Throwable $e) {
+            // Repli sur le magasin CA système de curl — journalisé (revue adverse du 01/10/2026, même
+            // raison que OpenAICompatible::lireLignesEnFlux) : sans effet pratique tant qu'Ollama est en
+            // HTTP local, mais un repli silencieux serait une régression invisible si $url passe un jour
+            // en HTTPS avec un certificat importé côté ICertificateManager seulement.
+            $this->logger->warning('eva_ai Ollama : ICertificateManager indisponible, repli sur le magasin CA système de curl', ['exception' => $e]);
+        }
+        curl_setopt_array($ch, $options);
+        $mh = curl_multi_init();
+        curl_multi_add_handle($mh, $ch);
+        try {
+            $actif = null;
+            do {
+                if ($this->clientDisconnected()) {
+                    return;
                 }
+                $etat = curl_multi_exec($mh, $actif);
+                while (($nl = strpos($tampon, "\n")) !== false) {
+                    yield substr($tampon, 0, $nl);
+                    $tampon = substr($tampon, $nl + 1);
+                    if ($this->clientDisconnected()) {
+                        return;
+                    }
+                }
+                if ($actif > 0) {
+                    // Bornée (200 ms) : une déconnexion client doit se détecter même si Ollama reste
+                    // temporairement silencieux (même intention que l'ancien read_timeout=5).
+                    curl_multi_select($mh, 0.2);
+                }
+            } while ($actif > 0 && $etat === CURLM_OK);
+            if ($tampon !== '') {
+                yield $tampon;
             }
+            $erreur = curl_error($ch);
+            if ($erreur !== '') {
+                throw new \RuntimeException('Ollama connection failed: ' . $erreur);
+            }
+            $statut = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            if ($statut < 200 || $statut >= 300) {
+                throw new \RuntimeException('Ollama request failed (HTTP ' . $statut . ').');
+            }
+        } finally {
+            curl_multi_remove_handle($mh, $ch);
+            curl_multi_close($mh);
+            curl_close($ch);
         }
     }
 
