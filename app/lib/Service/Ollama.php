@@ -1247,7 +1247,12 @@ class Ollama {
         // pour le cas courant (Ollama en HTTP local).
         try {
             $options[CURLOPT_CAINFO] = \OCP\Server::get(\OCP\ICertificateManager::class)->getAbsoluteBundlePath();
-        } catch (\Throwable $ignored) {
+        } catch (\Throwable $e) {
+            // Repli sur le magasin CA système de curl — journalisé (revue adverse du 01/10/2026, même
+            // raison que OpenAICompatible::lireLignesEnFlux) : sans effet pratique tant qu'Ollama est en
+            // HTTP local, mais un repli silencieux serait une régression invisible si $url passe un jour
+            // en HTTPS avec un certificat importé côté ICertificateManager seulement.
+            $this->logger->warning('eva_ai Ollama : ICertificateManager indisponible, repli sur le magasin CA système de curl', ['exception' => $e]);
         }
         curl_setopt_array($ch, $options);
         $mh = curl_multi_init();

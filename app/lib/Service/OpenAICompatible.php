@@ -177,9 +177,18 @@ class OpenAICompatible {
         // désactiverait la vérification TLS pour de vrai, contrairement au client Nextcloud.
         try {
             $options[CURLOPT_CAINFO] = \OCP\Server::get(\OCP\ICertificateManager::class)->getAbsoluteBundlePath();
-        } catch (\Throwable $ignored) {
+        } catch (\Throwable $e) {
             // Repli sur le magasin système par défaut de curl si le gestionnaire de certificats n'est pas
-            // disponible dans ce contexte — ne bloque jamais le flux pour ça.
+            // disponible dans ce contexte — ne bloque jamais le flux pour ça. MAIS journalisé (revue
+            // adverse du 01/10/2026) : le certificat des serveurs LLM internes (ex. infinityai02) est
+            // importé via `occ security:certificates:import`, donc DANS ce magasin, PAS dans celui de
+            // l'OS — un repli silencieux ici ferait échouer la connexion TLS ensuite sans aucune trace de
+            // la vraie cause. Cette classe n'a pas de logger injecté (contrairement à Ollama.php) : on va
+            // le chercher au même endroit que ICertificateManager plutôt que de changer le constructeur.
+            \OCP\Server::get(\Psr\Log\LoggerInterface::class)->warning(
+                'eva_ai OpenAICompatible : ICertificateManager indisponible, repli sur le magasin CA système de curl (le certificat custom, s\'il y en a un, ne sera pas reconnu)',
+                ['exception' => $e]
+            );
         }
         curl_setopt_array($ch, $options);
         $mh = curl_multi_init();
