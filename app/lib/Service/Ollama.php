@@ -1091,11 +1091,13 @@ class Ollama {
             return;
         }
         if ($provider !== 'ollama') {
-            $result = $this->openAiCompatible()->chat($messages, $tools, $timeout ?? self::CHAT_TIMEOUT);
-            if (isset($result['error'])) yield ['type' => 'error', 'delta' => $result['error']];
-            elseif (($result['tool_calls'] ?? []) !== []) yield ['type' => 'tool_calls', 'tool_calls' => $result['tool_calls'], 'raw' => $result['raw_tool_calls'] ?? [], 'model' => $result['model'] ?? ''];
-            else yield ['type' => 'content', 'delta' => $result['answer'] ?? ''];
-            yield ['type' => 'finished', 'model' => $result['model'] ?? ''];
+            // Avant le 01/10/2026 : appelait chat() (bloquant, stream:false) et rejouait toute la
+            // réponse comme un seul événement "content" une fois le modèle entièrement généré côté
+            // vLLM/LiteLLM/OpenAI — aucun token n'atteignait le navigateur avant la fin. Le reste du
+            // pipeline (RagService::askStream, StreamTraversableResponse, le lecteur NDJSON côté
+            // navigateur) streame déjà réellement ; seul ce maillon ne le faisait pas. Voir
+            // OpenAICompatible::chatStream().
+            yield from $this->openAiCompatible()->chatStream($messages, $tools, $timeout ?? self::CHAT_TIMEOUT);
             return;
         }
         $model = $this->resolveChatModel($preferredModel);

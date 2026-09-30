@@ -51,6 +51,151 @@ class OpenAICompatible {
     }
 
     /**
+     * Streaming variant of chat() : POST avec stream:true, lit le corps HTTP au fur et à mesure
+     * (mêmes 8192 octets/lecture + read_timeout que Ollama::chatStream, voir ce fichier) et parse les
+     * lignes SSE `data: {...}` du serveur amont (vLLM/LiteLLM/OpenAI), jusqu'à `data: [DONE]`. Avant
+     * le 01/10/2026, chat() (bloquant, stream:false) était appelé à la place et sa réponse complète
+     * rejouée comme un seul faux "chunk" — aucun token n'atteignait le navigateur avant la fin de la
+     * génération côté modèle. PROBLEMES.md n'en parle pas encore, à ajouter si un autre écart de
+     * comportement apparaît entre Ollama et ce provider.
+     * @param array<int,array{role:string,content:string}> $messages
+     * @return \Generator<string,array{type:string,delta?:string,tool_calls?:array,raw?:array,model?:string},void,void>
+     */
+    public function chatStream(array $messages, array $tools = [], int $timeout = 120): \Generator {
+        $id = $this->provider();
+        $model = $this->model();
+        $payload = ['model' => $model, 'messages' => $this->normalizeMessages($messages), 'temperature' => max(0.0, min(2.0, (float)$this->config->get('temperature'))), 'stream' => true];
+        if ($tools !== []) $payload['tools'] = $tools;
+        $body = null;
+        $startedAt = microtime(true);
+        $answer = '';
+        $streamCalls = [];
+        $finir = function () use ($id, $model, $messages, &$answer, &$streamCalls, $startedAt): array {
+            $this->usage?->recordChat($this->config->userId(), $id, $model, $messages, $answer, null, null, (int)round((microtime(true) - $startedAt) * 1000));
+            if ($streamCalls === []) {
+                return ['type' => 'finished', 'model' => $model];
+            }
+            ksort($streamCalls);
+            return ['type' => 'tool_calls', 'tool_calls' => $this->normalizeStreamedToolCalls($streamCalls), 'raw' => array_values($streamCalls), 'model' => $model];
+        };
+        try {
+            if ($this->clientDisconnected()) {
+                return;
+            }
+            $response = $this->clients->newClient()->post($this->endpoint(), [
+                'headers' => ['Authorization' => 'Bearer ' . $this->credentials->getCustom($this->config->userId() ?? '', $id), 'Content-Type' => 'application/json', 'Accept' => 'text/event-stream'],
+                'json' => $payload,
+                'timeout' => max(1, min(300, $timeout)),
+                // Lectures bornées pour que la détection de déconnexion se déclenche même si le
+                // serveur amont reste temporairement silencieux (pas de token).
+                'read_timeout' => 5,
+                'stream' => true,
+                'http_errors' => false,
+            ]);
+            $status = $response->getStatusCode();
+            if ($status < 200 || $status >= 300) {
+                yield ['type' => 'error', 'delta' => 'Provider request failed (HTTP ' . $status . ').'];
+                return;
+            }
+            $body = $response->getBody();
+            $buffer = '';
+            while (is_resource($body) ? !feof($body) : !$body->eof()) {
+                if ($this->clientDisconnected()) {
+                    return;
+                }
+                $chunk = is_resource($body) ? fread($body, 8192) : $body->read(8192);
+                if ($chunk === '' || $chunk === false) {
+                    usleep(10000);
+                    continue;
+                }
+                $buffer .= $chunk;
+                while (($nl = strpos($buffer, "\n")) !== false) {
+                    $line = trim(substr($buffer, 0, $nl));
+                    $buffer = substr($buffer, $nl + 1);
+                    // Ignore les lignes vides, "event: ...", les commentaires SSE ":..." (keep-alive) —
+                    // seules les lignes "data: " portent un événement du contrat OpenAI.
+                    if ($line === '' || !str_starts_with($line, 'data:')) {
+                        continue;
+                    }
+                    $data = trim(substr($line, 5));
+                    if ($data === '[DONE]') {
+                        yield $finir();
+                        return;
+                    }
+                    if ($this->clientDisconnected()) {
+                        return;
+                    }
+                    $obj = json_decode($data, true);
+                    if (!is_array($obj)) {
+                        continue;
+                    }
+                    $delta = $obj['choices'][0]['delta'] ?? [];
+                    if (!is_array($delta)) {
+                        continue;
+                    }
+                    if (is_array($delta['tool_calls'] ?? null)) {
+                        foreach ($delta['tool_calls'] as $tc) {
+                            if (!is_array($tc)) continue;
+                            $idx = (int)($tc['index'] ?? 0);
+                            $fn = is_array($tc['function'] ?? null) ? $tc['function'] : [];
+                            if (!isset($streamCalls[$idx])) {
+                                $streamCalls[$idx] = ['id' => (string)($tc['id'] ?? ('call_' . bin2hex(random_bytes(4)))), 'type' => 'function', 'function' => ['name' => '', 'arguments' => '']];
+                            }
+                            if (!empty($tc['id'])) $streamCalls[$idx]['id'] = (string)$tc['id'];
+                            if (isset($fn['name']) && $fn['name'] !== '') $streamCalls[$idx]['function']['name'] = (string)$fn['name'];
+                            // OpenAI streame toujours les arguments comme fragments de chaîne à
+                            // concaténer (jamais un objet déjà décodé, contrairement à Ollama).
+                            if (isset($fn['arguments']) && is_string($fn['arguments'])) $streamCalls[$idx]['function']['arguments'] .= $fn['arguments'];
+                        }
+                    }
+                    $content = (string)($delta['content'] ?? '');
+                    if ($content !== '') {
+                        $answer .= $content;
+                        if ($this->clientDisconnected()) {
+                            return;
+                        }
+                        yield ['type' => 'content', 'delta' => $content];
+                    }
+                }
+            }
+            // Connexion fermée sans "data: [DONE]" explicite (certains serveurs auto-hébergés ne
+            // l'envoient pas) : le flux est quand même terminé normalement, on clôt pareil.
+            yield $finir();
+        } catch (\Throwable $e) {
+            if (!$this->clientDisconnected()) {
+                yield ['type' => 'error', 'delta' => $e instanceof ProviderException ? $e->getMessage() : 'Provider connection or response failed. Check endpoint, key and model.'];
+            }
+        } finally {
+            if (is_resource($body)) {
+                @fclose($body);
+            } elseif (is_object($body) && method_exists($body, 'close')) {
+                try {
+                    $body->close();
+                } catch (\Throwable $ignored) {
+                    // Le nettoyage ne doit jamais masquer le résultat réel du flux.
+                }
+            }
+        }
+    }
+
+    private function clientDisconnected(): bool {
+        return function_exists('connection_aborted') && connection_aborted() > 0;
+    }
+
+    /** @param array<int,array{id:string,type:string,function:array{name:string,arguments:string}}> $raw */
+    private function normalizeStreamedToolCalls(array $raw): array {
+        $out = [];
+        foreach ($raw as $tc) {
+            $name = (string)($tc['function']['name'] ?? '');
+            if ($name === '') continue;
+            $argsRaw = $tc['function']['arguments'] ?? '';
+            $decoded = is_string($argsRaw) ? json_decode($argsRaw, true) : null;
+            $out[] = ['name' => $name, 'arguments' => is_array($decoded) ? $decoded : []];
+        }
+        return $out;
+    }
+
+    /**
      * Request images from an OpenAI-compatible /images/generations endpoint.
      * Returns decoded bytes so callers can keep the result inside Nextcloud.
      *
