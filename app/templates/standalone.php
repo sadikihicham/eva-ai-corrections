@@ -238,6 +238,28 @@
             cursor: pointer;
         }
         .export-btn:disabled { opacity: .5; cursor: default; }
+
+        /* ============ Personnalisation par conversation (police/taille/couleurs) ============ */
+        .eva-cz-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .5); display: flex; align-items: center; justify-content: center; z-index: 50; }
+        .eva-cz-modal { background: var(--color-main-background, #fff); color: var(--color-main-text, #111); border-radius: 12px; padding: 20px; width: min(420px, 92vw); max-height: 86vh; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+        .eva-cz-modal h2 { font-size: 17px; font-weight: 700; }
+        .eva-cz-field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+        .eva-cz-field span { font-weight: 600; color: var(--color-text-maxcontrast, #555); }
+        .eva-cz-field select, .eva-cz-field input[type='number'] { padding: 7px 9px; border: 1px solid var(--color-border, #ccc); border-radius: 6px; background: var(--color-main-background, #fff); color: var(--color-main-text, #111); font: inherit; }
+        .eva-cz-field input[type='color'] { width: 56px; height: 32px; padding: 2px; border: 1px solid var(--color-border, #ccc); border-radius: 6px; background: var(--color-main-background, #fff); cursor: pointer; }
+        .eva-cz-actions { display: flex; justify-content: flex-end; gap: 8px; }
+        .eva-cz-btn { padding: 8px 16px; border: 0; border-radius: 6px; background: var(--color-primary-element, #00679c); color: var(--color-primary-element-text, #fff); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+        .eva-cz-btn-ghost { background: var(--color-background-hover, #e5e5e5); color: var(--color-main-text, #111); }
+        .eva-cz-err { color: var(--color-error, #e9322d); font-size: 12px; white-space: pre-wrap; }
+        /* Appliquées seulement quand JS a détecté une personnalisation réelle pour la conversation
+           ouverte (voir appliquerApparence() dans eva_ai_standalone.js). Spécificité (1 type + 4
+           classes) volontairement supérieure aux règles .rm.user/.assistant .rb et #msgs ci-dessus
+           pour gagner même là où elles portent déjà !important (cf. bloquant B2 du même correctif
+           sur eva_ai-main.js : vérifié par lecture, pas supposé). */
+        body.eva-perso #msgs { background: var(--eva-bg, var(--color-background-dark, var(--color-main-background, #fff))) !important; }
+        body.eva-perso .rt { color: var(--eva-text, inherit) !important; font-family: var(--eva-font, inherit) !important; font-size: var(--eva-size, inherit) !important; }
+        body.eva-perso .rm.user .rb { background: var(--eva-bubble, var(--color-primary-element, #00679c)) !important; }
+        body.eva-perso .rm.assistant .rb { background: var(--eva-bubble, var(--color-main-background, #fff)) !important; }
         @media (max-width: 600px) {
             .rconfirm-share-form { grid-template-columns: 1fr; }
             .rconfirm-field:first-child { grid-column: auto; }
@@ -312,6 +334,7 @@
                     <h1>Chat with your files</h1>
                 </div>
                 <div class="head-right">
+                    <button id="customize" class="export-btn" title="Customize this chat" disabled>&#9881; Customize</button>
                     <button id="export" class="export-btn" title="Download this chat as Markdown" disabled>&#11015; Export</button>
                     <button id="export-pdf" class="export-btn" title="Download this chat as PDF" disabled>&#11015; PDF</button>
                     <button id="export-docx" class="export-btn" title="Download this chat as DOCX" disabled>&#11015; DOCX</button>
