@@ -19,6 +19,7 @@
             height: 100vh;
             display: flex;
             flex-direction: column;
+            overflow-y: auto;
         }
 
         /* ============ Topbar ============ */
@@ -63,7 +64,7 @@
         #layout {
             flex: 1;
             display: flex;
-            overflow: hidden;
+            overflow: visible;
         }
 
         /* ============ Sidebar ============ */
@@ -96,11 +97,37 @@
         #sidebar .sidebar-sep { height: 1px; background: var(--color-border, #ddd); margin: 12px 8px; }
 
         /* ============ Inhalt ============ */
+        /* Bug trouvé le 01/10 en testant en prod : cette page est servie DANS le chrome Nextcloud
+           (en-tête global "Search apps, files..." ~50px, visible en haut des captures), pas en
+           page isolée malgré le <!DOCTYPE html><body> de ce fichier — le <body> réellement rendu
+           par le navigateur est celui de Nextcloud (id="body-user"), et <div id="content"> ci-
+           dessous est réutilisé par le CSS cœur de Nextcloud (core/css/server.css) comme son
+           propre conteneur applicatif standard : #content{height:var(--body-height);
+           position:fixed;...}. --body-height se calcule un peu court sur cette page (pas de nav
+           Nextcloud standard), et une hauteur CSS explicite gagne toujours sur top/bottom en
+           position:fixed — #content se retrouvait ainsi plus petit que le viewport réel, sans
+           qu'aucune règle à nous ne le pilote. Conséquence mesurée : .rt/#msgs (flex:1 imbriqués
+           sans hauteur de référence fiable) prenaient leur taille "naturelle" (~650-700px) au lieu
+           de se contraindre, poussant le formulaire de saisie (#form) sous le bas de l'écran —
+           invisible, inatteignable au clic, sans erreur JS (silencieux).
+           Correctif : on arrête de dépendre du calcul de hauteur de Nextcloud pour cette page —
+           #content repasse en flux normal (position:static, hauteur naturelle), #layout/#msgs
+           arrêtent de compter sur un flex:1 fill-the-remaining-space fragile ; #msgs reçoit une
+           hauteur bornée explicite (max-height) avec défilement interne (déjà overflow-y:auto),
+           et body devient défilable en secours (overflow-y:auto) si jamais le contenu dépasse
+           quand même. #form est ainsi TOUJOURS atteignable, visible ou après un défilement de
+           page, quelle que soit l'estimation de hauteur faite par Nextcloud. Vérifié en direct
+           (chat vide ET chat à 24 messages, sidebar/personnalisation/RTL inchangés) avant d'écrire
+           ce correctif. !important sur #content : nécessaire pour battre la règle #content de
+           Nextcloud (même spécificité, mais potentiellement rechargée après ce <style> selon
+           l'ordre de chargement dynamique des CSS d'app). */
         #content {
             flex: 1;
             display: flex;
             flex-direction: column;
-            overflow: hidden;
+            overflow: visible !important;
+            position: static !important;
+            height: auto !important;
             padding: 24px clamp(16px, 3vw, 36px) 28px;
             background: var(--color-main-background, #f7f7f7);
         }
@@ -117,8 +144,9 @@
         .pill-warn { background: var(--color-warning, #f0a64a); color: #111; }
         .refresh { border: 1px solid var(--color-border, #ddd); background: var(--color-main-background, #fff); border-radius: 6px; padding: 4px 9px; cursor: pointer; font-size: 14px; line-height: 1; color: var(--color-main-text, #111); }
         #msgs {
-            flex: 1;
+            flex: none;
             min-height: 320px;
+            max-height: 60vh;
             background: var(--color-background-dark, var(--color-main-background, #fff));
             border: 1px solid var(--color-border, #ddd);
             border-radius: 14px;
@@ -147,11 +175,17 @@
         .rt ul { list-style: disc; }
         .rt ol { list-style: decimal; }
         .rt li { margin: 2px 0; }
-        .rt h1, .rt h2, .rt h3, .rt h4, .rt h5, .rt h6 { margin: 10px 0 6px; font-weight: 600; line-height: 1.3; }
-        .rt h1 { font-size: 17px; }
-        .rt h2 { font-size: 16px; }
-        .rt h3 { font-size: 15px; }
-        .rt h4, .rt h5, .rt h6 { font-size: 14px; }
+        /* Titres trop peu distincts du texte courant (14px/poids 600, écart de 1-3px à peine) :
+           signalé le 01/10, avec capture — les modèles utilisent surtout h3/h4 (rarement h1/h2),
+           donc l'échelle est recalibrée sur CES niveaux, pas uniquement h1/h2 qui servent peu en
+           pratique. Vérifié en direct sur une vraie réponse arabe (h3+h4) avant ce correctif. */
+        .rt h1, .rt h2, .rt h3, .rt h4, .rt h5, .rt h6 { margin: 20px 0 10px; font-weight: 700; line-height: 1.3; }
+        .rt h1, .rt h2, .rt h3 { padding-bottom: 5px; border-bottom: 1px solid var(--color-border, #ddd); }
+        .rt h1 { font-size: 24px; }
+        .rt h2 { font-size: 20px; }
+        .rt h3 { font-size: 18px; }
+        .rt h4 { font-size: 16px; }
+        .rt h5, .rt h6 { font-size: 14.5px; }
         .rt p code, .rt li code { font-family: var(--font-family-monospace, monospace); font-size: 85%; background: var(--color-background-dark, #eee); padding: 1px 5px; border-radius: 4px; }
         .rt pre { background: var(--color-background-dark, #f0f0f0); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 0 0 8px; }
         .rt pre code { font-family: var(--font-family-monospace, monospace); font-size: 13px; background: transparent; padding: 0; white-space: pre-wrap; }
@@ -272,10 +306,20 @@
             .rconfirm-field:first-child { grid-column: auto; }
         }
         .rm { position: relative; }
-        .rcopy {
+        /* .racts : plusieurs boutons par message (copier + export PDF/DOCX par message, demandé le
+           01/10) — remplace le positionnement absolu individuel de .rcopy par un conteneur flex,
+           même approche déjà en place dans eva_ai-main.js (.racts). */
+        .racts {
             position: absolute;
             top: 8px;
             right: 8px;
+            display: flex;
+            gap: 4px;
+            opacity: 0;
+            transition: opacity .12s;
+        }
+        .rm:hover .racts { opacity: 1; }
+        .rcopy {
             width: 24px;
             height: 24px;
             line-height: 1;
@@ -285,17 +329,17 @@
             border-radius: 6px;
             font-size: 13px;
             cursor: pointer;
-            opacity: 0;
-            transition: opacity .12s;
         }
-        .rm:hover .rcopy { opacity: 1; }
         .rcopy:hover { background: var(--color-background-hover, #e5e5e5); }
-        .form { display: flex; gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--color-border, #ddd); border-radius: 12px; background: var(--color-main-background, #fff); }
-        .form input {
+        .form { display: flex; gap: 8px; align-items: flex-end; padding: 8px; border: 1px solid var(--color-border, #ddd); border-radius: 12px; background: var(--color-main-background, #fff); }
+        /* Champ de saisie multiligne (correction orthographique du navigateur, demandée le 01/10) :
+           Entrée envoie, Maj+Entrée va à la ligne, hauteur auto jusqu’à 160px. */
+        .form textarea { resize: none; max-height: 160px; line-height: 1.4; font-family: inherit; overflow-y: auto; box-sizing: border-box; }
+        .form input, .form textarea {
             flex: 1; min-width: 0; padding: 10px 12px; border: 1px solid transparent; border-radius: 8px;
             font-size: 14px; color: var(--color-main-text, #111); background: transparent;
         }
-        .form input:focus { border-color: var(--color-primary-element, #00679c); outline: none; background: var(--color-background-hover, #f1f2f4); }
+        .form input:focus, .form textarea:focus { border-color: var(--color-primary-element, #00679c); outline: none; background: var(--color-background-hover, #f1f2f4); }
         .form button { padding: 10px 18px; border: 0; border-radius: 8px; background: var(--color-primary-element, #00679c); color: var(--color-primary-element-text, #fff); font-size: 14px; font-weight: 600; cursor: pointer; }
         .form button:disabled { opacity: .6; cursor: default; }
         .form button.stop { background: var(--color-error, #e9322d); }
@@ -358,7 +402,7 @@
             </div>
 
             <form class="form" id="form">
-                <input id="q" type="text" autocomplete="off" placeholder="What does my note about X say?">
+                <textarea id="q" rows="1" autocomplete="off" spellcheck="true" dir="auto" placeholder="What does my note about X say?"></textarea>
                 <button type="submit" id="send">Send</button>
             </form>
             <div class="err" id="err" style="display:none;"></div>
