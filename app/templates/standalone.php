@@ -251,15 +251,22 @@
         .eva-cz-btn { padding: 8px 16px; border: 0; border-radius: 6px; background: var(--color-primary-element, #00679c); color: var(--color-primary-element-text, #fff); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
         .eva-cz-btn-ghost { background: var(--color-background-hover, #e5e5e5); color: var(--color-main-text, #111); }
         .eva-cz-err { color: var(--color-error, #e9322d); font-size: 12px; white-space: pre-wrap; }
-        /* Appliquées seulement quand JS a détecté une personnalisation réelle pour la conversation
-           ouverte (voir appliquerApparence() dans eva_ai_standalone.js). Spécificité (1 type + 4
-           classes) volontairement supérieure aux règles .rm.user/.assistant .rb et #msgs ci-dessus
-           pour gagner même là où elles portent déjà !important (cf. bloquant B2 du même correctif
-           sur eva_ai-main.js : vérifié par lecture, pas supposé). */
+        /* Couleur/police : appliquées seulement quand JS a détecté une personnalisation réelle pour
+           la conversation ouverte (voir appliquerApparence() dans eva_ai_standalone.js). Spécificité
+           (1 type + classes) volontairement supérieure aux règles .rm.user/.assistant .rb et #msgs
+           ci-dessus pour gagner même là où elles portent déjà !important (cf. bloquant B2 du même
+           correctif sur eva_ai-main.js : vérifié par lecture, pas supposé). */
         body.eva-perso #msgs { background: var(--eva-bg, var(--color-background-dark, var(--color-main-background, #fff))) !important; }
-        body.eva-perso .rt { color: var(--eva-text, inherit) !important; font-family: var(--eva-font, inherit) !important; font-size: var(--eva-size, inherit) !important; }
+        body.eva-perso .rt { color: var(--eva-text, inherit) !important; font-family: var(--eva-font, inherit) !important; }
         body.eva-perso .rm.user .rb { background: var(--eva-bubble, var(--color-primary-element, #00679c)) !important; }
         body.eva-perso .rm.assistant .rb { background: var(--eva-bubble, var(--color-main-background, #fff)) !important; }
+        /* Taille de texte : PAS limitée à body.eva-perso. ChatStore::sanitizeAppearance() renvoie
+           toujours un fontSize réel (12-22, défaut 14, jamais "") même pour une conversation jamais
+           personnalisée — contrairement aux couleurs/police qui peuvent être "". La gater derrière
+           .eva-perso rendrait "changer seulement la taille" invisible (actif resterait faux tant
+           qu'aucune couleur/police n'est touchée) : trouvé par revue adverse sur la construction
+           soeur de eva_ai-main.js, corrigé ici dès la construction en la rendant inconditionnelle. */
+        .rt { font-size: var(--eva-size, inherit) !important; }
         @media (max-width: 600px) {
             .rconfirm-share-form { grid-template-columns: 1fr; }
             .rconfirm-field:first-child { grid-column: auto; }
