@@ -19,6 +19,7 @@
             height: 100vh;
             display: flex;
             flex-direction: column;
+            overflow-y: auto;
         }
 
         /* ============ Topbar ============ */
@@ -63,7 +64,7 @@
         #layout {
             flex: 1;
             display: flex;
-            overflow: hidden;
+            overflow: visible;
         }
 
         /* ============ Sidebar ============ */
@@ -96,11 +97,37 @@
         #sidebar .sidebar-sep { height: 1px; background: var(--color-border, #ddd); margin: 12px 8px; }
 
         /* ============ Inhalt ============ */
+        /* Bug trouvé le 01/10 en testant en prod : cette page est servie DANS le chrome Nextcloud
+           (en-tête global "Search apps, files..." ~50px, visible en haut des captures), pas en
+           page isolée malgré le <!DOCTYPE html><body> de ce fichier — le <body> réellement rendu
+           par le navigateur est celui de Nextcloud (id="body-user"), et <div id="content"> ci-
+           dessous est réutilisé par le CSS cœur de Nextcloud (core/css/server.css) comme son
+           propre conteneur applicatif standard : #content{height:var(--body-height);
+           position:fixed;...}. --body-height se calcule un peu court sur cette page (pas de nav
+           Nextcloud standard), et une hauteur CSS explicite gagne toujours sur top/bottom en
+           position:fixed — #content se retrouvait ainsi plus petit que le viewport réel, sans
+           qu'aucune règle à nous ne le pilote. Conséquence mesurée : .rt/#msgs (flex:1 imbriqués
+           sans hauteur de référence fiable) prenaient leur taille "naturelle" (~650-700px) au lieu
+           de se contraindre, poussant le formulaire de saisie (#form) sous le bas de l'écran —
+           invisible, inatteignable au clic, sans erreur JS (silencieux).
+           Correctif : on arrête de dépendre du calcul de hauteur de Nextcloud pour cette page —
+           #content repasse en flux normal (position:static, hauteur naturelle), #layout/#msgs
+           arrêtent de compter sur un flex:1 fill-the-remaining-space fragile ; #msgs reçoit une
+           hauteur bornée explicite (max-height) avec défilement interne (déjà overflow-y:auto),
+           et body devient défilable en secours (overflow-y:auto) si jamais le contenu dépasse
+           quand même. #form est ainsi TOUJOURS atteignable, visible ou après un défilement de
+           page, quelle que soit l'estimation de hauteur faite par Nextcloud. Vérifié en direct
+           (chat vide ET chat à 24 messages, sidebar/personnalisation/RTL inchangés) avant d'écrire
+           ce correctif. !important sur #content : nécessaire pour battre la règle #content de
+           Nextcloud (même spécificité, mais potentiellement rechargée après ce <style> selon
+           l'ordre de chargement dynamique des CSS d'app). */
         #content {
             flex: 1;
             display: flex;
             flex-direction: column;
-            overflow: hidden;
+            overflow: visible !important;
+            position: static !important;
+            height: auto !important;
             padding: 24px clamp(16px, 3vw, 36px) 28px;
             background: var(--color-main-background, #f7f7f7);
         }
@@ -117,8 +144,9 @@
         .pill-warn { background: var(--color-warning, #f0a64a); color: #111; }
         .refresh { border: 1px solid var(--color-border, #ddd); background: var(--color-main-background, #fff); border-radius: 6px; padding: 4px 9px; cursor: pointer; font-size: 14px; line-height: 1; color: var(--color-main-text, #111); }
         #msgs {
-            flex: 1;
+            flex: none;
             min-height: 320px;
+            max-height: 60vh;
             background: var(--color-background-dark, var(--color-main-background, #fff));
             border: 1px solid var(--color-border, #ddd);
             border-radius: 14px;
