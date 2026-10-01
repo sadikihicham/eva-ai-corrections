@@ -143,6 +143,35 @@
 
 
 /* -----------------------------------------------------------------------------
+   3.bis Indicateur de réflexion active (remplace les 3 points statiques « … »
+   affichés avant le premier token — demande du 01/10/2026, plus moderne/vivant).
+   ----------------------------------------------------------------------------- */
+#content-vue.eva-ai-app .chatview-root .eva-penser {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	height: 1.1em;
+	padding-block: 2px;
+}
+#content-vue.eva-ai-app .chatview-root .eva-penser span {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--color-primary-element, #00679c);
+	animation: eva-penser-vague 1.2s ease-in-out infinite;
+	opacity: .35;
+}
+#content-vue.eva-ai-app .chatview-root .eva-penser span:nth-child(2) { animation-delay: .15s; }
+#content-vue.eva-ai-app .chatview-root .eva-penser span:nth-child(3) { animation-delay: .3s; }
+@keyframes eva-penser-vague {
+	0%, 60%, 100% { transform: scale(.6); opacity: .35; }
+	30% { transform: scale(1.2); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+	#content-vue.eva-ai-app .chatview-root .eva-penser span { animation: none; opacity: .7; }
+}
+
+/* -----------------------------------------------------------------------------
    4. Typographie du contenu (.rt = rendu Markdown)
    ----------------------------------------------------------------------------- */
 #content-vue.eva-ai-app .chatview-root .rt {
