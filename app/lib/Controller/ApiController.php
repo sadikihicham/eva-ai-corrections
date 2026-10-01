@@ -1651,6 +1651,12 @@ class ApiController extends OCSController {
             $persona = trim((string)$body['persona']);
             $meta['persona'] = array_key_exists($persona, RagService::PERSONAS) ? $persona : '';
         }
+        if (array_key_exists('appearance', $body)) {
+            // Per-chat visual style (01/10): font/size/colors. The real validation (strict hex
+            // regex, font allowlist, size clamp) lives in ChatStore::sanitizeAppearance() — never
+            // trust this array as safe CSS just because it arrived as JSON with the right shape.
+            $meta['appearance'] = is_array($body['appearance']) ? $body['appearance'] : [];
+        }
         if ($meta === []) {
             return new DataResponse(['error' => 'No metadata given'], 400);
         }
