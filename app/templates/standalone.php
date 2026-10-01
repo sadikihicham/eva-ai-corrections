@@ -147,11 +147,17 @@
         .rt ul { list-style: disc; }
         .rt ol { list-style: decimal; }
         .rt li { margin: 2px 0; }
-        .rt h1, .rt h2, .rt h3, .rt h4, .rt h5, .rt h6 { margin: 10px 0 6px; font-weight: 600; line-height: 1.3; }
-        .rt h1 { font-size: 17px; }
-        .rt h2 { font-size: 16px; }
-        .rt h3 { font-size: 15px; }
-        .rt h4, .rt h5, .rt h6 { font-size: 14px; }
+        /* Titres trop peu distincts du texte courant (14px/poids 600, écart de 1-3px à peine) :
+           signalé le 01/10, avec capture — les modèles utilisent surtout h3/h4 (rarement h1/h2),
+           donc l'échelle est recalibrée sur CES niveaux, pas uniquement h1/h2 qui servent peu en
+           pratique. Vérifié en direct sur une vraie réponse arabe (h3+h4) avant ce correctif. */
+        .rt h1, .rt h2, .rt h3, .rt h4, .rt h5, .rt h6 { margin: 20px 0 10px; font-weight: 700; line-height: 1.3; }
+        .rt h1, .rt h2, .rt h3 { padding-bottom: 5px; border-bottom: 1px solid var(--color-border, #ddd); }
+        .rt h1 { font-size: 24px; }
+        .rt h2 { font-size: 20px; }
+        .rt h3 { font-size: 18px; }
+        .rt h4 { font-size: 16px; }
+        .rt h5, .rt h6 { font-size: 14.5px; }
         .rt p code, .rt li code { font-family: var(--font-family-monospace, monospace); font-size: 85%; background: var(--color-background-dark, #eee); padding: 1px 5px; border-radius: 4px; }
         .rt pre { background: var(--color-background-dark, #f0f0f0); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 0 0 8px; }
         .rt pre code { font-family: var(--font-family-monospace, monospace); font-size: 13px; background: transparent; padding: 0; white-space: pre-wrap; }
