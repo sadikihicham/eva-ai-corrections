@@ -20,8 +20,10 @@ use OCA\EvaAi\Service\KnowledgeInitializer;
 use OCP\AppFramework\OCSController;
 use OCP\AppFramework\Http\Attribute\NoAdminRequired;
 use OCA\EvaAi\Http\StreamTraversableResponse;
+use OCP\AppFramework\Http\DataDownloadResponse;
 use OCP\AppFramework\Http\DataResponse;
 use OCP\AppFramework\Http\NotFoundResponse;
+use OCP\AppFramework\Http\Response;
 use OCP\BackgroundJob\IJobList;
 use OCP\ICacheFactory;
 use OCP\App\IAppManager;
@@ -1881,6 +1883,52 @@ class ApiController extends OCSController {
 
     /**
      * GDPR data export (Issue #83): the user downloads their chats, personal
+     * Exports a conversation to PDF or DOCX (admin screenshot, 01/10: Arabic rendering +
+     * personalization + export request). `content` is the Markdown transcript the browser already
+     * builds for the existing ".md" download button — never re-derived server-side, so this route
+     * never reads the chat's stored messages itself (the `id` is only checked for ownership, same
+     * pattern as chatAppend/chatDelete). The heavy lifting (Arabic -> Collabora fallback, DOCX RTL
+     * per paragraph) is ActionExecutor::exportConversationFile(), the exact engine createFile()
+     * already uses for a model-written .pdf/.docx: no new rendering code, no new failure modes.
+     */
+    #[NoAdminRequired]
+    public function chatExport(string $id): Response {
+        $user = $this->requireUser();
+        if ($user === null) {
+            return new DataResponse(['error' => 'Not logged in'], 401);
+        }
+        // Defense in depth (review, 01/10): $id only reaches the download filename below after
+        // chatStore->get() already confirmed it names a real chat owned by $user (IDs are always
+        // server-generated, never client-chosen), but a strict allowlist costs nothing here and
+        // removes any dependency on that being true forever.
+        if (!preg_match('/^[A-Za-z0-9_-]+$/', $id)) {
+            return new NotFoundResponse();
+        }
+        $chat = $this->chatStore->get($user, $id);
+        if ($chat === null) {
+            return new NotFoundResponse();
+        }
+        $format = strtolower(trim((string)($this->requestParam('format') ?? '')));
+        $content = (string)($this->requestParam('content') ?? '');
+        if (!in_array($format, ['pdf', 'docx'], true) || trim($content) === '') {
+            return new DataResponse(['error' => 'format (pdf or docx) and a non-empty content are required'], 400);
+        }
+        $result = $this->executor->exportConversationFile($content, $format);
+        if (!($result['ok'] ?? false)) {
+            $status = 422;
+            return new DataResponse(['error' => $result['error'] ?? 'export failed', 'canRetryAs' => $result['canRetryAs'] ?? null], $status);
+        }
+        $ext = $format === 'pdf' ? 'pdf' : 'docx';
+        $response = new DataDownloadResponse($result['content'], 'eva-chat-' . $id . '.' . $ext, $result['mime']);
+        // Non-Latin-script characters silently replaced by "?" (review, 01/10): the binary download
+        // itself has no room for a warning field, so it rides along as a header the JS can read.
+        if (!empty($result['warning'])) {
+            $response->addHeader('X-Eva-Export-Warning', (string)$result['warning']);
+        }
+        return $response;
+    }
+
+    /**
      * knowledge and index metadata as one JSON file. Read-only, no admin needed.
      */
     #[NoAdminRequired]
