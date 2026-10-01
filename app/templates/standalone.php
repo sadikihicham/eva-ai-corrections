@@ -278,10 +278,20 @@
             .rconfirm-field:first-child { grid-column: auto; }
         }
         .rm { position: relative; }
-        .rcopy {
+        /* .racts : plusieurs boutons par message (copier + export PDF/DOCX par message, demandé le
+           01/10) — remplace le positionnement absolu individuel de .rcopy par un conteneur flex,
+           même approche déjà en place dans eva_ai-main.js (.racts). */
+        .racts {
             position: absolute;
             top: 8px;
             right: 8px;
+            display: flex;
+            gap: 4px;
+            opacity: 0;
+            transition: opacity .12s;
+        }
+        .rm:hover .racts { opacity: 1; }
+        .rcopy {
             width: 24px;
             height: 24px;
             line-height: 1;
@@ -291,10 +301,7 @@
             border-radius: 6px;
             font-size: 13px;
             cursor: pointer;
-            opacity: 0;
-            transition: opacity .12s;
         }
-        .rm:hover .rcopy { opacity: 1; }
         .rcopy:hover { background: var(--color-background-hover, #e5e5e5); }
         .form { display: flex; gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--color-border, #ddd); border-radius: 12px; background: var(--color-main-background, #fff); }
         .form input {
