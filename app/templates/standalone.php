@@ -331,12 +331,15 @@
             cursor: pointer;
         }
         .rcopy:hover { background: var(--color-background-hover, #e5e5e5); }
-        .form { display: flex; gap: 8px; align-items: center; padding: 8px; border: 1px solid var(--color-border, #ddd); border-radius: 12px; background: var(--color-main-background, #fff); }
-        .form input {
+        .form { display: flex; gap: 8px; align-items: flex-end; padding: 8px; border: 1px solid var(--color-border, #ddd); border-radius: 12px; background: var(--color-main-background, #fff); }
+        /* Champ de saisie multiligne (correction orthographique du navigateur, demandée le 01/10) :
+           Entrée envoie, Maj+Entrée va à la ligne, hauteur auto jusqu’à 160px. */
+        .form textarea { resize: none; max-height: 160px; line-height: 1.4; font-family: inherit; overflow-y: auto; box-sizing: border-box; }
+        .form input, .form textarea {
             flex: 1; min-width: 0; padding: 10px 12px; border: 1px solid transparent; border-radius: 8px;
             font-size: 14px; color: var(--color-main-text, #111); background: transparent;
         }
-        .form input:focus { border-color: var(--color-primary-element, #00679c); outline: none; background: var(--color-background-hover, #f1f2f4); }
+        .form input:focus, .form textarea:focus { border-color: var(--color-primary-element, #00679c); outline: none; background: var(--color-background-hover, #f1f2f4); }
         .form button { padding: 10px 18px; border: 0; border-radius: 8px; background: var(--color-primary-element, #00679c); color: var(--color-primary-element-text, #fff); font-size: 14px; font-weight: 600; cursor: pointer; }
         .form button:disabled { opacity: .6; cursor: default; }
         .form button.stop { background: var(--color-error, #e9322d); }
@@ -399,7 +402,7 @@
             </div>
 
             <form class="form" id="form">
-                <input id="q" type="text" autocomplete="off" placeholder="What does my note about X say?">
+                <textarea id="q" rows="1" autocomplete="off" spellcheck="true" dir="auto" placeholder="What does my note about X say?"></textarea>
                 <button type="submit" id="send">Send</button>
             </form>
             <div class="err" id="err" style="display:none;"></div>
