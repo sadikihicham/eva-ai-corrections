@@ -2129,6 +2129,68 @@ class ActionExecutor {
     }
 
     /**
+     * Exports already-serialized Markdown (built client-side, same code as the existing ".md"
+     * download button) to PDF or DOCX bytes for direct download — added 01/10 for the "download
+     * conversation" buttons (admin screenshot, Arabic rendering request). Reuses buildPdf/buildDocx/
+     * pdfViaOffice exactly as createFile() does for a model-written .pdf/.docx: same Arabic ->
+     * Collabora fallback, same errors. The text here is never model-supplied (it is the user's own
+     * conversation transcript assembled by the browser), so none of createFile()'s WRITE_TOOLS /
+     * content-length / signature checks apply — this is a read-only rendering of text the caller
+     * already has, not a write to the user's files.
+     *
+     * @return array{ok:true,content:string,mime:string}|array{ok:false,error:string,canRetryAs?:string}
+     */
+    public function exportConversationFile(string $markdown, string $format): array {
+        $format = strtolower($format);
+        // Same bound createFile() applies before reaching buildPdf/buildDocx (review, 01/10): without
+        // it, an authenticated user could POST an arbitrarily large transcript and burn disproportionate
+        // CPU/memory on this PHP-FPM worker and, for Arabic PDF, on the shared Collabora service too.
+        $maxChars = (int)$this->config->get('exec_write_max_chars') ?: 100000;
+        if (mb_strlen($markdown) > $maxChars) {
+            return ['ok' => false, 'error' => 'Conversation content exceeds ' . $maxChars . ' characters'];
+        }
+        if ($format === 'pdf') {
+            $arabic = preg_match('/\p{Arabic}/u', $markdown) === 1;
+            $replaced = 0;
+            $latin = null;
+            try {
+                $latin = $this->buildPdf($markdown, $replaced);
+            } catch (\Throwable $e) {
+                if ($e->getMessage() !== 'non-Latin text') {
+                    return ['ok' => false, 'error' => 'PDF generation failed: ' . $e->getMessage()];
+                }
+            }
+            // Same rule as createFile(): Arabic/Urdu goes through Nextcloud Office (buildPdf's
+            // Latin-only fonts would print "?"); other non-Latin scripts have no PDF path here.
+            $office = $arabic && ($latin === null || $replaced > 0) ? $this->pdfViaOffice($markdown) : null;
+            if ($office !== null) {
+                return ['ok' => true, 'content' => $office, 'mime' => 'application/pdf'];
+            }
+            if ($latin === null) {
+                return $arabic
+                    ? ['ok' => false, 'error' => 'This export needs Nextcloud Office (Collabora) for its Arabic-script text, and Office is not available right now.', 'canRetryAs' => 'docx']
+                    : ['ok' => false, 'error' => 'This conversation can only be exported to PDF in Latin script, and in Arabic or Urdu.', 'canRetryAs' => 'docx'];
+            }
+            // Same warning as createFile() (review, 01/10): non-Arabic non-Latin characters (Greek,
+            // Cyrillic, symbols) were silently replaced by "?" — the export must say so, not pretend
+            // fidelity it doesn't have.
+            return $replaced > 0
+                ? ['ok' => true, 'content' => $latin, 'mime' => 'application/pdf',
+                    'warning' => $replaced . ' character(s) could not be printed in the PDF and were replaced by "?". Offer a .docx export instead if that text matters.']
+                : ['ok' => true, 'content' => $latin, 'mime' => 'application/pdf'];
+        }
+        if ($format === 'docx') {
+            try {
+                return ['ok' => true, 'content' => $this->buildDocx($markdown, !$this->docxPlain),
+                    'mime' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+            } catch (\Throwable $e) {
+                return ['ok' => false, 'error' => 'DOCX generation failed: ' . $e->getMessage()];
+            }
+        }
+        return ['ok' => false, 'error' => 'Unsupported export format: ' . $format];
+    }
+
+    /**
      * Build a Word document (.docx) from plain text or simple Markdown, in pure PHP (ZipArchive), without external
      * services. Understands # / ## / ### headings, - / * / 1. lists (two spaces = one level, real Word lists that
      * restart per list), **bold**, | tables | (real Word tables, header row shaded), ``` code blocks (Courier New) and

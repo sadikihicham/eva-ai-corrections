@@ -313,6 +313,8 @@
                 </div>
                 <div class="head-right">
                     <button id="export" class="export-btn" title="Download this chat as Markdown" disabled>&#11015; Export</button>
+                    <button id="export-pdf" class="export-btn" title="Download this chat as PDF" disabled>&#11015; PDF</button>
+                    <button id="export-docx" class="export-btn" title="Download this chat as DOCX" disabled>&#11015; DOCX</button>
                     <span class="badge">eva_ai</span>
                 </div>
             </div>
